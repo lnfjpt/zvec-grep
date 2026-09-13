@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::LineColumnRange;
+use crate::domain::TextRange;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct LexicalSearchRequest {
@@ -40,8 +40,8 @@ pub(crate) struct LexicalMatch {
     pub rank: usize,
     pub absolute_path: PathBuf,
     pub relative_path: PathBuf,
-    pub range: LineColumnRange,
-    pub excerpt_range: Option<LineColumnRange>,
+    pub range: TextRange,
+    pub excerpt_range: Option<TextRange>,
     pub content: String,
 }
 

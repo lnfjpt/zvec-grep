@@ -3,7 +3,7 @@
 use crate::{
     EngineError,
     api::index::options::Device,
-    utils::{atomic_write, create_directories},
+    utils::{atomic_write, sync_directory},
 };
 use serde_json::{Value, json};
 use std::{
@@ -159,7 +159,29 @@ fn update_at(path: &Path, changes: Value) -> Result<(), EngineError> {
     let parent = path
         .parent()
         .ok_or_else(|| EngineError::invalid_argument("Invalid config path"))?;
-    create_directories(parent)?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    if let Err(error) = builder.create(parent)
+        && !(error.kind() == std::io::ErrorKind::AlreadyExists && parent.is_dir())
+    {
+        return Err(EngineError::from_io(
+            format!(
+                "create config directory '{}' (parent must already exist)",
+                parent.display()
+            ),
+            &error,
+        ));
+    }
     let _lock = crate::workspace::lock::acquire_read_write_lock(
         &parent.join("locks/config"),
         crate::workspace::lock::LockMode::Write,
@@ -169,7 +191,12 @@ fn update_at(path: &Path, changes: Value) -> Result<(), EngineError> {
     merge(&mut value, changes);
     let bytes = serde_json::to_vec_pretty(&value)
         .map_err(|error| EngineError::internal(error.to_string()))?;
-    atomic_write(path, &bytes)
+    atomic_write(path, &bytes)?;
+    // Retry this sync even when a previous attempt left the directory in place.
+    if parent.file_name().is_some() {
+        sync_directory(parent.parent().unwrap_or(parent))?;
+    }
+    Ok(())
 }
 
 fn merge(target: &mut Value, patch: Value) {
@@ -188,6 +215,32 @@ fn merge(target: &mut Value, patch: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_directory_requires_an_existing_outer_directory() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let outer = root.path().join("missing");
+        let directory = outer.join("settings");
+        let path = directory.join("config.json");
+        let error = update_at(&path, json!({"client":{"mode":"direct"}}))
+            .expect_err("outer directory must already exist");
+        assert_eq!(error.code(), EngineError::NOT_FOUND);
+        assert!(error.message().contains("config directory"));
+        assert!(!outer.exists());
+
+        fs::create_dir(&outer).expect("user prepares outer directory");
+        fs::write(&directory, b"existing file").expect("conflicting file");
+        assert!(update_at(&path, json!({})).is_err());
+        assert_eq!(
+            fs::read(&directory).expect("unchanged file"),
+            b"existing file"
+        );
+
+        fs::remove_file(&directory).expect("remove conflict");
+        update_at(&path, json!({"client":{"mode":"direct"}})).expect("retry config update");
+        assert_eq!(read_at(&path).expect("config")["client"]["mode"], "direct");
+    }
+
     #[test]
     fn updates_preserve_other_settings_and_do_not_erase_model_fields() {
         let root = tempfile::tempdir().expect("temporary directory");

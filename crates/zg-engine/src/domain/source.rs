@@ -4,4 +4,4 @@ mod range;
 
 pub(crate) use file::{FileId, FileSnapshot, SourceFile};
 pub(crate) use format::{FileCategory, FileFormat};
-pub(crate) use range::{LineColumnRange, SourceRange, TextPosition, TextRange};
+pub(crate) use range::{ByteRange, SourceRange, TextRange};

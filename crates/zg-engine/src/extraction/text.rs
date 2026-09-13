@@ -107,12 +107,15 @@ fn chunk_text(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<TextChu
             let end_line_index = end_index - 1;
             chunks.push(TextChunk {
                 text: chunk,
-                range: TextRange {
-                    start_line: start_index + 1,
-                    end_line: end_index,
-                    start_byte_offset: line_offsets[start_index],
-                    end_byte_offset: line_offsets[end_line_index] + lines[end_line_index].len(),
-                },
+                range: TextRange::from_coordinates(
+                    line_offsets[start_index],
+                    line_offsets[end_line_index] + lines[end_line_index].len(),
+                    start_index + 1,
+                    end_index,
+                    0,
+                    lines[end_line_index].len(),
+                )
+                .expect("chunk coordinates refer to source lines"),
             });
         }
 
@@ -145,12 +148,15 @@ fn split_long_line(
         if !slice.trim().is_empty() {
             chunks.push(TextChunk {
                 text: slice.to_owned(),
-                range: TextRange {
-                    start_line: line_index + 1,
-                    end_line: line_index + 1,
-                    start_byte_offset: line_offset + byte_offset,
-                    end_byte_offset: line_offset + byte_offset + slice_bytes,
-                },
+                range: TextRange::from_coordinates(
+                    line_offset + byte_offset,
+                    line_offset + byte_offset + slice_bytes,
+                    line_index + 1,
+                    line_index + 1,
+                    byte_offset,
+                    byte_offset + slice_bytes,
+                )
+                .expect("chunk coordinates refer to a source line"),
             });
         }
         byte_offset += slice_bytes;
@@ -241,12 +247,7 @@ mod tests {
         assert_eq!(chunks[0].document_id().len(), 64);
         assert_eq!(
             *chunks[0].range(),
-            SourceRange::Text(TextRange {
-                start_line: 1,
-                end_line: 1,
-                start_byte_offset: 0,
-                end_byte_offset: 10,
-            })
+            SourceRange::Text(TextRange::from_text(&source.text, 0, 10).expect("first line"))
         );
         for chunk in &chunks {
             let Content::Text(text) = &test_content(chunk) else {
@@ -275,17 +276,23 @@ mod tests {
                     panic!("text fragment expected");
                 };
                 assert!(content.chars().count() <= max_chars);
-                let SourceRange::Text(TextRange {
-                    start_byte_offset,
-                    end_byte_offset,
-                    ..
-                }) = *chunk.range()
-                else {
+                let SourceRange::Text(range) = *chunk.range() else {
                     panic!("text range expected");
                 };
                 assert_eq!(
-                    source.text.get(start_byte_offset..end_byte_offset),
+                    source
+                        .text
+                        .get(range.start_byte_offset()..range.end_byte_offset()),
                     Some(content.as_str())
+                );
+                assert_eq!(
+                    range,
+                    TextRange::from_text(
+                        &source.text,
+                        range.start_byte_offset(),
+                        range.end_byte_offset(),
+                    )
+                    .expect("source coordinates")
                 );
             }
         }
@@ -301,6 +308,7 @@ mod tests {
             range.slice(&source.text).expect("full source span"),
             source.text
         );
+        assert_eq!((range.end_line(), range.end_byte_column()), (3, 0));
     }
 
     #[test]

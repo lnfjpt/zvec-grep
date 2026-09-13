@@ -9,6 +9,5 @@ pub(crate) use entity::{
     WindowFragment, validate_fragments,
 };
 pub(crate) use source::{
-    FileCategory, FileFormat, FileId, FileSnapshot, LineColumnRange, SourceFile, SourceRange,
-    TextPosition, TextRange,
+    ByteRange, FileCategory, FileFormat, FileId, FileSnapshot, SourceFile, SourceRange, TextRange,
 };

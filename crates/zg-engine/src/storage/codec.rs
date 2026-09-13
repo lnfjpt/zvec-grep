@@ -10,13 +10,13 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{
     EngineError, EngineResult,
     domain::{
-        Content, Entity, EntityContent, EntityFragment, EntityId, EntityMetadata, FileFormat,
-        FileId, FileSnapshot, FragmentId, ImageContent, SourceFile, SourceRange, SymbolType,
-        TableCell, TableCellRole, TableContent, TextRange, WindowFragment,
+        ByteRange, Content, Entity, EntityContent, EntityFragment, EntityId, EntityMetadata,
+        FileFormat, FileId, FileSnapshot, FragmentId, ImageContent, SourceFile, SourceRange,
+        SymbolType, TableCell, TableCellRole, TableContent, TextRange, WindowFragment,
     },
 };
 
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 // Nested tables add several JSON containers; keep records below serde's recursion limit.
 const MAX_TABLE_DEPTH: usize = 16;
 
@@ -268,7 +268,7 @@ impl FragmentRecord<'_> {
                 id: FragmentId::new(window.id.into_owned())?,
                 entity_id: EntityId::new(window.entity_id.into_owned())?,
                 file_id: FileId::new(window.file_id.into_owned())?,
-                range: window.range.into(),
+                range: window.range.try_into()?,
                 contents: decode_contents(window.contents)?,
                 metadata: window.metadata.map(Into::into),
             }),
@@ -300,7 +300,7 @@ impl EntityRecord<'_> {
         Ok(Entity {
             id: EntityId::new(self.id.into_owned())?,
             file_id: FileId::new(self.file_id.into_owned())?,
-            range: self.range.into(),
+            range: self.range.try_into()?,
             content: match self.content {
                 EntityContentRecord::Source(contents) => {
                     EntityContent::Source(decode_contents(contents)?)
@@ -469,25 +469,12 @@ enum RangeRecord {
         end_line: usize,
         start_byte_offset: usize,
         end_byte_offset: usize,
+        start_byte_column: usize,
+        end_byte_column: usize,
     },
     Byte {
         start_offset: u64,
         end_offset: u64,
-    },
-    Page {
-        page: usize,
-    },
-    PageText {
-        page: usize,
-        start_byte_offset: usize,
-        end_byte_offset: usize,
-    },
-    PageRegion {
-        page: usize,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
     },
 }
 
@@ -496,91 +483,50 @@ impl From<SourceRange> for RangeRecord {
         match range {
             SourceRange::File => Self::File,
             SourceRange::Text(range) => Self::Text {
-                start_line: range.start_line,
-                end_line: range.end_line,
-                start_byte_offset: range.start_byte_offset,
-                end_byte_offset: range.end_byte_offset,
+                start_line: range.start_line(),
+                end_line: range.end_line(),
+                start_byte_offset: range.start_byte_offset(),
+                end_byte_offset: range.end_byte_offset(),
+                start_byte_column: range.start_byte_column(),
+                end_byte_column: range.end_byte_column(),
             },
-            SourceRange::Byte {
-                start_offset,
-                end_offset,
-            } => Self::Byte {
-                start_offset,
-                end_offset,
-            },
-            SourceRange::Page { page } => Self::Page { page },
-            SourceRange::PageText {
-                page,
-                start_byte_offset,
-                end_byte_offset,
-            } => Self::PageText {
-                page,
-                start_byte_offset,
-                end_byte_offset,
-            },
-            SourceRange::PageRegion {
-                page,
-                x,
-                y,
-                width,
-                height,
-            } => Self::PageRegion {
-                page,
-                x,
-                y,
-                width,
-                height,
+            SourceRange::Byte(range) => Self::Byte {
+                start_offset: range.start_offset,
+                end_offset: range.end_offset,
             },
         }
     }
 }
 
-impl From<RangeRecord> for SourceRange {
-    fn from(range: RangeRecord) -> Self {
-        match range {
+impl TryFrom<RangeRecord> for SourceRange {
+    type Error = EngineError;
+
+    fn try_from(range: RangeRecord) -> EngineResult<Self> {
+        Ok(match range {
             RangeRecord::File => Self::File,
             RangeRecord::Text {
                 start_line,
                 end_line,
                 start_byte_offset,
                 end_byte_offset,
-            } => Self::Text(TextRange {
-                start_line,
-                end_line,
+                start_byte_column,
+                end_byte_column,
+            } => Self::Text(TextRange::from_coordinates(
                 start_byte_offset,
                 end_byte_offset,
-            }),
+                start_line,
+                end_line,
+                start_byte_column,
+                end_byte_column,
+            )?),
             RangeRecord::Byte {
                 start_offset,
                 end_offset,
-            } => Self::Byte {
+            } => Self::Byte(ByteRange {
                 start_offset,
                 end_offset,
-            },
-            RangeRecord::Page { page } => Self::Page { page },
-            RangeRecord::PageText {
-                page,
-                start_byte_offset,
-                end_byte_offset,
-            } => Self::PageText {
-                page,
-                start_byte_offset,
-                end_byte_offset,
-            },
-            RangeRecord::PageRegion {
-                page,
-                x,
-                y,
-                width,
-                height,
-            } => Self::PageRegion {
-                page,
-                x,
-                y,
-                width,
-                height,
-            },
-        }
+            }),
+        })
     }
 }
 
@@ -805,12 +751,10 @@ mod tests {
     }
 
     fn text_range() -> SourceRange {
-        SourceRange::Text(TextRange {
-            start_line: 2,
-            end_line: 2,
-            start_byte_offset: "前言\n".len(),
-            end_byte_offset: "前言\n正文 😀".len(),
-        })
+        let source = "前言\n正文 😀";
+        SourceRange::Text(
+            TextRange::from_text(source, "前言\n".len(), source.len()).expect("text range"),
+        )
     }
 
     fn cell(
@@ -912,7 +856,7 @@ mod tests {
             panic!("text range");
         };
         assert_eq!(
-            "前言\n正文 😀".get(range.start_byte_offset..range.end_byte_offset),
+            "前言\n正文 😀".get(range.start_byte_offset()..range.end_byte_offset()),
             Some("正文 😀")
         );
         let encoded: Value =
@@ -922,26 +866,31 @@ mod tests {
             encoded["value"]["value"]["content"]["value"][1]["value"]["data"],
             "AAH/"
         );
+        assert_eq!(encoded["version"], 3);
         let ranges = [
-            SourceRange::File,
-            text_range(),
-            SourceRange::Byte {
-                start_offset: 2,
-                end_offset: u64::MAX,
-            },
-            SourceRange::Page { page: 3 },
-            SourceRange::PageText {
-                page: 3,
-                start_byte_offset: 3,
-                end_byte_offset: 7,
-            },
-            SourceRange::PageRegion {
-                page: 3,
-                x: 1,
-                y: 2,
-                width: 3,
-                height: 4,
-            },
+            (SourceRange::File, json!({"kind": "file"})),
+            (
+                text_range(),
+                json!({
+                    "kind": "text", "start_line": 2, "end_line": 2,
+                    "start_byte_offset": 7, "end_byte_offset": 18,
+                    "start_byte_column": 0, "end_byte_column": 11,
+                }),
+            ),
+            (
+                SourceRange::Byte(ByteRange {
+                    start_offset: 2,
+                    end_offset: u64::MAX,
+                }),
+                json!({"kind": "byte", "start_offset": 2, "end_offset": u64::MAX}),
+            ),
+            (
+                SourceRange::Byte(ByteRange {
+                    start_offset: u64::MAX,
+                    end_offset: u64::MAX,
+                }),
+                json!({"kind": "byte", "start_offset": u64::MAX, "end_offset": u64::MAX}),
+            ),
         ];
         let symbols = [
             SymbolType::Module,
@@ -951,11 +900,11 @@ mod tests {
             SymbolType::Value,
             SymbolType::Alias,
         ];
-        for (range, symbol_type) in ranges.into_iter().zip(symbols) {
+        for ((range, stored_range), symbol_type) in ranges.iter().cycle().zip(symbols) {
             let EntityFragment::Standalone(mut entity) = fragment() else {
                 unreachable!()
             };
-            entity.range = range;
+            entity.range = *range;
             entity.metadata = Some(EntityMetadata::Code {
                 symbol_type,
                 symbol_name: Some("symbol".to_owned()),
@@ -965,7 +914,14 @@ mod tests {
                 documentation: Some("documentation".to_owned()),
                 modifiers: vec!["public".to_owned(), "async".to_owned()],
             });
-            round_trip(&EntityFragment::Standalone(entity));
+            let fragment = EntityFragment::Standalone(entity);
+            let encoded = encode_fragment(&fragment).expect("encode fragment");
+            let record: Value = serde_json::from_str(&encoded).expect("fragment JSON");
+            assert_eq!(&record["value"]["value"]["range"], stored_range);
+            assert_eq!(
+                decode_fragment(&encoded).expect("decode fragment"),
+                fragment
+            );
         }
         let representative = EntityFragment::Representative(Entity {
             id: EntityId::new("group").expect("entity ID"),
@@ -1026,26 +982,36 @@ mod tests {
         let original: Value =
             serde_json::from_str(&encode_fragment(&fragment()).expect("encode fragment"))
                 .expect("fragment JSON");
-        for (kind, mut record) in [("source file", file_record), ("fragment", original.clone())] {
-            record["version"] = json!(1);
-            if kind == "fragment" {
-                record["value"]["value"]["range"] = json!({
-                    "kind": "text", "start_line": 2, "end_line": 2,
-                    "start_utf16_offset": 3, "end_utf16_offset": 8,
-                });
+        for (kind, record) in [("source file", file_record), ("fragment", original.clone())] {
+            for version in [1, 2] {
+                let mut record = record.clone();
+                record["version"] = json!(version);
+                if kind == "fragment" {
+                    record["value"]["value"]["range"] = if version == 1 {
+                        json!({
+                            "kind": "text", "start_line": 2, "end_line": 2,
+                            "start_utf16_offset": 3, "end_utf16_offset": 8,
+                        })
+                    } else {
+                        json!({
+                            "kind": "text", "start_line": 2, "end_line": 2,
+                            "start_byte_offset": 7, "end_byte_offset": 18,
+                        })
+                    };
+                }
+                let json = record.to_string();
+                let error = if kind == "source file" {
+                    decode_file(&json).expect_err("legacy source record")
+                } else {
+                    decode_fragment(&json).expect_err("legacy text range")
+                };
+                assert!(
+                    error
+                        .message()
+                        .contains(&format!("unsupported stored {kind} version {version}"))
+                );
+                assert!(error.message().contains("rebuild the index"));
             }
-            let json = record.to_string();
-            let error = if kind == "source file" {
-                decode_file(&json).expect_err("legacy source record")
-            } else {
-                decode_fragment(&json).expect_err("legacy UTF-16 range")
-            };
-            assert!(
-                error
-                    .message()
-                    .contains(&format!("unsupported stored {kind} version 1"))
-            );
-            assert!(error.message().contains("rebuild the index"));
         }
         let mut record = original.clone();
         record["version"] = json!(VERSION + 1);
@@ -1065,9 +1031,11 @@ mod tests {
             record["value"]["value"]["content"]["value"][1]["value"][field] = value;
             assert_corrupt_fragment(&record);
         }
-        let mut record = original.clone();
-        record["value"]["value"]["range"]["start_line"] = json!(0);
-        assert_corrupt_fragment(&record);
+        for (field, value) in [("start_line", 0), ("end_byte_column", 12)] {
+            let mut record = original.clone();
+            record["value"]["value"]["range"][field] = json!(value);
+            assert_corrupt_fragment(&record);
+        }
         let mut record = original.clone();
         record["value"]["value"]["content"]["value"] = json!([]);
         assert_corrupt_fragment(&record);

@@ -73,11 +73,19 @@ Apply the target platform's signing requirements to distributed binaries and lib
 - `lexical` provides embedded grep retrieval.
 - `service` composes these capabilities behind `ZvecGrep`.
 
+## Source ranges
+
+- `File` addresses the complete original file.
+- `Byte` addresses a continuous span of original file bytes. The selected bytes need not form an independently decodable resource.
+- `Text` addresses a continuous span of the complete decoded UTF-8 source. Each endpoint records a global byte offset, a line number, and a byte column. Coordinates are read through `TextRange` methods; its endpoints remain private.
+
+Extractors choose the range that locates their output. Ranges describe positions; loading and parsing belong to the source-reading code. Range comparisons assume the same unchanged source file and coordinate space. Extraction and lexical search use the same text coordinates.
+
 ## Text conventions
 
 - Internal text is UTF-8. Decode sources consistently, remove the encoding BOM, and preserve original line endings and whitespace.
-- Text positions count UTF-8 bytes. Distinguish offsets in the full decoded source, columns within a line, and offsets within a page's text.
-- Byte spans are zero-based and half-open (`[start, end)`); line and page numbers are one-based. Exact text reads reject offsets that are out of bounds or split a UTF-8 character.
+- Text positions count UTF-8 bytes. Distinguish offsets in the full decoded source from columns within a line.
+- Byte spans and columns are zero-based and half-open (`[start, end)`); empty spans are valid and line numbers are one-based. An endpoint immediately after a newline is column zero of the next line. Exact text reads reject offsets that are out of bounds or split a UTF-8 character.
 - Source positions refer to the same file version and decoded text used during extraction. Outlines, normalized text, and other derived content retain their original source locations.
 - Raw byte ranges and file content hashes refer to the original file bytes, independently of text decoding.
 - Length limits state their units. Chunk budgets count UTF-16 code units; model limits count tokens. Truncation preserves character boundaries.

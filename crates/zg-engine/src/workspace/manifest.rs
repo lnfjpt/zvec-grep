@@ -11,7 +11,7 @@ use crate::{
         index::options::{Device, DiscoveryOptions, RootPath},
         info::result::{WorkspaceIndexEmbedding, WorkspaceIndexInfo, WorkspaceIndexPolicy},
     },
-    utils::{atomic_write, create_directories},
+    utils::{atomic_write, sync_directory},
 };
 
 pub(crate) const WORKSPACE_MANIFEST_FILE: &str = "manifest.json";
@@ -225,13 +225,28 @@ pub(crate) fn write_workspace_manifest(
     manifest: &WorkspaceManifest,
 ) -> Result<(), EngineError> {
     manifest.validate()?;
-    create_directories(home)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    if let Err(error) = builder.create(home)
+        && !(error.kind() == std::io::ErrorKind::AlreadyExists && home.is_dir())
+    {
+        return Err(manifest_io("create directory for", home, &error));
+    }
     let path = workspace_manifest_path(home);
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
         EngineError::internal(format!("failed to encode workspace manifest: {error}"))
     })?;
     bytes.push(b'\n');
-    atomic_write(&path, &bytes)
+    atomic_write(&path, &bytes)?;
+    if home.file_name().is_some() {
+        sync_directory(home.parent().unwrap_or(home))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn delete_workspace_manifest(home: &Path) -> Result<(), EngineError> {

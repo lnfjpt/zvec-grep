@@ -3,7 +3,7 @@
 use crate::{
     EngineError,
     models::{EmbeddingCatalogEntry, get_embedding_model_catalog_entry},
-    utils::{atomic_write, create_directories},
+    utils::{atomic_write, sync_directory},
     workspace::{
         layout::{find_nearest_workspace, workspace_index_location},
         manifest::read_workspace_manifest,
@@ -233,7 +233,28 @@ fn signing_key(create: bool) -> Result<Vec<u8>, EngineError> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        create_directories(parent)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        if let Err(error) = builder.create(parent)
+            && !(error.kind() == std::io::ErrorKind::AlreadyExists && parent.is_dir())
+        {
+            return Err(EngineError::from_io(
+                format!(
+                    "create authorization key directory '{}' (parent must already exist)",
+                    parent.display()
+                ),
+                &error,
+            ));
+        }
+        sync_directory(parent)?;
+        if parent.file_name().is_some() {
+            sync_directory(parent.parent().unwrap_or(parent))?;
+        }
         let temporary = parent.join(format!(".authorization-key-{}", uuid::Uuid::new_v4()));
         let key = [
             uuid::Uuid::new_v4().as_bytes().as_slice(),
@@ -350,9 +371,27 @@ fn persist_grant(grant: Grant) -> Result<(), EngineError> {
         signing_key(true)?,
     )
     .to_vec();
-    create_directories(&location.home)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    if let Err(error) = builder.create(&location.home)
+        && !(error.kind() == std::io::ErrorKind::AlreadyExists && location.home.is_dir())
+    {
+        return Err(EngineError::from_io(
+            format!(
+                "create workspace authorization directory '{}'",
+                location.home.display()
+            ),
+            &error,
+        ));
+    }
     let bytes = serde_json::to_vec_pretty(&SignedGrant { grant, signature }).map_err(json)?;
-    atomic_write(&location.home.join("authorization.json"), &bytes)
+    atomic_write(&location.home.join("authorization.json"), &bytes)?;
+    sync_directory(&location.root)
 }
 
 fn read_grant(root: &Path) -> Result<Option<Grant>, EngineError> {

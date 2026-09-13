@@ -7,8 +7,8 @@ use tree_sitter::{Language, Node, Parser};
 use crate::{
     EngineError,
     domain::{
-        Content, Entity, EntityContent, EntityFragment, EntityMetadata, FileFormat, FileId,
-        FragmentId, SourceRange, SymbolType, WindowFragment,
+        Content, Entity, EntityContent, EntityFragment, EntityMetadata, FileFormat, FragmentId,
+        SourceRange, SymbolType, WindowFragment,
     },
     utils::{
         byte_offset_at_utf16_ceil, byte_offset_at_utf16_floor, collapse_whitespace,
@@ -343,12 +343,15 @@ fn node_to_window(node: Node<'_>, source: &[u8]) -> CodeWindow {
     CodeWindow {
         text: text(node, source).to_owned(),
         embedding_text: None,
-        range: TextRange {
-            start_line: node.start_position().row + 1,
-            end_line: node.end_position().row + 1,
-            start_byte_offset: node.start_byte(),
-            end_byte_offset: node.end_byte(),
-        },
+        range: TextRange::from_coordinates(
+            node.start_byte(),
+            node.end_byte(),
+            node.start_position().row + 1,
+            node.end_position().row + 1,
+            node.start_position().column,
+            node.end_position().column,
+        )
+        .expect("parser coordinates refer to source text"),
     }
 }
 
@@ -366,6 +369,7 @@ fn split_large_node(
             max_chars,
             node.start_position().row + 1,
             node.start_byte(),
+            node.start_position().column,
             overlap_chars,
         );
     }
@@ -389,6 +393,7 @@ fn split_large_node(
                 max_chars,
                 statement.start_position().row + 1,
                 statement.start_byte(),
+                statement.start_position().column,
                 overlap_chars,
             ));
             group_start = index + 1;
@@ -455,12 +460,15 @@ fn slice_statements(
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
-        range: TextRange {
-            start_line: statements[start_index].start_position().row + 1,
-            end_line: statements[end_index].end_position().row + 1,
-            start_byte_offset: start,
-            end_byte_offset: end,
-        },
+        range: TextRange::from_coordinates(
+            start,
+            end,
+            statements[start_index].start_position().row + 1,
+            statements[end_index].end_position().row + 1,
+            statements[start_index].start_position().column,
+            statements[end_index].end_position().column,
+        )
+        .expect("parser coordinates refer to source text"),
     }
 }
 
@@ -469,6 +477,7 @@ fn split_text_by_lines(
     max_chars: usize,
     start_line: usize,
     start_byte_offset: usize,
+    start_byte_column: usize,
     overlap_chars: usize,
 ) -> Vec<CodeWindow> {
     let lines = value.split('\n').collect::<Vec<_>>();
@@ -483,6 +492,11 @@ fn split_text_by_lines(
                 max_chars,
                 start_line + line_index,
                 start_byte_offset + line_offsets[line_index],
+                if line_index == 0 {
+                    start_byte_column
+                } else {
+                    0
+                },
                 overlap_chars,
             ));
             line_index += 1;
@@ -503,12 +517,19 @@ fn split_text_by_lines(
         windows.push(CodeWindow {
             text: chunk.clone(),
             embedding_text: None,
-            range: TextRange {
-                start_line: start_line + line_index,
-                end_line: start_line + end_index - 1,
-                start_byte_offset: start_byte_offset + line_offsets[line_index],
-                end_byte_offset: start_byte_offset + line_offsets[line_index] + chunk.len(),
-            },
+            range: TextRange::from_coordinates(
+                start_byte_offset + line_offsets[line_index],
+                start_byte_offset + line_offsets[line_index] + chunk.len(),
+                start_line + line_index,
+                start_line + end_index - 1,
+                if line_index == 0 {
+                    start_byte_column
+                } else {
+                    0
+                },
+                lines[end_index - 1].len() + if end_index == 1 { start_byte_column } else { 0 },
+            )
+            .expect("window coordinates refer to source lines"),
         });
         if end_index >= lines.len() {
             break;
@@ -524,6 +545,7 @@ fn split_long_line_by_chars(
     max_chars: usize,
     line_number: usize,
     start_byte_offset: usize,
+    start_byte_column: usize,
     overlap_chars: usize,
 ) -> Vec<CodeWindow> {
     let total_chars = utf16_len(line);
@@ -541,12 +563,15 @@ fn split_long_line_by_chars(
         windows.push(CodeWindow {
             text: line[start_byte..end_byte].to_owned(),
             embedding_text: None,
-            range: TextRange {
-                start_line: line_number,
-                end_line: line_number,
-                start_byte_offset: start_byte_offset + start_byte,
-                end_byte_offset: start_byte_offset + end_byte,
-            },
+            range: TextRange::from_coordinates(
+                start_byte_offset + start_byte,
+                start_byte_offset + end_byte,
+                line_number,
+                line_number,
+                start_byte_column + start_byte,
+                start_byte_column + end_byte,
+            )
+            .expect("window coordinates refer to a source line"),
         });
         if actual_end >= total_chars {
             break;
@@ -844,7 +869,6 @@ struct ScriptBlock<'source> {
     text: &'source str,
     format: FileFormat,
     jsx: bool,
-    start_line: usize,
     start_byte_offset: usize,
 }
 
@@ -853,6 +877,8 @@ fn extract_script_blocks(
     max_chars: usize,
     overlap_chars: usize,
 ) -> Result<Vec<IndexingExtractionFragment>, EngineError> {
+    let lines = source.text.split('\n').collect::<Vec<_>>();
+    let line_offsets = line_byte_offsets(&lines);
     let mut fragments = Vec::new();
     for block in find_script_blocks(&source.text) {
         let mut block_source = source.clone();
@@ -867,10 +893,10 @@ fn extract_script_blocks(
             block.jsx,
         )?;
         let remapped = remap_script_block_fragments(
-            &source.file.id,
+            source,
             block_fragments,
             fragments.len(),
-            block.start_line,
+            &line_offsets,
             block.start_byte_offset,
         );
         fragments.extend(remapped);
@@ -906,7 +932,6 @@ fn find_script_blocks(value: &str) -> Vec<ScriptBlock<'_>> {
             text: &value[content_start..close],
             format,
             jsx,
-            start_line: line_at_offset(bytes, content_start),
             start_byte_offset: content_start,
         });
         cursor = close + b"</script>".len();
@@ -920,16 +945,6 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8], start: usize) -> 
         .windows(needle.len())
         .position(|window| window.eq_ignore_ascii_case(needle))
         .map(|offset| start + offset)
-}
-
-fn line_at_offset(source: &[u8], offset: usize) -> usize {
-    let mut line = 1;
-    for byte in &source[..offset] {
-        if *byte == b'\n' {
-            line += 1;
-        }
-    }
-    line
 }
 
 fn script_block_format(attrs: &str) -> (FileFormat, bool) {
@@ -971,10 +986,10 @@ fn script_block_format(attrs: &str) -> (FileFormat, bool) {
 }
 
 fn remap_script_block_fragments(
-    file_id: &FileId,
+    source: &TextSource,
     fragments: Vec<IndexingExtractionFragment>,
     start_index: usize,
-    start_line: usize,
+    line_offsets: &[usize],
     start_byte_offset: usize,
 ) -> Vec<IndexingExtractionFragment> {
     let id_map = fragments
@@ -983,7 +998,7 @@ fn remap_script_block_fragments(
         .map(|(index, item)| {
             (
                 item.fragment.document_id().to_owned(),
-                make_entity_id(file_id, start_index + index),
+                make_entity_id(&source.file.id, start_index + index),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -998,7 +1013,7 @@ fn remap_script_block_fragments(
             let range = match &mut item.fragment {
                 EntityFragment::Standalone(entity) | EntityFragment::Representative(entity) => {
                     entity.id = id;
-                    entity.file_id = file_id.clone();
+                    entity.file_id = source.file.id.clone();
                     &mut entity.range
                 }
                 EntityFragment::Window(window) => {
@@ -1007,15 +1022,18 @@ fn remap_script_block_fragments(
                         .get(window.entity_id.as_str())
                         .expect("window owner is registered")
                         .clone();
-                    window.file_id = file_id.clone();
+                    window.file_id = source.file.id.clone();
                     &mut window.range
                 }
             };
             if let SourceRange::Text(range) = range {
-                range.start_line += start_line - 1;
-                range.end_line += start_line - 1;
-                range.start_byte_offset += start_byte_offset;
-                range.end_byte_offset += start_byte_offset;
+                *range = TextRange::from_offsets(
+                    &source.text,
+                    line_offsets,
+                    start_byte_offset + range.start_byte_offset(),
+                    start_byte_offset + range.end_byte_offset(),
+                )
+                .expect("script coordinates refer to the full source");
             }
             item
         })
@@ -1050,17 +1068,23 @@ mod tests {
         let Content::Text(content) = &test_content(fragment) else {
             panic!("text fragment expected");
         };
-        let SourceRange::Text(TextRange {
-            start_byte_offset,
-            end_byte_offset,
-            ..
-        }) = *fragment.range()
-        else {
+        let SourceRange::Text(range) = *fragment.range() else {
             panic!("text range expected");
         };
         assert_eq!(
-            source.text.get(start_byte_offset..end_byte_offset),
+            source
+                .text
+                .get(range.start_byte_offset()..range.end_byte_offset()),
             Some(content.as_str())
+        );
+        assert_eq!(
+            range,
+            TextRange::from_text(
+                &source.text,
+                range.start_byte_offset(),
+                range.end_byte_offset(),
+            )
+            .expect("source coordinates")
         );
     }
 
@@ -1126,11 +1150,11 @@ mod tests {
         );
         assert!(matches!(
             *add.range(),
-            SourceRange::Text(TextRange { start_line: 2, .. })
+            SourceRange::Text(range) if range.start_line() == 2
         ));
         assert!(matches!(
             *create.range(),
-            SourceRange::Text(TextRange { start_line: 8, .. })
+            SourceRange::Text(range) if range.start_line() == 8
         ));
         assert_eq!(
             fragments
@@ -1442,12 +1466,30 @@ mod tests {
         assert_source_backed(&source, second);
         assert!(matches!(
             first.range(),
-            SourceRange::Text(TextRange { start_line: 3, .. })
+            SourceRange::Text(range) if range.start_line() == 3
         ));
         assert!(matches!(
             second.range(),
-            SourceRange::Text(TextRange { start_line: 7, .. })
+            SourceRange::Text(range) if range.start_line() == 7
         ));
+
+        let inline_script = test_source(
+            FileFormat::Vue,
+            "inline.vue",
+            "<p>你好 😀</p><script>export function inline() { return 1; }</script>",
+        );
+        let fragments =
+            extract(&inline_script, ChunkOptions::default()).expect("inline script extraction");
+        let inline = named(&fragments, "inline");
+        assert_source_backed(&inline_script, inline);
+        let SourceRange::Text(range) = inline.range() else {
+            panic!("text range expected");
+        };
+        assert_eq!(range.start_line(), 1);
+        assert_eq!(
+            range.start_byte_column(),
+            "<p>你好 😀</p><script>export ".len()
+        );
 
         let plain_script = test_source(
             FileFormat::Vue,
@@ -1462,6 +1504,10 @@ mod tests {
             Content::Text("\r\n// 没有声明\r\n".to_owned())
         );
         assert!(fallback[0].metadata().is_none());
+        assert!(matches!(
+            fallback[0].range(),
+            SourceRange::Text(range) if range.end_line() == 4 && range.end_byte_column() == 0
+        ));
 
         let no_script = test_source(FileFormat::Svelte, "plain.svelte", "<h1>No script</h1>");
         let fallback = extract(&no_script, ChunkOptions::default()).expect("component fallback");
@@ -1522,14 +1568,11 @@ mod tests {
         let fragments = extract(&source, ChunkOptions::default()).expect("offset extraction");
         let fragment = named(&fragments, "afterEmoji");
         assert_source_backed(&source, fragment);
-        let SourceRange::Text(TextRange {
-            start_byte_offset, ..
-        }) = *fragment.range()
-        else {
+        let SourceRange::Text(range) = *fragment.range() else {
             panic!("text range expected");
         };
         assert_eq!(
-            start_byte_offset,
+            range.start_byte_offset(),
             "const prefix = \"你好 😀\";\r\nexport ".len()
         );
     }

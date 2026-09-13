@@ -1735,31 +1735,26 @@ fn range_label(range: &ContentRange) -> String {
         ContentRange::Text {
             start_line,
             end_line,
+            start_byte_offset,
+            end_byte_offset,
+            end_byte_column,
             ..
+        } => {
+            let last_line = if *end_byte_column == 0 && start_byte_offset < end_byte_offset {
+                end_line.saturating_sub(1)
+            } else {
+                *end_line
+            };
+            if *start_line == last_line {
+                start_line.to_string()
+            } else {
+                format!("{start_line}-{last_line}")
+            }
         }
-        | ContentRange::LineColumn {
-            start_line,
-            end_line,
-            ..
-        } if start_line == end_line => start_line.to_string(),
-        ContentRange::Text {
-            start_line,
-            end_line,
-            ..
-        }
-        | ContentRange::LineColumn {
-            start_line,
-            end_line,
-            ..
-        } => format!("{start_line}-{end_line}"),
         ContentRange::Byte {
             start_offset,
             end_offset,
         } => format!("bytes:{start_offset}-{end_offset}"),
-        ContentRange::Page { page } => format!("page:{page}"),
-        ContentRange::PageText { page, .. } | ContentRange::PageRegion { page, .. } => {
-            format!("page:{page}")
-        }
     }
 }
 
@@ -1966,6 +1961,26 @@ mod tests {
         empty.query = Some("  ".to_owned());
         empty.fts = None;
         assert!(empty.into_request().is_err());
+    }
+
+    #[test]
+    fn range_labels_show_covered_lines_and_preserve_empty_positions() {
+        for (start_line, end_line, start_byte_offset, end_byte_offset, end_byte_column, label) in [
+            (1, 2, 0, 4, 0, "1"),
+            (1, 3, 0, 8, 0, "1-2"),
+            (1, 3, 0, 9, 1, "1-3"),
+            (3, 3, 8, 8, 0, "3"),
+        ] {
+            let range = super::ContentRange::Text {
+                start_line,
+                end_line,
+                start_byte_offset,
+                end_byte_offset,
+                start_byte_column: 0,
+                end_byte_column,
+            };
+            assert_eq!(super::range_label(&range), label);
+        }
     }
 
     fn index_input() -> IndexInput {

@@ -694,12 +694,9 @@ mod tests {
         };
 
         let file_id = FileId::new("file").expect("file id");
-        let range = SourceRange::Text(TextRange {
-            start_line: 1,
-            end_line: 20,
-            start_byte_offset: 0,
-            end_byte_offset: 100,
-        });
+        let range = SourceRange::Text(
+            TextRange::from_coordinates(0, 100, 1, 20, 0, 5).expect("valid range"),
+        );
         let mut hit = SearchHit {
             entity: Entity {
                 id: EntityId::new("entity").expect("entity id"),
@@ -740,12 +737,9 @@ mod tests {
             super::context_item_target(&hit).content_role,
             ContextContentRole::Outline
         );
-        let window_range = SourceRange::Text(TextRange {
-            start_line: 2,
-            end_line: 2,
-            start_byte_offset: 10,
-            end_byte_offset: 20,
-        });
+        let window_range = SourceRange::Text(
+            TextRange::from_coordinates(10, 20, 2, 2, 0, 10).expect("valid range"),
+        );
         hit.evidence.push(SearchEvidence {
             fragment: EntityFragment::Window(WindowFragment {
                 id: FragmentId::new("window").expect("fragment id"),
@@ -836,6 +830,8 @@ mod tests {
                 end_line: 1,
                 start_byte_offset: 0,
                 end_byte_offset: 1,
+                start_byte_column: 0,
+                end_byte_column: 1,
             },
             excerpt_range: None,
             content: id.to_owned(),

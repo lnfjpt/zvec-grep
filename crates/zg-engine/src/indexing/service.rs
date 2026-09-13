@@ -48,7 +48,7 @@ use crate::{
 use super::pipeline::{IndexingContext, get_workspace_index_status, index_workspace};
 
 const DEFAULT_LOCAL_EMBEDDING: &str = "local/potion-code-16m-v2";
-const CURRENT_INDEX_VERSION: u32 = 2;
+const CURRENT_INDEX_VERSION: u32 = 3;
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceIndexService {
@@ -982,7 +982,7 @@ mod tests {
         for version in [None, Some(super::CURRENT_INDEX_VERSION)] {
             super::assert_index_version(version).expect("supported or unbuilt index");
         }
-        for version in [1, super::CURRENT_INDEX_VERSION + 1] {
+        for version in [1, 2, super::CURRENT_INDEX_VERSION + 1] {
             let error = super::assert_index_version(Some(version))
                 .expect_err("incompatible text coordinates");
             assert!(error.message().contains("rebuild the index"));

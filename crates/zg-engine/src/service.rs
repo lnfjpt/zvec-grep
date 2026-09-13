@@ -245,7 +245,7 @@ fn context_from_lexical(query: String, reply: LexicalSearchReply) -> ContextResu
     }
 }
 
-fn lexical_range(range: crate::domain::LineColumnRange) -> ContentRange {
+fn lexical_range(range: crate::domain::TextRange) -> ContentRange {
     range.into()
 }
 

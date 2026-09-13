@@ -15,7 +15,7 @@ use crate::{
         SourceRange,
     },
     extraction::{ChunkOptions, TextSource, extract},
-    utils::{decode_text, line_byte_offsets, sha256_hex},
+    utils::{decode_text, sha256_hex},
 };
 
 pub(crate) const RG_STRUCTURE_ENRICH_FILE_LIMIT: usize = 100;
@@ -24,24 +24,6 @@ const STRUCTURE_FILE_ID_NAMESPACE: &str = "__rg_structure__";
 pub(crate) struct StructureEnrichmentResult {
     pub items: Vec<ContextItem>,
     pub diagnostics: StructureEnrichmentDiagnostics,
-}
-
-struct StructuralSource {
-    text: String,
-    line_byte_offsets: Vec<usize>,
-    fragments: Vec<EntityFragment>,
-}
-
-impl StructuralSource {
-    fn byte_offset(&self, line: usize, column: usize) -> Option<usize> {
-        let start = *self.line_byte_offsets.get(line.checked_sub(1)?)?;
-        let end = self
-            .line_byte_offsets
-            .get(line)
-            .map_or(self.text.len(), |next| next - 1);
-        let offset = start.checked_add(column)?;
-        (offset <= end && self.text.is_char_boundary(offset)).then_some(offset)
-    }
 }
 
 pub(crate) fn enrich_lexical_items_with_structure(
@@ -118,7 +100,7 @@ fn parse_structural_source(
     root: &Path,
     absolute_path: &Path,
     explicit_max_size: Option<u64>,
-) -> Option<StructuralSource> {
+) -> Option<Vec<EntityFragment>> {
     let metadata = fs::metadata(absolute_path).ok()?;
     if !metadata.is_file() || metadata.len() == 0 {
         return None;
@@ -171,37 +153,31 @@ fn parse_structural_source(
     if structural.is_empty() {
         return None;
     }
-    Some(StructuralSource {
-        line_byte_offsets: line_byte_offsets(&source.text.split('\n').collect::<Vec<_>>()),
-        text: source.text,
-        fragments: structural,
-    })
+    Some(structural)
 }
 
 fn lexical_match_range(item: &ContextItem) -> Option<&ContentRange> {
     let range = item.excerpt_range.as_ref().unwrap_or(&item.range);
-    matches!(range, ContentRange::LineColumn { .. }).then_some(range)
+    matches!(range, ContentRange::Text { .. }).then_some(range)
 }
 
 fn smallest_containing_fragment<'fragment>(
-    source: &'fragment StructuralSource,
+    fragments: &'fragment [EntityFragment],
     inner: &ContentRange,
 ) -> Option<&'fragment EntityFragment> {
-    let ContentRange::LineColumn {
-        start_line,
-        end_line,
-        start_byte_column,
-        end_byte_column,
+    let ContentRange::Text {
+        start_byte_offset,
+        end_byte_offset,
+        ..
     } = inner
     else {
         return None;
     };
-    let start = source.byte_offset(*start_line, *start_byte_column)?;
-    let end = source.byte_offset(*end_line, *end_byte_column)?;
-    source
-        .fragments
+    fragments
         .iter()
-        .filter(|fragment| text_range_contains(fragment.range(), start..end))
+        .filter(|fragment| {
+            text_range_contains(fragment.range(), *start_byte_offset..*end_byte_offset)
+        })
         .min_by(|left, right| compare_fragment_container(left, right))
 }
 
@@ -209,8 +185,8 @@ fn text_range_contains(outer: &SourceRange, inner: std::ops::Range<usize>) -> bo
     matches!(
         outer,
         SourceRange::Text(range) if inner.start <= inner.end
-            && range.start_byte_offset <= inner.start
-            && range.end_byte_offset >= inner.end
+            && range.start_byte_offset() <= inner.start
+            && range.end_byte_offset() >= inner.end
     )
 }
 
@@ -224,8 +200,8 @@ fn compare_fragment_container(left: &EntityFragment, right: &EntityFragment) -> 
 fn fragment_byte_span(fragment: &EntityFragment) -> usize {
     match fragment.range() {
         SourceRange::Text(range) => range
-            .end_byte_offset
-            .saturating_sub(range.start_byte_offset),
+            .end_byte_offset()
+            .saturating_sub(range.start_byte_offset()),
         _ => usize::MAX,
     }
 }
@@ -260,9 +236,10 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::api::context::result::{
-        ContentRange, ContextContentRole, ContextItem, ContextItemKind, ContextItemStatus,
-        EntityMetadata, MatchedBy, StructureEnrichmentSource,
+        ContextContentRole, ContextItem, ContextItemKind, ContextItemStatus, EntityMetadata,
+        MatchedBy, StructureEnrichmentSource,
     };
+    use crate::domain::TextRange;
 
     use super::enrich_lexical_items_with_structure;
 
@@ -366,12 +343,9 @@ mod tests {
         let items = ["one", "two"].map(|needle| {
             let mut item = lexical_item(directory.path(), "same-line.ts", 1, text.trim_end());
             let start = text.find(needle).expect("matched text");
-            item.range = ContentRange::LineColumn {
-                start_line: 1,
-                end_line: 1,
-                start_byte_column: start,
-                end_byte_column: start + needle.len(),
-            };
+            item.range = TextRange::from_text(text, start, start + needle.len())
+                .expect("matched range")
+                .into();
             item
         });
         let result = enrich_lexical_items_with_structure(directory.path(), items.into(), None);
@@ -385,17 +359,20 @@ mod tests {
     }
 
     fn lexical_item(root: &Path, relative: &str, line: usize, content: &str) -> ContextItem {
+        let text = fs::read_to_string(root.join(relative)).expect("fixture source");
+        let start = text
+            .split_inclusive('\n')
+            .take(line - 1)
+            .map(str::len)
+            .sum();
+        let range =
+            TextRange::from_text(&text, start, start + content.len()).expect("fixture range");
         ContextItem {
             kind: ContextItemKind::LexicalMatch,
             rank: 0,
             absolute_path: root.join(relative),
             relative_path: relative.into(),
-            range: ContentRange::LineColumn {
-                start_line: line,
-                end_line: line,
-                start_byte_column: 0,
-                end_byte_column: content.len(),
-            },
+            range: range.into(),
             excerpt_range: None,
             content: content.to_owned(),
             content_role: Some(ContextContentRole::Source),

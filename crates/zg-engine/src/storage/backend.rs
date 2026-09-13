@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, DirBuilder, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
     time::{SystemTime, UNIX_EPOCH},
@@ -13,7 +13,7 @@ use crate::{
     EngineError, EngineResult,
     domain::{EntityId, FileId, validate_fragments},
     models::EmbeddingMetric,
-    utils::{atomic_write as write_record, create_directories, sync_directory},
+    utils::{atomic_write as write_record, sync_directory},
 };
 
 use super::{
@@ -26,7 +26,7 @@ use super::{
     zvec::NativeStore,
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const JOURNAL: &str = "pending.json";
 type StoreRegistry = Mutex<HashMap<PathBuf, Weak<SharedStore>>>;
 static STORES: OnceLock<StoreRegistry> = OnceLock::new();
@@ -156,8 +156,20 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
             ));
         }
         let read_only = options.is_read_only();
+        let outer = home.file_name().and_then(|_| home.parent());
         if !read_only {
-            create_directories(home)?;
+            let mut builder = DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            if let Err(error) = builder.create(home)
+                && !(error.kind() == std::io::ErrorKind::AlreadyExists && home.is_dir())
+            {
+                return Err(io_error("create index directory", home, &error));
+            }
         }
         let home = fs::canonicalize(home)
             .map_err(|error| io_error("locate index directory", home, &error))?;
@@ -176,6 +188,14 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
         }
         let (lock, schema) = prepare_storage(&home, &path, &options)?;
         let native = NativeStore::open(&path, &schema, read_only)?;
+        if !read_only {
+            // Repeat the same range after failures that leave directories in place.
+            sync_directory(&path)?;
+            sync_directory(&home)?;
+            if let Some(outer) = outer {
+                sync_directory(outer)?;
+            }
+        }
         let shared = Arc::new(SharedStore {
             state: Mutex::new(StoreState {
                 native,
@@ -484,7 +504,6 @@ fn load_schema(
             "embedding dimension must be in 1..=20,000",
         ));
     }
-    create_directories(path)?;
     write_record(
         &descriptor,
         &serde_json::to_vec(&SchemaRecord::new(embedding)).map_err(|error| json_error(&error))?,
@@ -523,10 +542,21 @@ fn prepare_storage(
             shared = false;
             continue;
         }
-        let schema = load_schema(path, options)?;
         if !read_only {
-            create_directories(path)?;
+            let mut builder = DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            if let Err(error) = builder.create(path)
+                && !(error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir())
+            {
+                return Err(io_error("create storage directory", path, &error));
+            }
         }
+        let schema = load_schema(path, options)?;
         dictionary::prepare(&path.join("dictionary"))?;
         if journal.exists() {
             let native = NativeStore::open(path, &schema, false)?;

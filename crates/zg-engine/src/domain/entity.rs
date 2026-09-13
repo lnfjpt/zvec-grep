@@ -229,19 +229,16 @@ pub(crate) fn validate_fragments<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::TextRange;
+    use crate::domain::{ByteRange, TextRange};
 
     fn file_id() -> FileId {
         FileId::new("source").expect("file id")
     }
 
     fn range(start: usize, end: usize) -> SourceRange {
-        SourceRange::Text(TextRange {
-            start_line: 1,
-            end_line: 1,
-            start_byte_offset: start,
-            end_byte_offset: end,
-        })
+        SourceRange::Text(
+            TextRange::from_coordinates(start, end, 1, 1, start, end).expect("valid range"),
+        )
     }
 
     fn entity(id: &str) -> Entity {
@@ -359,10 +356,10 @@ mod tests {
         );
 
         let mut invalid = entity("invalid");
-        invalid.range = SourceRange::Byte {
+        invalid.range = SourceRange::Byte(ByteRange {
             start_offset: 2,
             end_offset: 1,
-        };
+        });
         assert!(validate_fragments(&file_id(), &[EntityFragment::Standalone(invalid)]).is_err());
     }
 

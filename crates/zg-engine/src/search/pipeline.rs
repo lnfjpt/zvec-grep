@@ -1242,11 +1242,16 @@ mod tests {
     }
 
     fn text_range(start_line: usize, end_line: usize) -> SourceRange {
-        SourceRange::Text(TextRange {
-            start_line,
-            end_line,
-            start_byte_offset: 0,
-            end_byte_offset: 10,
-        })
+        SourceRange::Text(
+            TextRange::from_coordinates(
+                (start_line - 1) * 10,
+                end_line * 10 - 1,
+                start_line,
+                end_line,
+                0,
+                9,
+            )
+            .expect("valid range"),
+        )
     }
 }

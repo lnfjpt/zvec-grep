@@ -77,6 +77,11 @@ endpoint. Changing any of them requires a new grant. The signing key lives at
 `$ZVEC_GREP_HOME/authorization.key` (default `~/.zvec-grep/authorization.key`),
 or the path selected by `ZVEC_GREP_AUTHORIZATION_KEY_FILE`.
 
+Prepare the outer directory before initializing a custom signing-key location.
+For example, with `ZVEC_GREP_HOME=/data/apps/zg`, `/data/apps` must already exist;
+the engine creates `zg`. For an explicit key-file path, the engine can create its
+direct parent directory, but that directory's parent must already exist.
+
 Direct CLI, server CLI, and MCP read the same authorization on each operation;
 configure them to use the same signing key. Revocation takes effect for new
 operations without restarting the server. `--allow-remote` on `zg index` or

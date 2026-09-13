@@ -414,12 +414,15 @@ fn split_long_line(
         let text = &rest[..slice_bytes];
         windows.push(MarkdownWindow {
             text: text.to_owned(),
-            range: TextRange {
-                start_line: line_index + 1,
-                end_line: line_index + 1,
-                start_byte_offset: line_offset + byte_offset,
-                end_byte_offset: line_offset + byte_offset + slice_bytes,
-            },
+            range: TextRange::from_coordinates(
+                line_offset + byte_offset,
+                line_offset + byte_offset + slice_bytes,
+                line_index + 1,
+                line_index + 1,
+                byte_offset,
+                byte_offset + slice_bytes,
+            )
+            .expect("window coordinates refer to a source line"),
         });
         byte_offset += slice_bytes;
     }
@@ -434,12 +437,15 @@ fn lines_to_window(
 ) -> MarkdownWindow {
     MarkdownWindow {
         text: lines[start_index..=end_index].join("\n"),
-        range: TextRange {
-            start_line: start_index + 1,
-            end_line: end_index + 1,
-            start_byte_offset: line_offsets[start_index],
-            end_byte_offset: line_offsets[end_index] + lines[end_index].len(),
-        },
+        range: TextRange::from_coordinates(
+            line_offsets[start_index],
+            line_offsets[end_index] + lines[end_index].len(),
+            start_index + 1,
+            end_index + 1,
+            0,
+            lines[end_index].len(),
+        )
+        .expect("window coordinates refer to source lines"),
     }
 }
 
@@ -553,6 +559,7 @@ mod tests {
                 "Setext child",
                 "------------",
                 "body",
+                "",
             ]
             .join("\r\n"),
         );
@@ -593,17 +600,23 @@ mod tests {
             let Content::Text(content) = test_content(&fragment) else {
                 panic!("text content expected");
             };
-            let SourceRange::Text(TextRange {
-                start_byte_offset,
-                end_byte_offset,
-                ..
-            }) = *fragment.range()
-            else {
+            let SourceRange::Text(range) = *fragment.range() else {
                 panic!("text range expected");
             };
             assert_eq!(
-                source.text.get(start_byte_offset..end_byte_offset),
+                source
+                    .text
+                    .get(range.start_byte_offset()..range.end_byte_offset()),
                 Some(content.as_str())
+            );
+            assert_eq!(
+                range,
+                TextRange::from_text(
+                    &source.text,
+                    range.start_byte_offset(),
+                    range.end_byte_offset(),
+                )
+                .expect("source coordinates")
             );
         }
     }

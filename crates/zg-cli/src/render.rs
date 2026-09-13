@@ -99,13 +99,18 @@ pub fn write_context_with_options(
             ContentRange::Text {
                 start_line,
                 end_line,
+                start_byte_offset,
+                end_byte_offset,
+                end_byte_column,
                 ..
+            } => {
+                let last_line = if *end_byte_column == 0 && start_byte_offset < end_byte_offset {
+                    end_line.saturating_sub(1)
+                } else {
+                    *end_line
+                };
+                format!("{start_line}-{last_line}")
             }
-            | ContentRange::LineColumn {
-                start_line,
-                end_line,
-                ..
-            } => format!("{start_line}-{end_line}"),
             _ => start_line(&item.range).to_string(),
         };
         let matched_by = serde_json::to_value(item.matched_by).map_err(io::Error::other)?;
@@ -809,9 +814,7 @@ environment values.";
 
 fn start_line(range: &ContentRange) -> usize {
     match range {
-        ContentRange::Text { start_line, .. } | ContentRange::LineColumn { start_line, .. } => {
-            *start_line
-        }
+        ContentRange::Text { start_line, .. } => *start_line,
         _ => 0,
     }
 }
@@ -826,7 +829,7 @@ mod output_tests {
 
     #[test]
     fn preview_modes_and_trace_preserve_indexed_result_information() {
-        let result = ContextResult {
+        let mut result = ContextResult {
             query: "needle".into(),
             freshness: None,
             background_refresh: None,
@@ -845,7 +848,9 @@ mod output_tests {
                     start_line: 1,
                     end_line: 20,
                     start_byte_offset: 0,
-                    end_byte_offset: 100,
+                    end_byte_offset: 130,
+                    start_byte_column: 0,
+                    end_byte_column: 6,
                 },
                 excerpt_range: None,
                 content: (1..=20)
@@ -891,5 +896,21 @@ mod output_tests {
         let full = render(PreviewMode::Full, true);
         assert!(full.contains("20: line20"));
         assert!(full.contains("score: 0.7500"));
+
+        result.items[0].range = ContentRange::Text {
+            start_line: 1,
+            end_line: 21,
+            start_byte_offset: 0,
+            end_byte_offset: 131,
+            start_byte_column: 0,
+            end_byte_column: 0,
+        };
+        result.items[0].content.push('\n');
+        let mut buffer = Vec::new();
+        write_context_with_options(&mut buffer, &result, OutputOptions::default(), false)
+            .expect("render trailing newline");
+        let rendered = String::from_utf8(buffer).expect("UTF-8");
+        assert!(rendered.contains("sample.rs:1-20"));
+        assert!(!rendered.contains("sample.rs:1-21"));
     }
 }
