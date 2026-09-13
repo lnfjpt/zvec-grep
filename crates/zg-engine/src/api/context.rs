@@ -558,8 +558,7 @@ mod tests {
             serde_json::to_value(bytes).expect("byte range"),
             json!({ "kind": "byte", "start_offset": 12, "end_offset": 24 })
         );
-        let source = "intro\n中文\nend";
-        let indexed: result::ContentRange = TextRange::from_text(source, 6, 13)
+        let indexed: result::ContentRange = TextRange::from_coordinates(6, 13, 2, 3, 0, 0)
             .expect("indexed range")
             .into();
         assert_eq!(
@@ -570,7 +569,7 @@ mod tests {
                 "start_byte_column": 0, "end_byte_column": 0,
             })
         );
-        let lexical: result::ContentRange = TextRange::from_text(source, 9, 12)
+        let lexical: result::ContentRange = TextRange::from_coordinates(9, 12, 2, 2, 3, 6)
             .expect("lexical range")
             .into();
         assert_eq!(

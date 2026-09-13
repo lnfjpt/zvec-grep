@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(chunks[0].document_id().len(), 64);
         assert_eq!(
             *chunks[0].range(),
-            SourceRange::Text(TextRange::from_text(&source.text, 0, 10).expect("first line"))
+            SourceRange::Text(TextRange::from_coordinates(0, 10, 1, 1, 0, 10).expect("first line"))
         );
         for chunk in &chunks {
             let Content::Text(text) = &test_content(chunk) else {
@@ -261,6 +261,7 @@ mod tests {
     fn splits_long_unicode_lines_on_character_boundaries() {
         let text = format!("前言\r\nprefix {} suffix\r\n尾声", "😀".repeat(20));
         let source = test_source(FileFormat::Text, "unicode.txt", &text);
+        let line_starts = [0, "前言\r\n".len(), text.len() - "尾声".len()];
         for max_chars in [1, 10] {
             let chunks = extract(
                 &source,
@@ -286,13 +287,12 @@ mod tests {
                     Some(content.as_str())
                 );
                 assert_eq!(
-                    range,
-                    TextRange::from_text(
-                        &source.text,
-                        range.start_byte_offset(),
-                        range.end_byte_offset(),
-                    )
-                    .expect("source coordinates")
+                    range.start_byte_offset(),
+                    line_starts[range.start_line() - 1] + range.start_byte_column()
+                );
+                assert_eq!(
+                    range.end_byte_offset(),
+                    line_starts[range.end_line() - 1] + range.end_byte_column()
                 );
             }
         }

@@ -592,6 +592,13 @@ mod tests {
             item,
             EntityFragment::Representative(_) | EntityFragment::Window(_)
         )));
+        assert_eq!(
+            *fragments[0].range(),
+            SourceRange::Text(
+                TextRange::from_coordinates(0, "前言 😀\r\n\r".len(), 1, 2, 0, 1)
+                    .expect("preamble coordinates")
+            )
+        );
 
         for fragment in fragments {
             if matches!(fragment, EntityFragment::Representative(_)) {
@@ -608,15 +615,6 @@ mod tests {
                     .text
                     .get(range.start_byte_offset()..range.end_byte_offset()),
                 Some(content.as_str())
-            );
-            assert_eq!(
-                range,
-                TextRange::from_text(
-                    &source.text,
-                    range.start_byte_offset(),
-                    range.end_byte_offset(),
-                )
-                .expect("source coordinates")
             );
         }
     }

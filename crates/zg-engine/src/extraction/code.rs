@@ -1077,15 +1077,6 @@ mod tests {
                 .get(range.start_byte_offset()..range.end_byte_offset()),
             Some(content.as_str())
         );
-        assert_eq!(
-            range,
-            TextRange::from_text(
-                &source.text,
-                range.start_byte_offset(),
-                range.end_byte_offset(),
-            )
-            .expect("source coordinates")
-        );
     }
 
     #[test]
@@ -1572,8 +1563,16 @@ mod tests {
             panic!("text range expected");
         };
         assert_eq!(
-            range.start_byte_offset(),
-            "const prefix = \"你好 😀\";\r\nexport ".len()
+            range,
+            TextRange::from_coordinates(
+                "const prefix = \"你好 😀\";\r\nexport ".len(),
+                source.text.len(),
+                2,
+                2,
+                "export ".len(),
+                "export function afterEmoji() { return true; }".len(),
+            )
+            .expect("function coordinates")
         );
     }
 

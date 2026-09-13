@@ -751,10 +751,7 @@ mod tests {
     }
 
     fn text_range() -> SourceRange {
-        let source = "前言\n正文 😀";
-        SourceRange::Text(
-            TextRange::from_text(source, "前言\n".len(), source.len()).expect("text range"),
-        )
+        SourceRange::Text(TextRange::from_coordinates(7, 18, 2, 2, 0, 11).expect("text range"))
     }
 
     fn cell(

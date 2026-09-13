@@ -343,7 +343,8 @@ mod tests {
         let items = ["one", "two"].map(|needle| {
             let mut item = lexical_item(directory.path(), "same-line.ts", 1, text.trim_end());
             let start = text.find(needle).expect("matched text");
-            item.range = TextRange::from_text(text, start, start + needle.len())
+            let end = start + needle.len();
+            item.range = TextRange::from_coordinates(start, end, 1, 1, start, end)
                 .expect("matched range")
                 .into();
             item
@@ -366,7 +367,8 @@ mod tests {
             .map(str::len)
             .sum();
         let range =
-            TextRange::from_text(&text, start, start + content.len()).expect("fixture range");
+            TextRange::from_coordinates(start, start + content.len(), line, line, 0, content.len())
+                .expect("fixture range");
         ContextItem {
             kind: ContextItemKind::LexicalMatch,
             rank: 0,

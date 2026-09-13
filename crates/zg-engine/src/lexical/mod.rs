@@ -979,7 +979,8 @@ mod tests {
 
         let start = text.find("let").expect("matched line");
         let end = text.find("尾巴").expect("following line");
-        let range = TextRange::from_text(text, start, end).expect("span including newline");
+        let range =
+            TextRange::from_coordinates(start, end, 2, 3, 0, 0).expect("span including newline");
         let mut items = [LexicalMatch {
             rank: 1,
             absolute_path: root.path().join("source-0.txt"),
