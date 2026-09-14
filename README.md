@@ -86,8 +86,15 @@ Direct CLI, server CLI, and MCP read the same authorization on each operation;
 configure them to use the same signing key. Revocation takes effect for new
 operations without restarting the server. `--allow-remote` on `zg index` or
 `zg query` grants consent for that operation only, including its synchronous
-refresh, and never authorizes later watcher jobs. MCP callers use workspace
-grants; interactive consent elicitation is not implemented in this Rust version.
+refresh, and never authorizes later watcher jobs. MCP reuses existing workspace
+grants and otherwise asks form-capable clients for explicit consent before index
+or search sends data remotely. The form discloses the root, source roots, model,
+endpoint and data categories. Choose `once` for this operation, `workspace` for a
+signed persistent grant, or `cancel` to deny transmission. Search also offers
+`fts_only`, which disables vector retrieval and refresh. Unsupported clients,
+invalid responses, declined forms, cancellation and timeouts never grant consent.
+Cancelling the originating request also sends a cancellation notification for its
+pending consent form; clients control how that notification is presented.
 
 ## MCP request lifecycle
 

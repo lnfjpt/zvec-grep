@@ -3,6 +3,7 @@
 //! This crate owns MCP schemas and formatting only. It translates tool input
 //! into typed requests executed by the engine or the resident workspace provider.
 
+mod consent;
 mod request;
 
 use std::{
@@ -311,6 +312,9 @@ impl ZvecGrepMcpServer {
         let mut request = input
             .into_request()
             .map_err(|message| ErrorData::invalid_params(message, None))?;
+        if let Err(error) = consent::search(&mut request, &context).await {
+            return Ok(error_result(&error));
+        }
         let result = request::run(&context, |progress, signal| {
             request.on_progress = progress;
             request.signal = Some(signal);
@@ -349,16 +353,21 @@ impl ZvecGrepMcpServer {
                 mut options,
                 wait,
                 debug,
-            } => match request::run(&context, |progress, signal| {
-                options.on_progress = progress;
-                options.signal = Some(signal);
-                self.index_operations.submit_index(*options, wait)
-            })
-            .await
-            {
-                Ok(reply) => index_operation_to_result(&reply, debug),
-                Err(error) => error_result(&error),
-            },
+            } => {
+                if let Err(error) = consent::index(&mut options, &context).await {
+                    return Ok(error_result(&error));
+                }
+                match request::run(&context, |progress, signal| {
+                    options.on_progress = progress;
+                    options.signal = Some(signal);
+                    self.index_operations.submit_index(*options, wait)
+                })
+                .await
+                {
+                    Ok(reply) => index_operation_to_result(&reply, debug),
+                    Err(error) => error_result(&error),
+                }
+            }
             IndexToolRequest::Drop(request) => {
                 let root = request_root(request.root.as_deref());
                 match self.index_operations.drop_index(request).await {

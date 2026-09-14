@@ -6,7 +6,7 @@ use std::{
     process::{Child, ChildStdin, Command, Output, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
     thread::JoinHandle,
@@ -115,6 +115,30 @@ impl StdioBridge {
         writeln!(stdin, "{notification}")?;
         stdin.flush()?;
         Ok(())
+    }
+
+    fn request_with_consent(
+        &mut self,
+        request: &serde_json::Value,
+        choice: &str,
+    ) -> Result<(serde_json::Value, usize), Box<dyn Error>> {
+        self.notify(request)?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut prompts = 0;
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
+            let response: serde_json::Value = serde_json::from_str(&line)?;
+            if response["method"] == "elicitation/create" {
+                prompts += 1;
+                self.notify(&json!({"jsonrpc": "2.0", "id": response["id"], "result": {
+                    "action": "accept", "content": {"choice": choice}
+                }}))?;
+            } else if response.get("id") == request.get("id") {
+                return Ok((response, prompts));
+            }
+        }
     }
 
     fn close(mut self) -> Result<(), Box<dyn Error>> {
@@ -564,10 +588,100 @@ fn concurrent_stdio_bootstraps_share_one_resident_daemon() -> Result<(), Box<dyn
     Ok(())
 }
 
+#[test]
+fn stdio_remote_consent_controls_transmission_and_persistence() -> Result<(), Box<dyn Error>> {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
+    let home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    let embedding = EmbeddingServer::start()?;
+    std::fs::write(
+        workspace.path().join("sample.md"),
+        "# Consent\nremote consent fixture\n",
+    )?;
+    let listen = format!("127.0.0.1:{}", available_port()?);
+    let signing_key = home.path().join("authorization.key");
+    let output = Command::new(&binary)
+        .env("ZVEC_GREP_AUTHORIZATION_KEY_FILE", &signing_key)
+        .args([
+            "server",
+            "on",
+            "--home",
+            path_text(home.path())?,
+            "--listen",
+            &listen,
+            "--mcp-toolset",
+            "full",
+        ])
+        .output()?;
+    assert_command_success(&output);
+    let mut guard = ServerGuard {
+        binary: binary.clone(),
+        home: home.path().to_owned(),
+        active: true,
+    };
+    let mut bridge = StdioBridge::spawn(&binary, home.path(), &listen)?;
+    bridge.request(
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {"elicitation": {"form": {}}},
+            "clientInfo": {"name": "consent-test", "version": "1"}
+        }}),
+    )?;
+    bridge.notify(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
+    let index = |id| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "zvec_grep_index", "arguments": {
+                "root": workspace.path(), "embedding": "qwen/text-embedding-v4",
+                "endpoint": format!("http://{}/embeddings", embedding.address), "apiKey": "test-key",
+                "wait": true, "debug": true
+            }
+        }})
+    };
+    let (declined, prompts) = bridge.request_with_consent(&index(2), "cancel")?;
+    assert_eq!(prompts, 1);
+    assert_eq!(declined["result"]["isError"], true);
+    assert_eq!(embedding.requests.load(Ordering::SeqCst), 0);
+    assert!(!signing_key.exists());
+    let (indexed, prompts) = bridge.request_with_consent(&index(3), "once")?;
+    assert_eq!(prompts, 1);
+    assert_eq!(indexed["result"]["isError"], false, "{indexed}");
+    assert_eq!(
+        indexed["result"]["structuredContent"]["state"], "succeeded",
+        "{indexed}"
+    );
+    assert!(indexed["result"]["structuredContent"]["debug"]["timings"].is_array());
+    let indexed_requests = embedding.requests.load(Ordering::SeqCst);
+    assert!(indexed_requests > 0);
+    assert!(
+        !signing_key.exists(),
+        "one-operation consent must not create a signing key"
+    );
+    let search = |id| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "zvec_grep_search", "arguments": {"root": workspace.path(), "query": "consent", "autoUpdate": false, "apiKey": "test-key"}
+        }})
+    };
+    let (fts, prompts) = bridge.request_with_consent(&search(4), "fts_only")?;
+    assert_eq!(prompts, 1);
+    assert_eq!(fts["result"]["isError"], false, "{fts}");
+    assert_eq!(embedding.requests.load(Ordering::SeqCst), indexed_requests);
+    let (persisted, prompts) = bridge.request_with_consent(&index(5), "workspace")?;
+    assert_eq!(prompts, 1);
+    assert_eq!(persisted["result"]["isError"], false, "{persisted}");
+    assert!(signing_key.exists());
+    let (queried, prompts) = bridge.request_with_consent(&search(6), "cancel")?;
+    assert_eq!(prompts, 0, "valid workspace grants must skip elicitation");
+    assert_eq!(queried["result"]["isError"], false, "{queried}");
+    assert!(embedding.requests.load(Ordering::SeqCst) > indexed_requests);
+    bridge.close()?;
+    assert_command_success(&guard.stop()?);
+    Ok(())
+}
+
 struct EmbeddingServer {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    requests: Arc<AtomicUsize>,
 }
 
 impl EmbeddingServer {
@@ -575,13 +689,16 @@ impl EmbeddingServer {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(AtomicUsize::new(0));
         let worker = std::thread::spawn({
             let stop = Arc::clone(&stop);
+            let requests = Arc::clone(&requests);
             move || {
                 for stream in listener.incoming() {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
+                    requests.fetch_add(1, Ordering::SeqCst);
                     respond_embedding(stream.expect("mock embedding connection"))
                         .expect("mock embedding response");
                 }
@@ -591,6 +708,7 @@ impl EmbeddingServer {
             address,
             stop,
             worker: Some(worker),
+            requests,
         })
     }
 }
