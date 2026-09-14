@@ -113,6 +113,37 @@ impl SearchEmbeddingRuntime for ModelRuntimeLease {
     }
 }
 
+pub(crate) struct RequestEmbeddingRuntime<'a> {
+    pub model: &'a ModelRuntimeLease,
+    pub signal: Option<tokio_util::sync::CancellationToken>,
+}
+
+#[async_trait]
+impl SearchEmbeddingRuntime for RequestEmbeddingRuntime<'_> {
+    fn info(&self) -> &EmbeddingModelInfo {
+        self.model.info()
+    }
+
+    async fn embed_queries(&self, queries: &[String]) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.model
+            .embed(
+                &queries
+                    .iter()
+                    .cloned()
+                    .map(EmbeddingInput::text)
+                    .collect::<Vec<_>>(),
+                EmbeddingOptions {
+                    purpose: Some(EmbeddingPurpose::Query),
+                    signal: self.signal.clone(),
+                    ..EmbeddingOptions::default()
+                },
+                None,
+            )
+            .await
+            .map(|result| result.vectors)
+    }
+}
+
 #[derive(Clone)]
 struct RecallRoute {
     route: ResolvedSearchRoute,

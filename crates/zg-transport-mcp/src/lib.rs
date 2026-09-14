@@ -3,6 +3,8 @@
 //! This crate owns MCP schemas and formatting only. It translates tool input
 //! into typed requests executed by the engine or the resident workspace provider.
 
+mod request;
+
 use std::{
     fmt::{self, Write as _},
     path::{Component, Path, PathBuf},
@@ -304,12 +306,17 @@ impl ZvecGrepMcpServer {
     async fn zvec_grep_search(
         &self,
         Parameters(input): Parameters<SearchInput>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let request = input
+        let mut request = input
             .into_request()
             .map_err(|message| ErrorData::invalid_params(message, None))?;
-        let result = self.index_operations.search(&self.engine, request).await;
+        let result = request::run(&context, |progress, signal| {
+            request.on_progress = progress;
+            request.signal = Some(signal);
+            self.index_operations.search(&self.engine, request)
+        })
+        .await;
 
         Ok(match result {
             Ok(reply) => context_result_to_tool_result(&reply),
@@ -332,17 +339,23 @@ impl ZvecGrepMcpServer {
     async fn zvec_grep_index(
         &self,
         Parameters(input): Parameters<IndexInput>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let request = input
             .into_request()
             .map_err(|message| ErrorData::invalid_params(message, None))?;
         Ok(match request {
             IndexToolRequest::Index {
-                options,
+                mut options,
                 wait,
                 debug,
-            } => match self.index_operations.submit_index(*options, wait).await {
+            } => match request::run(&context, |progress, signal| {
+                options.on_progress = progress;
+                options.signal = Some(signal);
+                self.index_operations.submit_index(*options, wait)
+            })
+            .await
+            {
                 Ok(reply) => index_operation_to_result(&reply, debug),
                 Err(error) => error_result(&error),
             },

@@ -89,6 +89,23 @@ operations without restarting the server. `--allow-remote` on `zg index` or
 refresh, and never authorizes later watcher jobs. MCP callers use workspace
 grants; interactive consent elicitation is not implemented in this Rust version.
 
+## MCP request lifecycle
+
+Both HTTP and stdio expose the same tools. Search accepts `device`; index accepts
+`debug: true` to return completed statistics, timings and at most 100 skipped files.
+Use `wait: true` to obtain these diagnostics in the index response; background
+submissions return job state instead of pretending that indexing has completed.
+
+Index and search requests carrying `_meta.progressToken` receive coalesced MCP
+progress notifications during indexing, synchronous refresh and model download.
+The progress number is a monotonic event sequence; `message` contains the engine's
+JSON progress snapshot, including phase and file/download counters.
+
+Cancellation stops waiting and signals request-owned work cooperatively. An
+exclusive synchronous index job can be cancelled; shared jobs, watcher refreshes
+and already-submitted `wait: false` jobs continue under daemon ownership. Native
+operations already executing may finish their current non-interruptible step.
+
 ## Crates
 
 - `zg-engine`: `ZvecGrep`, engine errors, and method-grouped types under `api`;

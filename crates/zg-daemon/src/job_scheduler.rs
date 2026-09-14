@@ -135,6 +135,7 @@ struct ScheduledJob {
     snapshot: Mutex<IndexJobSnapshot>,
     options: Mutex<Option<IndexOptions>>,
     cancellation: CancellationToken,
+    shared: AtomicBool,
     result: Mutex<Option<IndexResult>>,
     finished: AtomicBool,
     completed: Notify,
@@ -173,6 +174,8 @@ impl IndexJobScheduler {
             return Err(SchedulerError::Closed);
         }
         if let Some(active) = state.active_by_root.get(&canonical_root).cloned() {
+            // Once another caller relies on a job, request cancellation must not stop it.
+            active.shared.store(true, Ordering::Release);
             let active_snapshot = lock(&active.snapshot).clone();
             let needs_followup = reason == JobReason::Watch
                 || active_snapshot.reason == JobReason::Watch
@@ -196,6 +199,7 @@ impl IndexJobScheduler {
             }
             if needs_followup {
                 if let Some(followup) = state.followup_by_root.get(&canonical_root) {
+                    followup.shared.store(true, Ordering::Release);
                     merge_options(&mut lock(&followup.options), options);
                     if reason == JobReason::Manual {
                         lock(&followup.snapshot).reason = JobReason::Manual;
@@ -407,6 +411,7 @@ fn create_job(
         }),
         options: Mutex::new(Some(options)),
         cancellation: CancellationToken::new(),
+        shared: AtomicBool::new(reason == JobReason::Watch),
         result: Mutex::new(None),
         finished: AtomicBool::new(false),
         completed: Notify::new(),
@@ -414,6 +419,30 @@ fn create_job(
 }
 
 fn spawn_job(inner: Arc<SchedulerInner>, job: Arc<ScheduledJob>) {
+    if let Some(signal) = lock(&job.options)
+        .as_ref()
+        .and_then(|options| options.signal.clone())
+    {
+        let inner = Arc::clone(&inner);
+        let job = Arc::clone(&job);
+        tokio::spawn(async move {
+            let completed = job.completed.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
+            if job.finished.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::select! {
+                () = completed => {},
+                () = signal.cancelled() => {
+                    let _state = lock(&inner.state);
+                    if !job.shared.load(Ordering::Acquire) {
+                        job.cancellation.cancel();
+                    }
+                }
+            }
+        });
+    }
     tokio::spawn(async move {
         let permit = tokio::select! {
             () = job.cancellation.cancelled() => {
@@ -1027,6 +1056,105 @@ mod tests {
 
     struct CancellationAwareExecutor {
         started: Notify,
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_removes_a_queued_job_without_starting_the_executor() {
+        let executor = Arc::new(CancellationAwareExecutor {
+            started: Notify::new(),
+        });
+        let scheduler = IndexJobScheduler::new(
+            executor.clone(),
+            SchedulerConfig {
+                concurrency: 1,
+                queue_capacity: 4,
+            },
+        );
+        let first_root = std::env::temp_dir().join("mcp-running");
+        scheduler
+            .submit(
+                first_root.clone(),
+                IndexOptions::default(),
+                JobReason::Manual,
+            )
+            .expect("first job");
+        executor.started.notified().await;
+        let signal = tokio_util::sync::CancellationToken::new();
+        let queued = scheduler
+            .submit(
+                std::env::temp_dir().join("mcp-queued"),
+                IndexOptions {
+                    signal: Some(signal.clone()),
+                    ..Default::default()
+                },
+                JobReason::Manual,
+            )
+            .expect("queued job");
+        signal.cancel();
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            scheduler.wait(queued.job.id),
+        )
+        .await
+        .expect("queued cancellation")
+        .expect("completion");
+        assert_eq!(completed.job.state, JobState::Cancelled);
+        assert_eq!(scheduler.snapshot().running, 1);
+        assert_eq!(scheduler.snapshot().queued, 0);
+        scheduler.cancel_root(&first_root);
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_stops_only_exclusive_jobs() {
+        for reused in [false, true] {
+            let executor = Arc::new(CancellationAwareExecutor {
+                started: Notify::new(),
+            });
+            let scheduler = IndexJobScheduler::new(executor.clone(), SchedulerConfig::default());
+            let root = std::env::temp_dir().join("mcp-cancellation");
+            let signal = tokio_util::sync::CancellationToken::new();
+            let submitted = scheduler
+                .submit(
+                    root.clone(),
+                    IndexOptions {
+                        signal: Some(signal.clone()),
+                        ..Default::default()
+                    },
+                    JobReason::Manual,
+                )
+                .expect("submit");
+            executor.started.notified().await;
+            if reused {
+                assert!(
+                    scheduler
+                        .submit(root.clone(), IndexOptions::default(), JobReason::Manual)
+                        .expect("reuse")
+                        .reused
+                );
+            }
+            signal.cancel();
+            if reused {
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(30),
+                        scheduler.wait(submitted.job.id)
+                    )
+                    .await
+                    .is_err()
+                );
+                scheduler.cancel_root(&root);
+            }
+            let completed = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                scheduler.wait(submitted.job.id),
+            )
+            .await
+            .expect("must stop")
+            .expect("completion");
+            assert_eq!(completed.job.state, JobState::Cancelled);
+            scheduler.shutdown().await;
+        }
     }
 
     #[async_trait]

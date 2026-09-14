@@ -167,16 +167,31 @@ impl WorkspaceRuntimeManager {
             return Err(WorkspaceRuntimeError::Scheduler(SchedulerError::Closed));
         }
         let reporter = options.on_progress.take();
+        if options
+            .signal
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(WorkspaceRuntimeError::Engine(EngineError::cancelled(
+                "index request was cancelled",
+            )));
+        }
+        if !wait {
+            // A submitted background job outlives the request that created it.
+            options.signal = None;
+        }
         let canonical_root = canonical_root(options.root.as_deref())?;
         options.root = Some(canonical_root.clone());
         let runtime = self.runtime(canonical_root.clone(), &options);
-        *lock(&runtime.index_template) = options.clone();
+        let mut template = options.clone();
+        template.signal = None;
+        *lock(&runtime.index_template) = template;
         let target_revision = runtime.dirty_revision.load(Ordering::Acquire);
         let submitted = self
             .inner
             .scheduler
             .submit(canonical_root, options, JobReason::Manual)?;
-        if !wait {
+        {
             let manager = self.clone();
             let job_id = submitted.job.id;
             tokio::spawn(async move {
@@ -189,6 +204,8 @@ impl WorkspaceRuntimeManager {
                         .await;
                 }
             });
+        }
+        if !wait {
             return Ok(RuntimeIndexSubmission {
                 job: submitted.job,
                 reused: submitted.reused,
@@ -218,6 +235,10 @@ impl WorkspaceRuntimeManager {
         // Watch submissions always queue a successor to an already running job.
         // A full reconciliation also covers changes still in watcher debounce.
         let mut options = options;
+        let reporter = options.on_progress.take();
+        if !wait {
+            options.signal = None;
+        }
         options.changes = vec![IndexChange::Rescan];
         if wait {
             self.ensure_watching(Arc::clone(&runtime))
@@ -231,10 +252,12 @@ impl WorkspaceRuntimeManager {
             .scheduler
             .submit(root.clone(), options, JobReason::Watch)
             .map_err(|error| WorkspaceRuntimeError::from(error).into_engine_error())?;
-        if !wait {
+        {
             let manager = self.clone();
+            let runtime = Arc::clone(&runtime);
+            let job_id = submitted.job.id;
             tokio::spawn(async move {
-                if let Ok(completed) = manager.inner.scheduler.wait(submitted.job.id).await
+                if let Ok(completed) = manager.inner.scheduler.wait(job_id).await
                     && completed.job.state == JobState::Succeeded
                 {
                     runtime
@@ -245,12 +268,14 @@ impl WorkspaceRuntimeManager {
                     }
                 }
             });
+        }
+        if !wait {
             return Ok(());
         }
         let completed = self
             .inner
             .scheduler
-            .wait(submitted.job.id)
+            .wait_with_progress(submitted.job.id, reporter)
             .await
             .map_err(|error| WorkspaceRuntimeError::from(error).into_engine_error())?;
         ensure_refresh_succeeded(&completed.job)?;
@@ -355,9 +380,13 @@ impl WorkspaceRuntimeManager {
     fn runtime(&self, canonical_root: PathBuf, options: &IndexOptions) -> Arc<WorkspaceRuntime> {
         let mut runtimes = lock(&self.inner.runtimes);
         Arc::clone(runtimes.entry(canonical_root.clone()).or_insert_with(|| {
+            let mut template = options.clone();
+            // Resident state must not retain request cancellation or progress observers.
+            template.signal = None;
+            template.on_progress = None;
             Arc::new(WorkspaceRuntime {
                 canonical_root,
-                index_template: Mutex::new(options.clone()),
+                index_template: Mutex::new(template),
                 watcher: tokio::sync::Mutex::new(None),
                 watcher_active: AtomicBool::new(false),
                 dirty_revision: AtomicU64::new(1),
@@ -502,6 +531,8 @@ impl IndexOperationProvider for WorkspaceRuntimeManager {
         }
         let options = IndexOptions {
             root: request.root.clone(),
+            on_progress: request.on_progress.clone(),
+            signal: request.signal.clone(),
             allow_remote: request.allow_remote,
             api_key: request.api_key.clone(),
             endpoint: request.endpoint.clone(),
@@ -648,6 +679,8 @@ async fn watch_loop(
         let mut options = lock(&runtime.index_template).clone();
         // One-operation consent must never authorize later watcher jobs.
         options.allow_remote = false;
+        options.signal = None;
+        options.on_progress = None;
         options.root = Some(runtime.canonical_root.clone());
         options.rebuild = false;
         options.changes = batch.changes.into_iter().map(map_change).collect();

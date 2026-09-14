@@ -205,31 +205,8 @@ impl WorkspaceIndexService {
             .workspace_needs_refresh(&location, factory.as_ref())
             .await?
         {
-            self.index(
-                models,
-                IndexOptions {
-                    root: Some(location.root.clone()),
-                    allow_remote: options.allow_remote,
-                    api_key: options.api_key.clone(),
-                    endpoint: options.endpoint.clone(),
-                    embedding_concurrency: options.embedding_concurrency,
-                    device: options.device,
-                    model_cache: options.model_cache.clone(),
-                    embedding: options.authorization_model.as_ref().map(|reference| {
-                        crate::api::index::options::EmbeddingModelSpec {
-                            reference: reference.clone(),
-                            revision: None,
-                            cache_dir: options.model_cache.clone(),
-                            endpoint: options.endpoint.clone(),
-                            device: options
-                                .device
-                                .unwrap_or(crate::api::index::options::Device::Auto),
-                        }
-                    }),
-                    ..IndexOptions::default()
-                },
-            )
-            .await?;
+            self.index(models, refresh_options(options, location.root.clone()))
+                .await?;
         }
         let _lock = acquire_home_lock(&location.home, LockMode::Read, "context")?;
         let manifest = read_workspace_manifest(&location.home)?.ok_or_else(|| {
@@ -273,6 +250,11 @@ impl WorkspaceIndexService {
             &manifest.index_info(),
             storage.as_ref(),
             model
+                .as_ref()
+                .map(|model| crate::search::RequestEmbeddingRuntime {
+                    model,
+                    signal: options.signal.clone(),
+                })
                 .as_ref()
                 .map(|model| model as &dyn crate::search::SearchEmbeddingRuntime),
             options,
@@ -399,6 +381,32 @@ impl fmt::Debug for WorkspaceIndexService {
             .debug_struct("WorkspaceIndexService")
             .field("scanner", &self.scanner)
             .finish_non_exhaustive()
+    }
+}
+
+fn refresh_options(options: &ContextOptions, root: PathBuf) -> IndexOptions {
+    IndexOptions {
+        root: Some(root),
+        on_progress: options.on_progress.clone(),
+        signal: options.signal.clone(),
+        allow_remote: options.allow_remote,
+        api_key: options.api_key.clone(),
+        endpoint: options.endpoint.clone(),
+        embedding_concurrency: options.embedding_concurrency,
+        device: options.device,
+        model_cache: options.model_cache.clone(),
+        embedding: options.authorization_model.as_ref().map(|reference| {
+            crate::api::index::options::EmbeddingModelSpec {
+                reference: reference.clone(),
+                revision: None,
+                cache_dir: options.model_cache.clone(),
+                endpoint: options.endpoint.clone(),
+                device: options
+                    .device
+                    .unwrap_or(crate::api::index::options::Device::Auto),
+            }
+        }),
+        ..IndexOptions::default()
     }
 }
 

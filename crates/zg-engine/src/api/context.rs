@@ -58,6 +58,12 @@ pub mod options {
         pub device: Option<crate::api::index::options::Device>,
         #[serde(default)]
         pub model_cache: Option<PathBuf>,
+        /// Runtime-only progress for synchronous refreshes.
+        #[serde(skip)]
+        pub on_progress: Option<crate::api::index::progress::IndexProgressReporter>,
+        /// Runtime-only cooperative cancellation for this request.
+        #[serde(skip)]
+        pub signal: Option<tokio_util::sync::CancellationToken>,
     }
 
     impl Default for ContextOptions {
@@ -98,6 +104,8 @@ pub mod options {
                 authorization_model: None,
                 device: None,
                 model_cache: None,
+                on_progress: None,
+                signal: None,
             }
         }
     }
