@@ -153,6 +153,7 @@ pub struct IndexOperationResult {
     pub state: IndexOperationState,
     pub reused: bool,
     pub error: Option<IndexOperationError>,
+    pub result: Option<zg_engine::api::index::IndexResult>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -208,6 +209,7 @@ impl IndexOperationProvider for DirectIndexOperationProvider {
             state: IndexOperationState::Succeeded,
             reused: false,
             error: None,
+            result: Some(result),
         })
     }
 
@@ -336,12 +338,14 @@ impl ZvecGrepMcpServer {
             .into_request()
             .map_err(|message| ErrorData::invalid_params(message, None))?;
         Ok(match request {
-            IndexToolRequest::Index { options, wait } => {
-                match self.index_operations.submit_index(*options, wait).await {
-                    Ok(reply) => index_operation_to_result(&reply),
-                    Err(error) => error_result(&error),
-                }
-            }
+            IndexToolRequest::Index {
+                options,
+                wait,
+                debug,
+            } => match self.index_operations.submit_index(*options, wait).await {
+                Ok(reply) => index_operation_to_result(&reply, debug),
+                Err(error) => error_result(&error),
+            },
             IndexToolRequest::Drop(request) => {
                 let root = request_root(request.root.as_deref());
                 match self.index_operations.drop_index(request).await {
@@ -634,6 +638,7 @@ enum IndexToolRequest {
     Index {
         options: Box<IndexOptions>,
         wait: bool,
+        debug: bool,
     },
     Drop(InfoOptions),
 }
@@ -670,6 +675,9 @@ struct IndexOutput {
     dropped: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<IndexJobErrorOutput>,
+    /// Completed indexing statistics, timings and skipped files when debug is requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -940,12 +948,6 @@ impl SearchInput {
         if let Some(api_key) = &self.api_key {
             validate_text("apiKey", api_key, 1, 8_192)?;
         }
-        if self.device.is_some() {
-            return Err(
-                "device is not available until the local embedding runtime is implemented"
-                    .to_owned(),
-            );
-        }
         if self
             .limit
             .is_some_and(|limit| limit == 0 || limit > MAX_SEARCH_LIMIT)
@@ -1022,6 +1024,7 @@ impl SearchInput {
             modified_after_epoch_ms: parse_optional_time(self.modified_after, "modifiedAfter")?,
             modified_before_epoch_ms: parse_optional_time(self.modified_before, "modifiedBefore")?,
             api_key: self.api_key,
+            device: self.device.map(Into::into),
             embedding_concurrency: self.embedding_concurrency,
             ..ContextOptions::default()
         };
@@ -1134,6 +1137,7 @@ impl IndexInput {
                 ..IndexOptions::default()
             }),
             wait: self.wait.unwrap_or(false),
+            debug: self.debug.unwrap_or(false),
         })
     }
 
@@ -1466,7 +1470,7 @@ fn request_root(root: Option<&Path>) -> PathBuf {
     root.map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
-fn index_operation_to_result(reply: &IndexOperationResult) -> CallToolResult {
+fn index_operation_to_result(reply: &IndexOperationResult, debug: bool) -> CallToolResult {
     structured_result(IndexOutput {
         root: reply.root.display().to_string(),
         job_id: reply.job_id.clone(),
@@ -1481,6 +1485,11 @@ fn index_operation_to_result(reply: &IndexOperationResult) -> CallToolResult {
         action: Some(IndexActionOutput::Index),
         dropped: None,
         error: reply.error.as_ref().map(index_job_error_output),
+        debug: reply.result.as_ref().filter(|_| debug).map(|result| {
+            let mut diagnostics = result.clone();
+            diagnostics.skipped.truncate(100);
+            serde_json::json!(diagnostics)
+        }),
     })
 }
 
@@ -1493,6 +1502,7 @@ fn drop_result_to_index_result(root: &Path, removed: bool) -> CallToolResult {
         action: Some(IndexActionOutput::Drop),
         dropped: Some(removed),
         error: None,
+        debug: None,
     })
 }
 
@@ -1869,6 +1879,43 @@ mod tests {
     }
 
     #[test]
+    fn search_accepts_all_supported_devices() {
+        for device in ["auto", "cpu", "metal", "vulkan", "cuda"] {
+            let mut search = input();
+            search.device =
+                Some(serde_json::from_value(serde_json::json!(device)).expect("device"));
+            let request = search.into_request().expect("device should map");
+            assert_eq!(serde_json::json!(request.device), device);
+        }
+    }
+
+    #[test]
+    fn index_debug_is_opt_in_and_requires_completed_statistics() {
+        let mut reply = super::IndexOperationResult {
+            root: test_root(),
+            job_id: "test".into(),
+            state: super::IndexOperationState::Succeeded,
+            reused: false,
+            error: None,
+            result: Some(zg_engine::api::index::IndexResult {
+                files_scanned: 3,
+                ..Default::default()
+            }),
+        };
+        let output = |reply: &super::IndexOperationResult, debug| {
+            super::index_operation_to_result(reply, debug)
+                .structured_content
+                .expect("output")
+        };
+        assert!(output(&reply, false).get("debug").is_none());
+        assert_eq!(output(&reply, true)["debug"]["files_scanned"], 3);
+        assert!(output(&reply, true)["debug"]["timings"].is_array());
+        reply.result = None;
+        reply.state = super::IndexOperationState::Queued;
+        assert!(output(&reply, true).get("debug").is_none());
+    }
+
+    #[test]
     fn agent_server_exposes_only_search() {
         let server = ZvecGrepMcpServer::agent(Arc::new(ZvecGrep::new()));
         let tools = server.listed_tools();
@@ -1902,11 +1949,13 @@ mod tests {
         let IndexToolRequest::Index {
             options: request,
             wait,
+            debug,
         } = request
         else {
             panic!("index tool must create an index request");
         };
         assert!(wait);
+        assert!(debug);
         assert_eq!(request.root, Some(test_root()));
         assert_eq!(request.roots.len(), 1);
         assert_eq!(request.discovery.globs, ["*.rs"]);

@@ -475,6 +475,7 @@ impl IndexOperationProvider for WorkspaceRuntimeManager {
                 report: error.report,
                 retryable: error.retryable,
             }),
+            result: submitted.result,
         })
     }
 
