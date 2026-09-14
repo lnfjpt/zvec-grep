@@ -18,6 +18,7 @@ use crate::{
 
 use super::{
     codec, dictionary,
+    pending::{self, PendingChange, PendingChanges},
     spi::{
         FileIndexDiagnostics, FileIndexStatus, IndexedFragment, StorageResult, StorageSearchFilter,
         StorageSearchHit, StoredEntity, StoredFile, WorkspaceIndexEmbeddingSchema,
@@ -27,7 +28,8 @@ use super::{
 };
 
 const VERSION: u32 = 4;
-const JOURNAL: &str = "pending.json";
+const CHECKPOINT_OPERATIONS: usize = 64;
+const CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 type StoreRegistry = Mutex<HashMap<PathBuf, Weak<SharedStore>>>;
 static STORES: OnceLock<StoreRegistry> = OnceLock::new();
 static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
@@ -51,7 +53,11 @@ struct SharedStore {
 
 struct StoreState {
     native: NativeStore,
+    pending: PendingChanges,
+    pending_operations: usize,
+    pending_bytes: u64,
     needs_recovery: bool,
+    closed: bool,
 }
 
 struct ZvecStorage {
@@ -124,33 +130,6 @@ impl SchemaRecord {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JournalRecord {
-    version: u32,
-    operation: Operation,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Operation {
-    Replace {
-        source: String,
-        status: Option<FileIndexStatus>,
-        entries: Vec<EntryRecord>,
-    },
-    Delete {
-        file_id: String,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EntryRecord {
-    fragment: String,
-    vector: Vec<f32>,
-}
-
 impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
     fn open(
         &self,
@@ -208,7 +187,11 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
         let shared = Arc::new(SharedStore {
             state: Mutex::new(StoreState {
                 native,
+                pending: PendingChanges::new(),
+                pending_operations: 0,
+                pending_bytes: 0,
                 needs_recovery: false,
+                closed: false,
             }),
             path: path.clone(),
             schema,
@@ -265,38 +248,69 @@ impl ZvecStorage {
     fn read<T>(&self, operation: impl FnOnce(&NativeStore) -> EngineResult<T>) -> EngineResult<T> {
         let shared = self.shared()?;
         let state = lock_state(&shared)?;
-        if state.needs_recovery {
-            return Err(recovery_required());
-        }
+        assert_usable(&state)?;
         operation(&state.native)
     }
 
-    fn commit(&self, operation: Operation) -> EngineResult<()> {
+    fn apply(
+        &self,
+        change: PendingChange,
+        bytes: u64,
+        operation: impl FnOnce(&NativeStore) -> EngineResult<()>,
+    ) -> EngineResult<()> {
         if self.read_only {
             return Err(EngineError::invalid_argument(
                 "cannot write read-only workspace storage",
             ));
         }
         let shared = self.shared()?;
-        let record = JournalRecord {
-            version: VERSION,
-            operation,
-        };
-        let encoded = serde_json::to_vec(&record).map_err(|error| json_error(&error))?;
         let mut state = lock_state(&shared)?;
-        if state.needs_recovery {
-            return Err(recovery_required());
-        }
-        // A durable redo record precedes every native mutation. A failed commit
-        // blocks reads until reopen replays it; partial collections are never served.
+        assert_usable(&state)?;
+        // Keep every file changed since the last checkpoint. A crash may require
+        // reindexing even files whose native writes already completed in memory.
         state.needs_recovery = true;
-        write_record(&shared.path.join(JOURNAL), &encoded)?;
-        replay(&state.native, &shared.schema, record)?;
-        state.native.flush()?;
-        clear_journal(&shared.path)?;
-        state.needs_recovery = false;
+        state
+            .pending
+            .insert(change.file_id().as_str().to_owned(), change);
+        pending::write(&shared.path, &state.pending)?;
+        operation(&state.native)?;
+        state.pending_operations = state.pending_operations.saturating_add(1);
+        state.pending_bytes = state.pending_bytes.saturating_add(bytes);
+        if state.pending_operations >= CHECKPOINT_OPERATIONS
+            || state.pending_bytes >= CHECKPOINT_BYTES
+        {
+            checkpoint(&shared.path, &mut state)?;
+        } else {
+            // The complete in-memory result is readable by this writer. Its
+            // durability is confirmed only when the batch is checkpointed.
+            state.needs_recovery = false;
+        }
         Ok(())
     }
+}
+
+fn assert_usable(state: &StoreState) -> EngineResult<()> {
+    if state.closed {
+        return Err(EngineError::resource_closed("workspace storage is closed"));
+    }
+    if state.needs_recovery {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
+fn checkpoint(path: &Path, state: &mut StoreState) -> EngineResult<()> {
+    if state.pending.is_empty() {
+        return Ok(());
+    }
+    state.needs_recovery = true;
+    state.native.flush()?;
+    pending::clear(path)?;
+    state.pending.clear();
+    state.pending_operations = 0;
+    state.pending_bytes = 0;
+    state.needs_recovery = false;
+    Ok(())
 }
 
 #[async_trait]
@@ -352,7 +366,11 @@ impl WorkspaceIndexStorage for ZvecStorage {
             truncated_fragment_count: diagnostics.and_then(|value| value.truncated_fragment_count),
             error: None,
         });
-        self.commit(replace_operation(&file, entries)?)
+        self.apply(
+            PendingChange::Reindex(file.source.clone()),
+            estimated_write_bytes(&file, entries),
+            |native| native.apply_replace(&file, entries),
+        )
     }
 
     fn mark_file_failed(&self, file: &StoredFile, error: &str) -> StorageResult<()> {
@@ -365,12 +383,14 @@ impl WorkspaceIndexStorage for ZvecStorage {
             truncated_fragment_count: None,
             error: Some(error.to_owned()),
         });
-        self.commit(replace_operation(&file, &[])?)
+        self.apply(PendingChange::Reindex(file.source.clone()), 0, |native| {
+            native.apply_replace(&file, &[])
+        })
     }
 
     fn delete_file(&self, file_id: &FileId) -> StorageResult<()> {
-        self.commit(Operation::Delete {
-            file_id: file_id.as_str().to_owned(),
+        self.apply(PendingChange::Delete(file_id.clone()), 0, |native| {
+            native.apply_delete(file_id)
         })
     }
 
@@ -378,69 +398,70 @@ impl WorkspaceIndexStorage for ZvecStorage {
         if self.read_only {
             return Ok(());
         }
-        self.read(NativeStore::flush)
+        let shared = self.shared()?;
+        let mut state = lock_state(&shared)?;
+        assert_usable(&state)?;
+        checkpoint(&shared.path, &mut state)
     }
 
     fn close(&self) -> StorageResult<()> {
-        self.shared
+        // Serialize concurrent closes through the final checkpoint as well as
+        // taking the lease, so none can return while its writes are persisting.
+        let mut lease = self
+            .shared
             .lock()
-            .map_err(|_| EngineError::internal("storage lease lock was poisoned"))?
-            .take();
-        Ok(())
-    }
-}
-
-fn replace_operation(file: &StoredFile, entries: &[IndexedFragment]) -> EngineResult<Operation> {
-    Ok(Operation::Replace {
-        source: codec::encode_file(&file.source)?,
-        status: file.index_status.clone(),
-        entries: entries
-            .iter()
-            .map(|entry| {
-                Ok(EntryRecord {
-                    fragment: codec::encode_fragment(&entry.fragment)?,
-                    vector: entry.vector.clone(),
-                })
-            })
-            .collect::<EngineResult<_>>()?,
-    })
-}
-
-fn replay(
-    native: &NativeStore,
-    schema: &WorkspaceIndexEmbeddingSchema,
-    record: JournalRecord,
-) -> EngineResult<()> {
-    if record.version != VERSION {
-        return Err(EngineError::storage_failure(format!(
-            "unsupported storage journal version {}; expected {VERSION}; rebuild the index",
-            record.version
-        )));
-    }
-    match record.operation {
-        Operation::Replace {
-            source,
-            status,
-            entries,
-        } => {
-            let file = StoredFile {
-                source: codec::decode_file(&source)?,
-                index_status: status,
-            };
-            let entries = entries
-                .into_iter()
-                .map(|entry| {
-                    Ok(IndexedFragment {
-                        fragment: codec::decode_fragment(&entry.fragment)?,
-                        vector: entry.vector,
-                    })
-                })
-                .collect::<EngineResult<Vec<_>>>()?;
-            validate_batch(&file, &entries, schema)?;
-            native.apply_replace(&file, &entries)
+            .map_err(|_| EngineError::internal("storage lease lock was poisoned"))?;
+        let Some(shared) = lease.take() else {
+            return Ok(());
+        };
+        if self.read_only {
+            return Ok(());
         }
-        Operation::Delete { file_id } => native.apply_delete(&FileId::new(file_id)?),
+        let mut state = lock_state(&shared)?;
+        // Reject a write that acquired its Arc before close but is still waiting
+        // for this lock. A successful close commits every accepted write.
+        state.closed = true;
+        if state.needs_recovery {
+            return Err(recovery_required());
+        }
+        checkpoint(&shared.path, &mut state)
     }
+}
+
+fn estimated_write_bytes(file: &StoredFile, entries: &[IndexedFragment]) -> u64 {
+    // Bound the batch using source size and raw vectors without serializing a
+    // second copy of fragment contents. An oversized file forces a checkpoint.
+    entries
+        .iter()
+        .fold(file.source.snapshot.size_bytes, |bytes, entry| {
+            bytes.saturating_add(
+                u64::try_from(entry.vector.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(4),
+            )
+        })
+}
+
+fn recover_pending(native: &NativeStore, changes: PendingChanges) -> EngineResult<()> {
+    for change in changes.into_values() {
+        match change {
+            PendingChange::Reindex(source) => native.apply_replace(
+                &StoredFile {
+                    source,
+                    index_status: Some(FileIndexStatus {
+                        indexed_epoch_ms: None,
+                        entity_count: 0,
+                        token_count: None,
+                        truncated_fragment_count: None,
+                        error: None,
+                    }),
+                },
+                &[],
+            )?,
+            PendingChange::Delete(id) => native.apply_delete(&id)?,
+        }
+    }
+    Ok(())
 }
 
 fn validate_batch(
@@ -451,6 +472,7 @@ fn validate_batch(
     file.source.validate()?;
     validate_fragments(&file.source.id, entries.iter().map(|entry| &entry.fragment))?;
     for entry in entries {
+        codec::validate_fragment(&entry.fragment)?;
         validate_vector(&entry.vector, schema)?;
     }
     Ok(())
@@ -548,8 +570,8 @@ fn prepare_storage(
     let mut shared = read_only;
     loop {
         let lock = acquire_storage_lock(home, shared)?;
-        let journal = path.join(JOURNAL);
-        if shared && journal.exists() {
+        let marker = path.join(pending::NAME);
+        if shared && marker.exists() {
             // Release before changing lock modes; Windows does not convert held locks.
             shared = false;
             continue;
@@ -570,11 +592,14 @@ fn prepare_storage(
         }
         let schema = load_schema(path, options, dictionary_cache)?;
         dictionary::prepare_cache(dictionary_cache)?;
-        if journal.exists() {
+        if marker.exists() {
+            // Decode the entire batch before touching native data. Recovery
+            // needs writable handles even when the caller only wants to search.
+            let changes = pending::read(path)?;
             let native = NativeStore::open(path, &schema, dictionary_cache, false)?;
-            replay(&native, &schema, read_json(&journal)?)?;
+            recover_pending(&native, changes)?;
             native.flush()?;
-            clear_journal(path)?;
+            pending::clear(path)?;
         }
         if read_only && !shared {
             // Recheck after reacquiring: another writer may run between locks.
@@ -611,13 +636,6 @@ fn storage_lock_error(home: &Path, error: std::fs::TryLockError) -> EngineError 
         )),
         std::fs::TryLockError::Error(error) => io_error("lock workspace storage", home, &error),
     }
-}
-
-fn clear_journal(path: &Path) -> EngineResult<()> {
-    let journal = path.join(JOURNAL);
-    fs::remove_file(&journal)
-        .map_err(|error| io_error("remove committed storage journal", &journal, &error))?;
-    sync_directory(path)
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> EngineResult<T> {

@@ -634,7 +634,7 @@ impl From<MetadataRecord<'_>> for EntityMetadata {
     }
 }
 
-fn validate_fragment(fragment: &EntityFragment) -> EngineResult<()> {
+pub(super) fn validate_fragment(fragment: &EntityFragment) -> EngineResult<()> {
     fragment.range().validate()?;
     if let Some(EntityContent::Outline(outline)) =
         fragment.as_entity().map(|entity| &entity.content)

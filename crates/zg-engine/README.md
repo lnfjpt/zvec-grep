@@ -49,7 +49,9 @@ Request and result types live in `api::{index, context, info}`. `EngineError::co
 
 ## Storage
 
-The index keeps files, entities, fragments, and vectors in separate collections. File replacements are journaled before mutation and recovered when the index reopens; reads cannot observe an index awaiting recovery. The versioned storage codec preserves numeric format IDs and encodes image bytes as base64.
+The index keeps files, entities, fragments, and vectors in separate collections. Zvec's WAL handles native document recovery. Before each mutation, the engine persists a pending record containing only source metadata or a deletion intent. It flushes all collections and clears the records after 64 operations, an estimated 16 MiB of source and vector data, finalization, or a healthy writer close.
+
+Reopening an interrupted batch removes its partial index data and marks affected files for reindexing before serving reads. The next indexing pass rereads those files and recomputes their embeddings, even if the source has not changed; completed checkpoints remain available. The versioned storage codec preserves numeric format IDs and encodes image bytes as base64.
 
 Indexes created before the workspace-relative file schema require a rebuild (`IndexOptions::rebuild` or `zg index --rebuild`). Old single-root manifests can still supply embedding and discovery settings for the rebuild.
 

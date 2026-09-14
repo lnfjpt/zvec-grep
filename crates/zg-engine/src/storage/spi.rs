@@ -133,6 +133,9 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
         filter: Option<&StorageSearchFilter>,
     ) -> StorageResult<Vec<StorageSearchHit>>;
 
+    /// Applies a complete file replacement to the current writer. Durability is
+    /// confirmed by a batch checkpoint, `finalize_writes`, or successful `close`.
+    /// An interrupted batch is discarded and its files are marked for reindexing.
     fn replace_file(
         &self,
         file: &StoredFile,
@@ -144,8 +147,11 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
 
     fn delete_file(&self, file_id: &FileId) -> StorageResult<()>;
 
+    /// Persists all accepted writes and clears their pending recovery records.
     async fn finalize_writes(&self) -> StorageResult<()>;
 
+    /// Closes this lease. A healthy writer checkpoints its remaining batch;
+    /// a failed writer releases its resources and leaves recovery records intact.
     fn close(&self) -> StorageResult<()>;
 }
 

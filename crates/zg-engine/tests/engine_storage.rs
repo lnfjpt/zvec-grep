@@ -258,6 +258,148 @@ async fn public_engine_records_failed_files_and_recovers_on_auto_update() -> Tes
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources() -> TestResult {
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(root, server.address)?;
+    let source_path = root.join("note.txt");
+    let contents = "Orchard documentation survives interrupted indexing.\n";
+    fs::write(&source_path, contents)?;
+    let modified = fs::metadata(&source_path)?.modified()?;
+
+    let engine = ZvecGrep::new();
+    let initial = engine.index(index_options(root)).await?;
+    assert_eq!((initial.files_added, initial.files_failed), (1, 0));
+    assert_eq!(
+        fts_paths(&engine, root, "orchard").await?,
+        [PathBuf::from("note.txt")]
+    );
+    let index_path = engine.info(info_options(root)).await?.index_path;
+    let requests = server.requests.load(Ordering::Acquire);
+    assert!(requests > 0);
+    engine.close();
+    drop(engine);
+
+    let files_path = index_path.join("files");
+    let source = {
+        let files = native_documents(&files_path)?;
+        assert_eq!(files.len(), 1);
+        files[0].get_string("payload")?.expect("source payload")
+    };
+    // A completed file can still have a pending marker after a crash before marker removal.
+    // Preserve its full snapshot so recovery must override the ordinary unchanged-file fast path.
+    let pending_path = index_path.join("pending.json");
+    fs::write(
+        &pending_path,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "files": [{ "kind": "reindex", "source": source }],
+        }))?,
+    )?;
+
+    let engine = ZvecGrep::new();
+    let status = engine
+        .info(info_options(root))
+        .await?
+        .status
+        .expect("status");
+    assert_eq!(
+        (
+            status.files_pending,
+            status.files_indexed,
+            status.files_failed
+        ),
+        (1, 0, 0)
+    );
+    assert!(
+        !pending_path.exists(),
+        "recovery flushes and clears the marker"
+    );
+    assert!(fts_paths(&engine, root, "orchard").await?.is_empty());
+    assert_eq!(server.requests.load(Ordering::Acquire), requests);
+    engine.close();
+    drop(engine);
+
+    let files = native_documents(&files_path)?;
+    assert_eq!(
+        files.len(),
+        1,
+        "recovery preserves the source for reindexing"
+    );
+    assert_eq!(
+        files[0].get_string("payload")?.as_deref(),
+        Some(source.as_str())
+    );
+    let collections = fs::read_dir(&index_path)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                matches!(name, "entities" | "fragments") || name.starts_with("vectors_")
+            })
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(collections.len(), 3);
+    for collection in collections {
+        assert!(
+            native_documents(&collection)?.is_empty(),
+            "recovery clears searchable records in {}",
+            collection.display()
+        );
+    }
+    assert_eq!(fs::read_to_string(&source_path)?, contents);
+    assert_eq!(fs::metadata(&source_path)?.modified()?, modified);
+    assert_eq!(server.requests.load(Ordering::Acquire), requests);
+
+    let engine = ZvecGrep::new();
+    let recovered = engine.index(index_options(root)).await?;
+    assert_eq!((recovered.files_unchanged, recovered.files_failed), (0, 0));
+    let after_reindex = server.requests.load(Ordering::Acquire);
+    assert!(
+        after_reindex > requests,
+        "pending sources must be embedded again"
+    );
+    assert_eq!(
+        fts_paths(&engine, root, "orchard").await?,
+        [PathBuf::from("note.txt")]
+    );
+    let status = engine
+        .info(info_options(root))
+        .await?
+        .status
+        .expect("status");
+    assert_eq!((status.files_pending, status.files_indexed), (0, 1));
+    let vector = engine
+        .context(ContextOptions {
+            root: Some(root.to_path_buf()),
+            routes: vec![ContextRoute {
+                mode: ContextRouteMode::Vector,
+                query: "orchard documentation".to_owned(),
+            }],
+            auto_update: false,
+            allow_remote: true,
+            ..ContextOptions::default()
+        })
+        .await?;
+    assert!(
+        vector
+            .items
+            .iter()
+            .any(|item| item.relative_path == Path::new("note.txt"))
+    );
+    let after_search = server.requests.load(Ordering::Acquire);
+    let unchanged = engine.index(index_options(root)).await?;
+    assert_eq!(unchanged.files_unchanged, 1);
+    assert_eq!(server.requests.load(Ordering::Acquire), after_search);
+    engine.drop_index(info_options(root)).await?;
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
 async fn public_engine_reuses_relative_files_after_moving_workspace() -> TestResult {
     let temporary = tempdir()?;
     let original_root = temporary.path().join("original");
@@ -327,6 +469,22 @@ async fn public_engine_reuses_relative_files_after_moving_workspace() -> TestRes
     engine.drop_index(info_options(&relocated_root)).await?;
     engine.close();
     Ok(())
+}
+
+fn native_documents(path: &Path) -> Result<Vec<zvec_rust::Doc>, Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    let path = dunce::simplified(path);
+    let mut options = zvec_rust::CollectionOptions::new()?;
+    options.set_read_only(true)?;
+    let collection = zvec_rust::Collection::open(
+        path.to_str().expect("UTF-8 collection path"),
+        Some(&options),
+    )?;
+    let documents = collection
+        .iter_with_options(None, false)?
+        .collect::<Result<Vec<_>, _>>()?;
+    collection.close()?;
+    Ok(documents)
 }
 
 fn index_options(root: &Path) -> IndexOptions {
