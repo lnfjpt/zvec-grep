@@ -14,20 +14,26 @@ use std::{
 };
 
 use serde_json::json;
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
+
+const SERVER_START_ATTEMPTS: usize = 5;
 
 struct ServerGuard {
     binary: PathBuf,
     home: PathBuf,
+    listen: String,
+    token_file: Option<PathBuf>,
     active: bool,
 }
 
 impl ServerGuard {
     fn stop(&mut self) -> Result<Output, std::io::Error> {
-        let output = Command::new(&self.binary)
-            .args(["server", "off", "--home"])
-            .arg(&self.home)
-            .output()?;
+        let mut command = Command::new(&self.binary);
+        command.args(["server", "off", "--home"]).arg(&self.home);
+        if let Some(token_file) = &self.token_file {
+            command.arg("--token-file").arg(token_file);
+        }
+        let output = command.output()?;
         if output.status.success() {
             self.active = false;
         }
@@ -38,12 +44,134 @@ impl ServerGuard {
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         if self.active {
-            let _ = Command::new(&self.binary)
-                .args(["server", "off", "--home"])
-                .arg(&self.home)
-                .output();
+            let _ = self.stop();
         }
     }
+}
+
+// Each caller supplies its own TempDir, so cleanup can only stop that test's
+// daemon. Keep the guard alive even when bootstrap fails before reporting ready.
+fn start_on_available_port<T>(
+    binary: &Path,
+    home: &TempDir,
+    token_file: Option<&Path>,
+    mut start: impl FnMut(&str) -> Result<T, Box<dyn Error>>,
+) -> Result<(ServerGuard, T), Box<dyn Error>> {
+    for attempt in 1..=SERVER_START_ATTEMPTS {
+        let mut guard = ServerGuard {
+            binary: binary.to_owned(),
+            home: home.path().to_owned(),
+            listen: format!("127.0.0.1:{}", available_port()?),
+            token_file: token_file.map(Path::to_owned),
+            active: true,
+        };
+        let log_path = home.path().join("daemon/server.log");
+        let log_start = std::fs::metadata(&log_path).map_or(0, |metadata| metadata.len());
+        match start(&guard.listen) {
+            Ok(value) => return Ok((guard, value)),
+            Err(error) => {
+                let log = log_tail(&log_path, log_start);
+                let details = format!("{error}\ndaemon log ({}):\n{log}", log_path.display());
+                let already_ready = std::fs::read(home.path().join("daemon/instance.lock"))
+                    .is_ok_and(|bytes| {
+                        serde_json::from_slice::<serde_json::Value>(&bytes)
+                            .is_ok_and(|record| record["ready"] == true)
+                    });
+                let address_in_use = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+                    || is_address_in_use(&details);
+                if attempt == SERVER_START_ATTEMPTS || already_ready || !address_in_use {
+                    return Err(details.into());
+                }
+                // Only bind conflicts are retryable. A failed stop must never
+                // allow a later attempt to accidentally reuse a surviving daemon.
+                assert_command_success(&guard.stop()?);
+            }
+        }
+    }
+    unreachable!("server startup returns on the final attempt")
+}
+
+fn start_server(
+    binary: &Path,
+    home: &TempDir,
+    toolset: &str,
+    token_file: Option<&Path>,
+    configure: impl Fn(&mut Command),
+) -> Result<(ServerGuard, Output), Box<dyn Error>> {
+    start_on_available_port(binary, home, token_file, |listen| {
+        let mut command = Command::new(binary);
+        command
+            .args(["server", "on", "--home"])
+            .arg(home.path())
+            .args(["--listen", listen, "--mcp-toolset", toolset]);
+        if let Some(token_file) = token_file {
+            command.arg("--token-file").arg(token_file);
+        }
+        configure(&mut command);
+        server_start_output(&mut command)
+    })
+}
+
+fn server_start_output(command: &mut Command) -> Result<Output, Box<dyn Error>> {
+    let output = command.output()?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!(
+            "server startup failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into())
+    }
+}
+
+fn is_address_in_use(details: &str) -> bool {
+    details.contains("is already in use")
+        || details.contains("Address already in use")
+        || details.contains("AddrInUse")
+        || details.contains("Only one usage of each socket address")
+}
+
+fn log_tail(path: &Path, start: u64) -> String {
+    use std::io::{Seek, SeekFrom};
+
+    let read = || -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let tail_start = file.metadata()?.len().saturating_sub(8192).max(start);
+        file.seek(SeekFrom::Start(tail_start))?;
+        let mut bytes = Vec::new();
+        file.take(8192).read_to_end(&mut bytes)?;
+        let mut lines = String::from_utf8_lossy(&bytes)
+            .lines()
+            .rev()
+            .take(20)
+            .map(|line| {
+                let lower = line.to_ascii_lowercase();
+                if [
+                    "api_key",
+                    "apikey",
+                    "api key",
+                    "authorization",
+                    "bearer",
+                    "token",
+                    "credential",
+                ]
+                .iter()
+                .any(|sensitive| lower.contains(sensitive))
+                {
+                    "[redacted sensitive log line]".to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        lines.reverse();
+        Ok(lines.join("\n"))
+    };
+    read().unwrap_or_else(|error| format!("<unavailable: {error}>"))
 }
 
 struct StdioBridge {
@@ -51,10 +179,16 @@ struct StdioBridge {
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     reader: Option<JoinHandle<()>>,
+    stderr: NamedTempFile,
+    home: PathBuf,
+    daemon_log_start: u64,
 }
 
 impl StdioBridge {
     fn spawn(binary: &Path, home: &Path, listen: &str) -> Result<Self, Box<dyn Error>> {
+        let stderr = NamedTempFile::new()?;
+        let daemon_log_start =
+            std::fs::metadata(home.join("daemon/server.log")).map_or(0, |metadata| metadata.len());
         let mut child = Command::new(binary)
             .args([
                 "server",
@@ -68,7 +202,7 @@ impl StdioBridge {
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr.reopen()?)
             .spawn()?;
         let stdin = child.stdin.take().ok_or("stdio bridge has no stdin")?;
         let stdout = child.stdout.take().ok_or("stdio bridge has no stdout")?;
@@ -88,6 +222,9 @@ impl StdioBridge {
             stdin: Some(stdin),
             lines,
             reader: Some(reader),
+            stderr,
+            home: home.to_owned(),
+            daemon_log_start,
         })
     }
 
@@ -95,19 +232,8 @@ impl StdioBridge {
         &mut self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn Error>> {
-        let id = request.get("id").cloned().ok_or("request has no id")?;
-        let stdin = self.stdin.as_mut().ok_or("stdio bridge is closed")?;
-        writeln!(stdin, "{request}")?;
-        stdin.flush()?;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let line = self.lines.recv_timeout(remaining)?;
-            let response = serde_json::from_str::<serde_json::Value>(&line)?;
-            if response.get("id") == Some(&id) {
-                return Ok(response);
-            }
-        }
+        self.wait_for_response(request, None)
+            .map(|(response, _)| response)
     }
 
     fn notify(&mut self, notification: &serde_json::Value) -> Result<(), Box<dyn Error>> {
@@ -122,23 +248,95 @@ impl StdioBridge {
         request: &serde_json::Value,
         choice: &str,
     ) -> Result<(serde_json::Value, usize), Box<dyn Error>> {
-        self.notify(request)?;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        self.wait_for_response(request, Some(choice))
+    }
+
+    fn wait_for_response(
+        &mut self,
+        request: &serde_json::Value,
+        choice: Option<&str>,
+    ) -> Result<(serde_json::Value, usize), Box<dyn Error>> {
+        let id = request.get("id").ok_or("request has no id")?;
+        let started = Instant::now();
+        self.notify(request).map_err(|error| {
+            self.response_error(request, choice, 0, started, "none", &error.to_string())
+        })?;
+        // A blocking index request includes cold tokenizer/storage setup. Use
+        // the same 30-second budget as the HTTP indexing fixture, without
+        // resetting the deadline when consent or progress notifications arrive.
+        let timeout = if request["params"]["name"] == "zvec_grep_index" {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(20)
+        };
+        let deadline = started + timeout;
         let mut prompts = 0;
+        let mut last_message = "none".to_owned();
         loop {
             let line = self
                 .lines
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
-            let response: serde_json::Value = serde_json::from_str(&line)?;
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| {
+                    self.response_error(
+                        request,
+                        choice,
+                        prompts,
+                        started,
+                        &last_message,
+                        &error.to_string(),
+                    )
+                })?;
+            let response: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+                self.response_error(
+                    request,
+                    choice,
+                    prompts,
+                    started,
+                    &last_message,
+                    &format!("invalid JSON: {error}"),
+                )
+            })?;
+            // Record protocol metadata only: request arguments and response
+            // bodies may contain API keys or indexed source content.
+            last_message = json!({
+                "id": response.get("id"),
+                "method": response.get("method"),
+                "error_code": response.pointer("/error/code"),
+                "has_result": response.get("result").is_some()
+            })
+            .to_string();
             if response["method"] == "elicitation/create" {
                 prompts += 1;
+                let choice = choice.ok_or("unexpected consent prompt")?;
                 self.notify(&json!({"jsonrpc": "2.0", "id": response["id"], "result": {
                     "action": "accept", "content": {"choice": choice}
                 }}))?;
-            } else if response.get("id") == request.get("id") {
+            } else if response.get("id") == Some(id) {
                 return Ok((response, prompts));
             }
         }
+    }
+
+    fn response_error(
+        &mut self,
+        request: &serde_json::Value,
+        choice: Option<&str>,
+        prompts: usize,
+        started: Instant,
+        last_message: &str,
+        reason: &str,
+    ) -> Box<dyn Error> {
+        let child_status = match self.child.try_wait() {
+            Ok(Some(status)) => status.to_string(),
+            Ok(None) => "running".to_owned(),
+            Err(error) => format!("unavailable: {error}"),
+        };
+        let log_path = self.home.join("daemon/server.log");
+        format!(
+            "stdio response failed: {reason}; id={}, method={}, tool={}, choice={choice:?}, prompts={prompts}, elapsed={:?}, child={child_status}, last_message={last_message}\nbridge stderr:\n{}\ndaemon log ({}):\n{}",
+            request["id"], request["method"], request["params"]["name"], started.elapsed(),
+            log_tail(self.stderr.path(), 0), log_path.display(), log_tail(&log_path, self.daemon_log_start)
+        ).into()
     }
 
     fn close(mut self) -> Result<(), Box<dyn Error>> {
@@ -178,32 +376,58 @@ impl Drop for StdioBridge {
 }
 
 #[test]
+fn server_start_retries_a_bind_race_without_stopping_the_port_owner() -> Result<(), Box<dyn Error>>
+{
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
+    let home = TempDir::new()?;
+    let mut attempts = 0;
+    let mut occupied = None;
+    let (mut guard, _) = start_on_available_port(&binary, &home, None, |listen| {
+        attempts += 1;
+        if occupied.is_none() {
+            // Claim the port after selection, immediately before daemon startup.
+            occupied = Some(TcpListener::bind(listen)?);
+        }
+        server_start_output(
+            Command::new(&binary)
+                .args(["server", "on", "--home"])
+                .arg(home.path())
+                .args(["--listen", listen, "--mcp-toolset", "full"]),
+        )
+    })?;
+    assert!(attempts >= 2, "the forced bind conflict must be retried");
+    let occupied = occupied.ok_or("bind-race listener was not created")?;
+    assert_ne!(guard.listen, occupied.local_addr()?.to_string());
+    assert_command_success(&guard.stop()?);
+    // Retry cleanup is scoped to the private home, never to the occupied port.
+    assert!(TcpStream::connect(occupied.local_addr()?).is_ok());
+    Ok(())
+}
+
+#[test]
+fn server_start_does_not_retry_unrelated_failures() -> Result<(), Box<dyn Error>> {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
+    let home = TempDir::new()?;
+    let mut attempts = 0;
+    let result = start_on_available_port::<()>(&binary, &home, None, |_| {
+        attempts += 1;
+        Err("fixture setup failed".into())
+    });
+    assert_eq!(attempts, 1);
+    let error = result.err().ok_or("unexpected startup success")?;
+    assert!(error.to_string().contains("fixture setup failed"));
+    Ok(())
+}
+
+#[test]
 fn server_on_exposes_only_agent_search_and_off_stops_it() -> Result<(), Box<dyn Error>> {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
-    let port = available_port()?;
-    let listen = format!("127.0.0.1:{port}");
-    let output = Command::new(&binary)
-        .args([
-            "server",
-            "on",
-            "--home",
-            path_text(home.path())?,
-            "--listen",
-            &listen,
-            "--mcp-toolset",
-            "agent",
-        ])
-        .output()?;
-    assert_command_success(&output);
+    let (mut guard, output) = start_server(&binary, &home, "agent", None, |_| {})?;
+    let port = guard.listen.parse::<SocketAddr>()?.port();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Server: ready"));
     assert!(stdout.contains("MCP toolset: agent"));
-    let mut guard = ServerGuard {
-        binary,
-        home: home.path().to_owned(),
-        active: true,
-    };
 
     let initialize = json!({
         "jsonrpc": "2.0",
@@ -310,29 +534,13 @@ fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<
         ])
         .output()?;
     assert_command_success(&consent);
-    let port = available_port()?;
-    let listen = format!("127.0.0.1:{port}");
-    let output = Command::new(&binary)
-        .env("ZVEC_GREP_API_KEY", "local-test-key")
-        .env("ZVEC_GREP_AUTHORIZATION_KEY_FILE", &signing_key)
-        .args([
-            "server",
-            "on",
-            "--home",
-            path_text(home.path())?,
-            "--listen",
-            &listen,
-            "--mcp-toolset",
-            "full",
-        ])
-        .output()?;
-    assert_command_success(&output);
+    let (mut guard, output) = start_server(&binary, &home, "full", None, |command| {
+        command
+            .env("ZVEC_GREP_API_KEY", "local-test-key")
+            .env("ZVEC_GREP_AUTHORIZATION_KEY_FILE", &signing_key);
+    })?;
+    let port = guard.listen.parse::<SocketAddr>()?.port();
     assert!(String::from_utf8_lossy(&output.stdout).contains("MCP toolset: full"));
-    let mut guard = ServerGuard {
-        binary,
-        home: home.path().to_owned(),
-        active: true,
-    };
 
     let initialize = json!({
         "jsonrpc": "2.0",
@@ -528,36 +736,32 @@ fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<
 fn concurrent_stdio_bootstraps_share_one_resident_daemon() -> Result<(), Box<dyn Error>> {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
-    let port = available_port()?;
-    let listen = format!("127.0.0.1:{port}");
-    let mut guard = ServerGuard {
-        binary: binary.clone(),
-        home: home.path().to_owned(),
-        active: true,
-    };
-    let mut bridges = (0..4)
-        .map(|_| StdioBridge::spawn(&binary, home.path(), &listen))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (mut guard, mut bridges) = start_on_available_port(&binary, &home, None, |listen| {
+        let mut bridges = (0..4)
+            .map(|_| StdioBridge::spawn(&binary, home.path(), listen))
+            .collect::<Result<Vec<_>, _>>()?;
 
-    for (index, bridge) in bridges.iter_mut().enumerate() {
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": index + 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": { "name": "zg-stdio-test", "version": "1" }
-            }
-        });
-        let response = bridge.request(&initialize)?;
-        assert_eq!(response["result"]["serverInfo"]["name"], "zvec-grep");
-        bridge.notify(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-            "params": {}
-        }))?;
-    }
+        for (index, bridge) in bridges.iter_mut().enumerate() {
+            let initialize = json!({
+                "jsonrpc": "2.0",
+                "id": index + 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "zg-stdio-test", "version": "1" }
+                }
+            });
+            let response = bridge.request(&initialize)?;
+            assert_eq!(response["result"]["serverInfo"]["name"], "zvec-grep");
+            bridge.notify(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }))?;
+        }
+        Ok(bridges)
+    })?;
 
     let list = bridges[0].request(&json!({
         "jsonrpc": "2.0",
@@ -598,28 +802,11 @@ fn stdio_remote_consent_controls_transmission_and_persistence() -> Result<(), Bo
         workspace.path().join("sample.md"),
         "# Consent\nremote consent fixture\n",
     )?;
-    let listen = format!("127.0.0.1:{}", available_port()?);
     let signing_key = home.path().join("authorization.key");
-    let output = Command::new(&binary)
-        .env("ZVEC_GREP_AUTHORIZATION_KEY_FILE", &signing_key)
-        .args([
-            "server",
-            "on",
-            "--home",
-            path_text(home.path())?,
-            "--listen",
-            &listen,
-            "--mcp-toolset",
-            "full",
-        ])
-        .output()?;
-    assert_command_success(&output);
-    let mut guard = ServerGuard {
-        binary: binary.clone(),
-        home: home.path().to_owned(),
-        active: true,
-    };
-    let mut bridge = StdioBridge::spawn(&binary, home.path(), &listen)?;
+    let (mut guard, _) = start_server(&binary, &home, "full", None, |command| {
+        command.env("ZVEC_GREP_AUTHORIZATION_KEY_FILE", &signing_key);
+    })?;
+    let mut bridge = StdioBridge::spawn(&binary, home.path(), &guard.listen)?;
     bridge.request(
         &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-11-25", "capabilities": {"elicitation": {"form": {}}},
@@ -812,27 +999,14 @@ fn token_file_protects_daemon_requests_and_is_forwarded_to_child() -> Result<(),
     let home = TempDir::new()?;
     let token_file = home.path().join("token.txt");
     std::fs::write(&token_file, "test-token-012345678901234567890123456789\n")?;
-    let listen = format!("127.0.0.1:{}", available_port()?);
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
-    let started = Command::new(&binary)
-        .args(["server", "on", "--home"])
-        .arg(home.path())
-        .args(["--listen", &listen, "--token-file"])
-        .arg(&token_file)
-        .env_remove("ZVEC_GREP_SERVER_TOKEN")
-        .env_remove("ZVEC_GREP_SERVER_TOKEN_FILE")
-        .output()?;
-    let mut guard = ServerGuard {
-        binary: binary.clone(),
-        home: home.path().to_owned(),
-        active: true,
-    };
-    assert!(
-        started.status.success(),
-        "{}",
-        String::from_utf8_lossy(&started.stderr)
-    );
-    let mut connection = TcpStream::connect(&listen)?;
+    let (mut guard, _) = start_server(&binary, &home, "agent", Some(&token_file), |command| {
+        command
+            .env_remove("ZVEC_GREP_SERVER_TOKEN")
+            .env_remove("ZVEC_GREP_SERVER_TOKEN_FILE");
+    })?;
+    let listen = &guard.listen;
+    let mut connection = TcpStream::connect(listen)?;
     connection.set_read_timeout(Some(Duration::from_secs(5)))?;
     write!(
         connection,

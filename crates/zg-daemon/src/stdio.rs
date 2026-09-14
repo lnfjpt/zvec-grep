@@ -1,5 +1,6 @@
-use std::{path::Path, time::Duration};
+use std::{collections::VecDeque, path::Path, time::Duration};
 
+use futures::{FutureExt, future::BoxFuture};
 use rmcp::{
     RoleClient, RoleServer,
     transport::{
@@ -10,7 +11,6 @@ use rmcp::{
         },
     },
 };
-use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::{
@@ -57,7 +57,11 @@ where
     Downstream: Transport<RoleServer>,
     Upstream: Transport<RoleClient>,
 {
-    let mut sends = JoinSet::new();
+    // Transport::send may only enqueue a message when its future is polled.
+    // Poll one send at a time in each direction to preserve wire order, while
+    // continuing to receive and to send in the opposite direction.
+    let mut upstream_sends = VecDeque::new();
+    let mut downstream_sends = VecDeque::new();
     let mut monitor = tokio::time::interval_at(
         tokio::time::Instant::now() + DAEMON_MONITOR_INTERVAL,
         DAEMON_MONITOR_INTERVAL,
@@ -69,10 +73,7 @@ where
                 let Some(message) = message else {
                     break Ok(());
                 };
-                let send = upstream.send(message);
-                sends.spawn(async move {
-                    send.await.map_err(|error| format!("sending MCP request to daemon: {error}"))
-                });
+                upstream_sends.push_back(upstream.send(message).boxed());
             }
             message = upstream.receive() => {
                 let Some(message) = message else {
@@ -80,24 +81,27 @@ where
                         "daemon MCP transport closed while stdio was connected".to_owned(),
                     ));
                 };
-                let send = downstream.send(message);
-                sends.spawn(async move {
-                    send.await.map_err(|error| format!("sending MCP response to stdout: {error}"))
-                });
+                downstream_sends.push_back(downstream.send(message).boxed());
             }
-            completed = sends.join_next(), if !sends.is_empty() => {
-                match completed {
-                    Some(Ok(Err(error))) => break Err(DaemonError::McpBridge(error)),
-                    Some(Err(error)) => {
-                        break Err(DaemonError::McpBridge(format!(
-                            "MCP relay send task failed: {error}"
-                        )));
-                    }
-                    Some(Ok(Ok(()))) | None => {}
+            result = send_next(&mut upstream_sends) => {
+                if let Err(error) = result {
+                    break Err(DaemonError::McpBridge(format!(
+                        "sending MCP request to daemon: {error}"
+                    )));
+                }
+            }
+            result = send_next(&mut downstream_sends) => {
+                if let Err(error) = result {
+                    break Err(DaemonError::McpBridge(format!(
+                        "sending MCP response to stdout: {error}"
+                    )));
                 }
             }
             _ = monitor.tick() => {
-                let current = server_status(home).await?;
+                let current = match server_status(home).await {
+                    Ok(current) => current,
+                    Err(error) => break Err(error),
+                };
                 if !same_daemon(connected, &current) {
                     break Err(DaemonError::McpBridge(
                         "daemon stopped or changed while stdio was connected".to_owned(),
@@ -107,8 +111,8 @@ where
         }
     };
 
-    sends.abort_all();
-    while sends.join_next().await.is_some() {}
+    drop(upstream_sends);
+    drop(downstream_sends);
     let (downstream_close, upstream_close) = tokio::join!(downstream.close(), upstream.close());
     if let Err(error) = downstream_close {
         warn!(%error, "failed to close MCP stdio transport");
@@ -119,6 +123,15 @@ where
     relay_result
 }
 
+async fn send_next<E>(sends: &mut VecDeque<BoxFuture<'static, Result<(), E>>>) -> Result<(), E> {
+    let Some(send) = sends.front_mut() else {
+        return std::future::pending().await;
+    };
+    let result = send.await;
+    sends.pop_front();
+    result
+}
+
 fn same_daemon(connected: &DaemonStatus, current: &DaemonStatus) -> bool {
     current.running
         && current.ready
@@ -127,32 +140,4 @@ fn same_daemon(connected: &DaemonStatus, current: &DaemonStatus) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::same_daemon;
-    use crate::DaemonStatus;
-
-    fn status(pid: u32, url: &str) -> DaemonStatus {
-        DaemonStatus {
-            running: true,
-            ready: true,
-            pid: Some(pid),
-            server_url: Some(url.to_owned()),
-            mcp_toolset: Some("agent".to_owned()),
-        }
-    }
-
-    #[test]
-    fn daemon_identity_requires_the_same_ready_process_and_url() {
-        let connected = status(10, "http://127.0.0.1:7999/mcp");
-        assert!(same_daemon(&connected, &connected));
-        assert!(!same_daemon(
-            &connected,
-            &status(11, "http://127.0.0.1:7999/mcp")
-        ));
-
-        let mut stopped = connected.clone();
-        stopped.running = false;
-        stopped.ready = false;
-        assert!(!same_daemon(&connected, &stopped));
-    }
-}
+mod tests;
