@@ -1,8 +1,8 @@
 use super::super::pending::{self, PendingChange, PendingChanges};
 use super::*;
 use crate::domain::{
-    Content, Entity, EntityContent, EntityFragment, EntityMetadata, FileFormat, FileSnapshot,
-    SourceFile, SourceRange, SymbolType, TableCell, TableCellRole, TableContent,
+    Content, Entity, EntityContent, EntityFragment, EntityMetadata, FileFormat, FileRecord,
+    FileSnapshot, SourceRange, SymbolType, TableCell, TableCellRole, TableContent,
 };
 use std::{
     collections::BTreeSet,
@@ -49,20 +49,18 @@ fn open(path: &Path, read_only: bool) -> Box<dyn WorkspaceIndexStorage> {
         .expect("open real zvec storage")
 }
 
-fn fixture(id: &str, text: &str, vector: Vec<f32>) -> (StoredFile, IndexedFragment) {
+fn fixture(id: &str, text: &str, vector: Vec<f32>) -> (FileRecord, IndexedFragment) {
     let id = FileId::new(id).expect("file ID");
-    let file = StoredFile {
-        source: SourceFile {
-            id: id.clone(),
-            relative_path: PathBuf::from(format!("{}.txt", id.as_str())),
-            formats: vec![FileFormat::Text],
-            snapshot: FileSnapshot {
-                size_bytes: text.len() as u64,
-                modified_epoch_ms: Some(1),
-                content_hash: None,
-            },
+    let file = FileRecord {
+        id: id.clone(),
+        relative_path: PathBuf::from(format!("{}.txt", id.as_str())),
+        formats: vec![FileFormat::Text],
+        snapshot: FileSnapshot {
+            size_bytes: text.len() as u64,
+            modified_epoch_ms: Some(1),
+            content_hash: Some(crate::utils::sha256_hex(text.as_bytes())),
         },
-        index_status: None,
+        index_status: FileIndexStatus::NotIndexed,
     };
     let entry = IndexedFragment {
         fragment: EntityFragment::Standalone(Entity {
@@ -97,16 +95,16 @@ fn persists_filters_and_replaces_complete_files() {
     let (first, entry) = fixture("first", "orchard\0苹果 数据库", vec![1.0, 0.0, 0.0]);
     let (second, other) = fixture("second", "orchard vineyard", vec![0.0, 1.0, 0.0]);
     storage
-        .replace_file(&first, std::slice::from_ref(&entry), None)
+        .replace_file(&first, std::slice::from_ref(&entry))
         .expect("first file");
     storage
-        .replace_file(&second, &[other], None)
+        .replace_file(&second, &[other])
         .expect("second file");
     let marker = home.join("storage").join(pending::NAME);
     assert!(marker.exists(), "small writes await a checkpoint");
 
     let filter = StorageSearchFilter {
-        file_ids: Some(vec![first.source.id.clone()]),
+        file_ids: Some(vec![first.id.clone()]),
         entity_ids: Some(vec![entry.fragment.entity_id().clone()]),
         symbol_names: Some(vec!["quoted'\\name\0suffix".to_owned()]),
         symbol_types: Some(vec![SymbolType::Function]),
@@ -122,7 +120,9 @@ fn persists_filters_and_replaces_complete_files() {
         .search_vector(&[1.0, 0.0, 0.0], 10, Some(&filter))
         .expect("filtered ANN");
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].file.source, first.source);
+    assert_eq!(hits[0].file.id, first.id);
+    assert_eq!(hits[0].file.snapshot, first.snapshot);
+    assert!(hits[0].file.index_status.is_indexed());
     let ranked = storage
         .search_vector(&[1.0, 0.0, 0.0], 10, None)
         .expect("ranked ANN");
@@ -130,7 +130,7 @@ fn persists_filters_and_replaces_complete_files() {
     assert_eq!(ranked[0].fragment, entry.fragment);
     for rejected in [
         StorageSearchFilter {
-            file_ids: Some(vec![second.source.id.clone()]),
+            file_ids: Some(vec![second.id.clone()]),
             ..filter.clone()
         },
         StorageSearchFilter {
@@ -201,16 +201,13 @@ fn persists_filters_and_replaces_complete_files() {
             .is_none()
     );
     assert_eq!(
-        storage.list_files().expect("files")[0]
-            .index_status
-            .as_ref()
-            .and_then(|status| status.error.as_deref()),
+        storage.list_files().expect("files")[0].index_status.error(),
         Some("fixture extraction error")
     );
     storage
-        .replace_file(&first, &[entry], None)
+        .replace_file(&first, &[entry])
         .expect("retry failed file");
-    storage.delete_file(&second.source.id).expect("delete file");
+    storage.delete_file(&second.id).expect("delete file");
     storage.close().expect("close writer");
     assert!(
         !marker.exists(),
@@ -236,7 +233,7 @@ fn persists_filters_and_replaces_complete_files() {
             .len(),
         1
     );
-    assert!(reader.delete_file(&first.source.id).is_err());
+    assert!(reader.delete_file(&first.id).is_err());
     let second_reader = open(home, true);
     reader.close().expect("close one reader");
     assert_eq!(
@@ -270,7 +267,7 @@ fn invalidates_interrupted_batches_before_serving_readers() {
         (&unaffected, &unaffected_entry),
     ] {
         storage
-            .replace_file(source, std::slice::from_ref(entry), None)
+            .replace_file(source, std::slice::from_ref(entry))
             .expect("initial file");
     }
     storage.close().expect("close writer");
@@ -279,16 +276,16 @@ fn invalidates_interrupted_batches_before_serving_readers() {
     let path = home.join("storage");
     let changes = PendingChanges::from([
         (
-            file.source.id.as_str().to_owned(),
-            PendingChange::Reindex(replacement_file.source.clone()),
+            file.id.as_str().to_owned(),
+            PendingChange::Reindex(replacement_file.clone()),
         ),
         (
-            added.source.id.as_str().to_owned(),
-            PendingChange::Reindex(added.source.clone()),
+            added.id.as_str().to_owned(),
+            PendingChange::Reindex(added.clone()),
         ),
         (
-            deleted.source.id.as_str().to_owned(),
-            PendingChange::Delete(deleted.source.id.clone()),
+            deleted.id.as_str().to_owned(),
+            PendingChange::Delete(deleted.id.clone()),
         ),
     ]);
     pending::write(&path, &changes).expect("durable batch intent");
@@ -301,11 +298,14 @@ fn invalidates_interrupted_batches_before_serving_readers() {
         false,
     )
     .expect("native writer");
+    native.apply_delete(&file.id).expect("partial mutation");
+    let mut partial = added.clone();
+    partial.index_status = FileIndexStatus::Indexed {
+        indexed_epoch_ms: 1,
+        entity_count: 1,
+    };
     native
-        .apply_delete(&file.source.id)
-        .expect("partial mutation");
-    native
-        .apply_replace(&added, std::slice::from_ref(&replacement))
+        .apply_replace(&partial, std::slice::from_ref(&replacement))
         .expect("uncheckpointed replacement");
     native.flush().expect("persist partial mutation");
     drop(native);
@@ -344,7 +344,7 @@ fn invalidates_interrupted_batches_before_serving_readers() {
         (&deleted, &deleted_entry),
     ] {
         let filter = StorageSearchFilter {
-            file_ids: Some(vec![source.source.id.clone()]),
+            file_ids: Some(vec![source.id.clone()]),
             ..StorageSearchFilter::default()
         };
         assert!(
@@ -362,22 +362,18 @@ fn invalidates_interrupted_batches_before_serving_readers() {
     }
     let recovered = reader.list_files().expect("recovered source metadata");
     assert_eq!(recovered.len(), 3);
-    for source in [&replacement_file.source, &added.source] {
+    for source in [&replacement_file, &added] {
         let stored = recovered
             .iter()
-            .find(|file| file.source.id == source.id)
+            .find(|file| file.id == source.id)
             .expect("pending source retained");
-        assert_eq!(&stored.source, source);
-        let status = stored.index_status.as_ref().expect("pending index status");
-        assert_eq!(status.indexed_epoch_ms, None);
-        assert_eq!(status.entity_count, 0);
-        assert_eq!(status.error, None);
+        assert_eq!(stored, source);
+        let status = &stored.index_status;
+        assert_eq!(status.indexed_epoch_ms(), None);
+        assert_eq!(status.entity_count(), 0);
+        assert_eq!(status.error(), None);
     }
-    assert!(
-        !recovered
-            .iter()
-            .any(|file| file.source.id == deleted.source.id)
-    );
+    assert!(!recovered.iter().any(|file| file.id == deleted.id));
     assert_eq!(
         reader
             .search_fts("vineyard", 10, None)
@@ -424,16 +420,12 @@ fn checkpoints_batches_at_the_operation_limit() {
     let marker = home.join("storage").join(pending::NAME);
     for index in 0..CHECKPOINT_OPERATIONS {
         let (file, entry) = fixture(&format!("batch-{index}"), "orchard", vec![1.0, 0.0, 0.0]);
-        storage
-            .replace_file(&file, &[entry], None)
-            .expect("batch write");
+        storage.replace_file(&file, &[entry]).expect("batch write");
         assert_eq!(marker.exists(), index + 1 < CHECKPOINT_OPERATIONS);
     }
 
     let (later, entry) = fixture("later", "uncheckpointed banana", vec![0.0, 1.0, 0.0]);
-    storage
-        .replace_file(&later, &[entry], None)
-        .expect("next batch");
+    storage.replace_file(&later, &[entry]).expect("next batch");
     assert_eq!(
         pending::read(&home.join("storage"))
             .expect("next batch marker")
@@ -453,10 +445,7 @@ fn checkpoints_batches_at_the_operation_limit() {
     assert_eq!(
         files
             .iter()
-            .filter(|file| file
-                .index_status
-                .as_ref()
-                .is_some_and(|status| status.indexed_epoch_ms.is_some()))
+            .filter(|file| file.index_status.is_indexed())
             .count(),
         CHECKPOINT_OPERATIONS
     );
@@ -495,7 +484,7 @@ fn checkpoint_crash_fixture() {
             },
         );
         storage
-            .replace_file(&file, &[entry], None)
+            .replace_file(&file, &[entry])
             .expect("child write before abrupt termination");
     }
     fs::write(home.join("writer-ready"), b"ready").expect("publish child readiness");
@@ -591,18 +580,14 @@ fn recovers_only_the_uncheckpointed_batch_after_process_termination() {
         let entity_id = EntityId::new(format!("entity-crash-{index}")).expect("fixture entity ID");
         let file = files
             .iter()
-            .find(|file| file.source.id == id)
+            .find(|file| file.id == id)
             .expect("crash source retained");
-        let status = file.index_status.as_ref().expect("recovered index status");
+        let status = &file.index_status;
         let committed = index < CHECKPOINT_OPERATIONS;
+        assert_eq!(status.is_indexed(), committed, "file={id:?}\n{child_log}");
         assert_eq!(
-            status.indexed_epoch_ms.is_some(),
-            committed,
-            "file={id:?}\n{child_log}"
-        );
-        assert_eq!(
-            status.entity_count,
-            usize::from(committed),
+            status.entity_count(),
+            u64::from(committed),
             "file={id:?}\n{child_log}"
         );
         assert_eq!(
@@ -617,7 +602,8 @@ fn recovers_only_the_uncheckpointed_batch_after_process_termination() {
             indexed_ids.insert(id.as_str().to_owned());
         } else {
             assert_eq!(
-                status.error, None,
+                status.error(),
+                None,
                 "pending source must be retried\n{child_log}"
             );
             pending_ids.push(id);
@@ -629,7 +615,7 @@ fn recovers_only_the_uncheckpointed_batch_after_process_termination() {
         .expect("checkpointed FTS after crash");
     assert_eq!(
         fts.iter()
-            .map(|hit| hit.file.source.id.as_str().to_owned())
+            .map(|hit| hit.file.id.as_str().to_owned())
             .collect::<BTreeSet<_>>(),
         indexed_ids,
         "{child_log}"
@@ -640,7 +626,7 @@ fn recovers_only_the_uncheckpointed_batch_after_process_termination() {
     assert_eq!(
         vector
             .iter()
-            .map(|hit| hit.file.source.id.as_str().to_owned())
+            .map(|hit| hit.file.id.as_str().to_owned())
             .collect::<BTreeSet<_>>(),
         indexed_ids,
         "{child_log}"
@@ -679,9 +665,9 @@ fn checkpoints_large_sources_before_the_operation_limit() {
     for id in ["first-large", "second-large"] {
         let (mut file, entry) = fixture(id, "orchard", vec![1.0, 0.0, 0.0]);
         // Source metadata represents a large file without allocating its full contents.
-        file.source.snapshot.size_bytes = CHECKPOINT_BYTES / 2;
+        file.snapshot.size_bytes = CHECKPOINT_BYTES / 2;
         storage
-            .replace_file(&file, &[entry], None)
+            .replace_file(&file, &[entry])
             .expect("large source write");
         assert_eq!(marker.exists(), id == "first-large");
     }
@@ -704,9 +690,7 @@ async fn finalizes_small_batches_and_preserves_failure_status() {
     let storage = open(home, false);
     let (file, entry) = fixture("source", "orchard", vec![1.0, 0.0, 0.0]);
     let (failed, _) = fixture("failed", "unreadable", vec![0.0, 1.0, 0.0]);
-    storage
-        .replace_file(&file, &[entry], None)
-        .expect("small write");
+    storage.replace_file(&file, &[entry]).expect("small write");
     storage
         .mark_file_failed(&failed, "fixture failure")
         .expect("failed source");
@@ -734,11 +718,11 @@ async fn finalizes_small_batches_and_preserves_failure_status() {
     let files = reader.list_files().expect("finalized file status");
     let stored = files
         .iter()
-        .find(|file| file.source.id == failed.source.id)
+        .find(|file| file.id == failed.id)
         .expect("failed source remains");
-    let status = stored.index_status.as_ref().expect("failure status");
-    assert_eq!(status.error.as_deref(), Some("fixture failure"));
-    assert_eq!(status.indexed_epoch_ms, None);
+    let status = &stored.index_status;
+    assert_eq!(status.error(), Some("fixture failure"));
+    assert_eq!(status.indexed_epoch_ms(), None);
     reader.close().expect("close reader");
 }
 
@@ -750,33 +734,29 @@ fn retains_only_the_latest_intent_for_repeated_file_updates() {
     let storage = open(home, false);
     let (file, original) = fixture("source", "old apple", vec![1.0, 0.0, 0.0]);
     storage
-        .replace_file(&file, &[original], None)
+        .replace_file(&file, &[original])
         .expect("initial replacement");
-    storage
-        .delete_file(&file.source.id)
-        .expect("temporary deletion");
+    storage.delete_file(&file.id).expect("temporary deletion");
     let (mut latest, replacement) = fixture("source", "new banana", vec![0.0, 1.0, 0.0]);
-    latest.source.snapshot.modified_epoch_ms = Some(2);
+    latest.snapshot.modified_epoch_ms = Some(2);
     storage
-        .replace_file(&latest, std::slice::from_ref(&replacement), None)
+        .replace_file(&latest, std::slice::from_ref(&replacement))
         .expect("latest replacement");
     let (deleted, entry) = fixture("deleted", "ripe pear", vec![0.0, 0.0, 1.0]);
     storage
-        .replace_file(&deleted, &[entry], None)
+        .replace_file(&deleted, &[entry])
         .expect("another replacement");
-    storage
-        .delete_file(&deleted.source.id)
-        .expect("final deletion");
+    storage.delete_file(&deleted.id).expect("final deletion");
     assert_eq!(
         pending::read(&path).expect("pending intentions"),
         PendingChanges::from([
             (
-                latest.source.id.as_str().to_owned(),
-                PendingChange::Reindex(latest.source.clone())
+                latest.id.as_str().to_owned(),
+                PendingChange::Reindex(latest.clone())
             ),
             (
-                deleted.source.id.as_str().to_owned(),
-                PendingChange::Delete(deleted.source.id.clone())
+                deleted.id.as_str().to_owned(),
+                PendingChange::Delete(deleted.id.clone())
             ),
         ])
     );
@@ -793,15 +773,8 @@ fn retains_only_the_latest_intent_for_repeated_file_updates() {
     let reader = open(home, true);
     let files = reader.list_files().expect("recovered latest intention");
     assert_eq!(files.len(), 1);
-    assert_eq!(files[0].source, latest.source);
-    assert_eq!(
-        files[0]
-            .index_status
-            .as_ref()
-            .expect("pending status")
-            .indexed_epoch_ms,
-        None
-    );
+    assert_eq!(files[0], latest);
+    assert_eq!(files[0].index_status.indexed_epoch_ms(), None);
     assert!(
         reader
             .get_entity(replacement.fragment.entity_id())
@@ -826,14 +799,14 @@ async fn failed_marker_write_blocks_access_and_close_releases_the_lease() {
     let storage = open(home, false);
     let (file, entry) = fixture("source", "orchard", vec![1.0, 0.0, 0.0]);
     storage
-        .replace_file(&file, std::slice::from_ref(&entry), None)
+        .replace_file(&file, std::slice::from_ref(&entry))
         .expect("healthy pending write");
     let marker = path.join(pending::NAME);
     let preserved = path.join("preserved-pending.json");
     fs::rename(&marker, &preserved).expect("preserve durable intent");
     fs::create_dir(&marker).expect("obstruct marker replacement");
     let (other, replacement) = fixture("other", "banana", vec![0.0, 1.0, 0.0]);
-    assert!(storage.replace_file(&other, &[replacement], None).is_err());
+    assert!(storage.replace_file(&other, &[replacement]).is_err());
     for error in [
         storage
             .list_files()
@@ -848,7 +821,7 @@ async fn failed_marker_write_blocks_access_and_close_releases_the_lease() {
             .get_entity(entry.fragment.entity_id())
             .expect_err("failed writer cannot read entities"),
         storage
-            .delete_file(&file.source.id)
+            .delete_file(&file.id)
             .expect_err("failed writer cannot mutate"),
         storage
             .finalize_writes()
@@ -869,7 +842,7 @@ async fn failed_marker_write_blocks_access_and_close_releases_the_lease() {
     let reader = open(home, true);
     let files = reader.list_files().expect("recover earlier writes");
     assert_eq!(files.len(), 1);
-    assert_eq!(files[0].source, file.source);
+    assert_eq!(files[0], file);
     assert!(
         reader
             .search_fts("orchard", 10, None)
@@ -894,7 +867,7 @@ fn rejects_invalid_writes_without_poisoning_storage() {
         entry.vector = invalid;
         assert_eq!(
             storage
-                .replace_file(&file, std::slice::from_ref(&entry), None)
+                .replace_file(&file, std::slice::from_ref(&entry))
                 .expect_err("invalid vector")
                 .code(),
             EngineError::INVALID_ARGUMENT
@@ -909,14 +882,14 @@ fn rejects_invalid_writes_without_poisoning_storage() {
     }
     entry.vector = vec![1.0, 0.0, 0.0];
     storage
-        .replace_file(&file, std::slice::from_ref(&entry), None)
+        .replace_file(&file, std::slice::from_ref(&entry))
         .expect("valid write after rejections");
     let marker = home.join("storage").join(pending::NAME);
     let healthy_pending = fs::read(&marker).expect("healthy pending batch");
     entry.vector = vec![1.0];
     assert_eq!(
         storage
-            .replace_file(&file, &[entry], None)
+            .replace_file(&file, &[entry])
             .expect_err("invalid replacement of pending source")
             .code(),
         EngineError::INVALID_ARGUMENT
@@ -942,7 +915,7 @@ fn rejects_invalid_writes_without_poisoning_storage() {
         }],
     })]);
     let error = storage
-        .replace_file(&file, &[invalid_table], None)
+        .replace_file(&file, &[invalid_table])
         .expect_err("invalid table must be rejected before writing intent");
     assert_eq!(error.code(), EngineError::INVALID_ARGUMENT);
     assert!(error.message().contains("table cell span"));
@@ -988,12 +961,119 @@ fn rejects_invalid_writes_without_poisoning_storage() {
 }
 
 #[test]
+fn invalid_file_states_and_owners_never_start_a_pending_batch() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let storage = open(directory.path(), false);
+    let (file, entry) = fixture("state", "source content", vec![1.0, 0.0, 0.0]);
+    let marker = directory.path().join("storage").join(pending::NAME);
+    let mut unread = file.clone();
+    unread.snapshot.content_hash = None;
+    assert!(
+        storage
+            .replace_file(&unread, std::slice::from_ref(&entry))
+            .is_err()
+    );
+    for error in ["", " ", "\n"] {
+        assert!(storage.mark_file_failed(&file, error).is_err());
+    }
+    let mut other = file.clone();
+    other.id = FileId::new("other-source").expect("other file ID");
+    assert!(
+        storage
+            .replace_file(&other, std::slice::from_ref(&entry))
+            .is_err()
+    );
+    assert!(!marker.exists());
+    assert!(storage.list_files().expect("no partial records").is_empty());
+    storage
+        .replace_file(&file, &[])
+        .expect("successful empty extraction");
+    storage.close().expect("checkpoint empty result");
+    let reader = open(directory.path(), true);
+    let files = reader.list_files().expect("read empty indexed source");
+    assert_eq!(files.len(), 1);
+    assert!(files[0].index_status.is_indexed());
+    assert_eq!(files[0].index_status.entity_count(), 0);
+    assert_eq!(files[0].snapshot, file.snapshot);
+    reader.close().expect("close reader");
+}
+
+#[test]
+fn native_replacements_require_a_consistent_complete_file_state() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    open(directory.path(), false)
+        .close()
+        .expect("initialize storage");
+    let native = NativeStore::open(
+        &directory.path().join("storage"),
+        &schema(),
+        &dictionary::cache_path().expect("dictionary cache"),
+        false,
+    )
+    .expect("native writer");
+    let (mut file, entry) = fixture("state", "source content", vec![1.0, 0.0, 0.0]);
+    for status in [
+        FileIndexStatus::NotIndexed,
+        FileIndexStatus::Failed {
+            error: "extraction failed".to_owned(),
+        },
+        FileIndexStatus::Indexed {
+            indexed_epoch_ms: 1,
+            entity_count: 0,
+        },
+        FileIndexStatus::Indexed {
+            indexed_epoch_ms: 1,
+            entity_count: 2,
+        },
+    ] {
+        file.index_status = status;
+        assert!(
+            native
+                .apply_replace(&file, std::slice::from_ref(&entry))
+                .is_err()
+        );
+    }
+    assert!(
+        native
+            .list_files()
+            .expect("no partial mutations")
+            .is_empty()
+    );
+    file.index_status = FileIndexStatus::Indexed {
+        indexed_epoch_ms: 1,
+        entity_count: 1,
+    };
+    native
+        .apply_replace(&file, std::slice::from_ref(&entry))
+        .expect("consistent result");
+    assert_eq!(
+        native
+            .get_entity(entry.fragment.entity_id())
+            .expect("stored entity")
+            .expect("entity exists")
+            .file,
+        file
+    );
+    file.index_status = FileIndexStatus::NotIndexed;
+    native
+        .apply_replace(&file, &[])
+        .expect("discard interrupted result");
+    assert!(
+        native
+            .get_entity(entry.fragment.entity_id())
+            .expect("no partial entity")
+            .is_none()
+    );
+    assert_eq!(native.list_files().expect("reindex marker"), vec![file]);
+}
+
+#[test]
 fn rejects_legacy_schemas_before_opening_collections() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
     let path = home.join("storage");
     fs::create_dir(&path).expect("storage directory");
-    for version in [1, 2, 3] {
+    for version in [1, 2, 3, 4] {
         let mut record = SchemaRecord::new(&schema(), &home.join("legacy-dictionary"));
         record.version = version;
         fs::write(
@@ -1074,7 +1154,7 @@ fn writes_fragments_across_native_batch_boundaries() {
         })
         .collect::<Vec<_>>();
     storage
-        .replace_file(&file, &entries, None)
+        .replace_file(&file, &entries)
         .expect("batched write");
     let last = entries.last().expect("last batch entry");
     let filter = StorageSearchFilter {
@@ -1096,7 +1176,7 @@ fn writes_fragments_across_native_batch_boundaries() {
         last.fragment
     );
     storage
-        .replace_file(&file, &[], None)
+        .replace_file(&file, &[])
         .expect("replace with empty file");
     assert!(
         storage

@@ -1,13 +1,14 @@
 use std::{
     collections::HashSet,
-    fs::{self, Metadata},
+    fs::{self, File, Metadata},
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Instant, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
-use same_file::is_same_file;
+use same_file::{Handle, is_same_file};
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -565,29 +566,92 @@ fn read_batch_sync(
         } else {
             file.root.join(&file.relative_path)
         };
-        let bytes = fs::read(&absolute_path).map_err(|error| {
+        let handle = File::open(&absolute_path).map_err(|error| {
             HostError::storage_failure(
                 "native-scanner",
-                format!("could not read source {}: {error}", absolute_path.display()),
+                format!("could not open source {}: {error}", absolute_path.display()),
             )
         })?;
-        let metadata = fs::metadata(&absolute_path).map_err(|error| {
-            HostError::storage_failure(
-                "native-scanner",
-                format!(
-                    "could not inspect source {}: {error}",
-                    absolute_path.display()
-                ),
-            )
-        })?;
+        let (bytes, source_fingerprint) = read_source_snapshot(&absolute_path, handle)?;
+        control.check()?;
         sources.push(SourceFile {
             root: file.root.clone(),
             relative_path: file.relative_path.clone(),
             bytes,
-            source_fingerprint: source_fingerprint(metadata.len(), modified_epoch_ms(&metadata)),
+            source_fingerprint,
         });
     }
     Ok(sources)
+}
+
+fn read_source_snapshot(path: &Path, mut file: File) -> Result<(Vec<u8>, String), HostError> {
+    let inspect = |file: &File| {
+        file.metadata().map_err(|error| {
+            HostError::storage_failure(
+                "native-scanner",
+                format!("could not inspect source {}: {error}", path.display()),
+            )
+        })
+    };
+    let before = inspect(&file)?;
+    if !before.is_file() {
+        return Err(HostError::invalid_argument(format!(
+            "source must be a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        HostError::storage_failure(
+            "native-scanner",
+            format!("could not read source {}: {error}", path.display()),
+        )
+    })?;
+    let after = inspect(&file)?;
+    let actual_size = u64::try_from(bytes.len())
+        .map_err(|_| HostError::internal("source byte length exceeds u64"))?;
+    validate_source_snapshot(path, &before, &after, actual_size)?;
+
+    let same_file = Handle::from_file(file)
+        .and_then(|opened| Handle::from_path(path).map(|current| opened == current))
+        .map_err(|error| {
+            HostError::storage_failure(
+                "native-scanner",
+                format!(
+                    "could not verify source identity {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    if !same_file {
+        return Err(HostError::storage_failure(
+            "native-scanner",
+            format!("source was replaced while reading: {}", path.display()),
+        ));
+    }
+    Ok((
+        bytes,
+        source_fingerprint(after.len(), modified_epoch_ms(&after)),
+    ))
+}
+
+fn validate_source_snapshot(
+    path: &Path,
+    before: &Metadata,
+    after: &Metadata,
+    actual_size: u64,
+) -> Result<(), HostError> {
+    // Compare the full timestamp; the public fingerprint intentionally uses milliseconds.
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || actual_size != after.len()
+    {
+        return Err(HostError::storage_failure(
+            "native-scanner",
+            format!("source changed while reading: {}", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_relative_path(path: &Path) -> Result<(), HostError> {
@@ -646,4 +710,79 @@ fn record_skipped(
 
 fn is_nested_git_repository_directory(path: &Path) -> bool {
     fs::metadata(path.join(".git")).is_ok_and(|metadata| metadata.is_file() || metadata.is_dir())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs::FileTimes, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn source_snapshot_uses_metadata_from_the_read_handle() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("source.txt");
+        fs::write(&path, b"source").expect("write source");
+        let file = File::open(&path).expect("open source");
+        let metadata = file.metadata().expect("source metadata");
+
+        let (bytes, fingerprint) = read_source_snapshot(&path, file).expect("read source");
+
+        assert_eq!(bytes, b"source");
+        assert_eq!(
+            fingerprint,
+            source_fingerprint(6, modified_epoch_ms(&metadata))
+        );
+    }
+
+    #[test]
+    fn source_snapshot_rejects_a_replaced_path_even_with_matching_size_and_time() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("source.txt");
+        let replacement = directory.path().join("replacement.txt");
+        fs::write(&path, b"source").expect("write source");
+        fs::write(&replacement, b"change").expect("write replacement");
+        let file = File::open(&path).expect("open source");
+        let modified = file
+            .metadata()
+            .expect("source metadata")
+            .modified()
+            .expect("mtime");
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .expect("open replacement")
+            .set_times(FileTimes::new().set_modified(modified))
+            .expect("set replacement mtime");
+        fs::rename(&path, directory.path().join("previous.txt")).expect("move source");
+        fs::rename(&replacement, &path).expect("replace source");
+
+        let error = read_source_snapshot(&path, file).expect_err("replacement must fail");
+        assert!(error.to_string().contains("source was replaced"));
+    }
+
+    #[test]
+    fn source_snapshot_rejects_changed_metadata_and_incorrect_byte_lengths() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("source.txt");
+        fs::write(&path, b"source").expect("write source");
+        let file = File::options()
+            .write(true)
+            .open(&path)
+            .expect("open source");
+        let before = file.metadata().expect("source metadata");
+
+        for actual_size in [5, 7] {
+            assert!(validate_source_snapshot(&path, &before, &before, actual_size).is_err());
+        }
+        file.set_len(7).expect("grow source");
+        let longer = file.metadata().expect("larger source metadata");
+        assert!(validate_source_snapshot(&path, &before, &longer, 7).is_err());
+
+        let modified = longer.modified().expect("mtime") + Duration::from_secs(2);
+        file.set_times(FileTimes::new().set_modified(modified))
+            .expect("change source mtime");
+        let later = file.metadata().expect("modified source metadata");
+        assert!(validate_source_snapshot(&path, &longer, &later, 7).is_err());
+    }
 }

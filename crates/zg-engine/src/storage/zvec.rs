@@ -4,7 +4,6 @@ use std::{
     path::Path,
 };
 
-use serde::{Deserialize, Serialize};
 use zvec_rust::{
     Collection, CollectionOptions, CollectionSchema, DataType, Doc, FieldSchema, Fts, IndexParams,
     MetricType, SearchQuery,
@@ -13,15 +12,15 @@ use zvec_rust::{
 use super::{
     codec,
     spi::{
-        FileIndexStatus, IndexedFragment, StorageSearchFilter, StorageSearchHit, StorageSearchPath,
-        StoredEntity, StoredFile, WorkspaceIndexEmbeddingSchema,
+        IndexedFragment, StorageSearchFilter, StorageSearchHit, StorageSearchPath, StoredEntity,
+        WorkspaceIndexEmbeddingSchema,
     },
 };
 use crate::{
     EngineError, EngineResult,
     domain::{
-        Content, EntityContent, EntityFragment, EntityId, EntityMetadata, FileId, SymbolType,
-        validate_fragments,
+        Content, EntityContent, EntityFragment, EntityId, EntityMetadata, FileId, FileRecord,
+        SymbolType, validate_fragments,
     },
     models::EmbeddingMetric,
     utils::sha256_hex_parts,
@@ -84,7 +83,7 @@ impl NativeStore {
         })
     }
 
-    pub(super) fn list_files(&self) -> EngineResult<Vec<StoredFile>> {
+    pub(super) fn list_files(&self) -> EngineResult<Vec<FileRecord>> {
         let iterator = native(
             self.files.iter_with_options(None, false),
             "iterate source files",
@@ -93,15 +92,14 @@ impl NativeStore {
             .map(|doc| decode_file_doc(&native(doc, "read source file")?))
             .collect::<EngineResult<Vec<_>>>()?;
         files.sort_by(|left, right| {
-            left.source
-                .relative_path
-                .cmp(&right.source.relative_path)
-                .then_with(|| left.source.id.as_str().cmp(right.source.id.as_str()))
+            left.relative_path
+                .cmp(&right.relative_path)
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
         });
         Ok(files)
     }
 
-    pub(super) fn get_file(&self, id: &FileId) -> EngineResult<Option<StoredFile>> {
+    pub(super) fn get_file(&self, id: &FileId) -> EngineResult<Option<FileRecord>> {
         let key = primary_key("file", id.as_str());
         fetch_one(&self.files, &key)?
             .as_ref()
@@ -125,6 +123,7 @@ impl NativeStore {
         let file = self
             .get_file(&entity.file_id)?
             .ok_or_else(|| corrupt("entity references a missing file"))?;
+        validate_indexed_owner(&file, &entity.file_id)?;
         Ok(Some(StoredEntity { entity, file }))
     }
 
@@ -226,6 +225,7 @@ impl NativeStore {
                     .get(&primary_key("file", fragment.file_id().as_str()))
                     .ok_or_else(|| corrupt("fragment references a missing file"))?
                     .clone();
+                validate_indexed_owner(&file, fragment.file_id())?;
                 Ok(StorageSearchHit {
                     fragment,
                     file,
@@ -238,11 +238,25 @@ impl NativeStore {
 
     pub(super) fn apply_replace(
         &self,
-        file: &StoredFile,
+        file: &FileRecord,
         entries: &[IndexedFragment],
     ) -> EngineResult<()> {
         self.assert_writable()?;
-        validate_fragments(&file.source.id, entries.iter().map(|entry| &entry.fragment))?;
+        validate_fragments(&file.id, entries.iter().map(|entry| &entry.fragment))?;
+        let entity_count = u64::try_from(
+            entries
+                .iter()
+                .filter(|entry| entry.fragment.as_entity().is_some())
+                .count(),
+        )
+        .map_err(|_| EngineError::invalid_argument("entity count exceeds u64"))?;
+        if (!file.index_status.is_indexed() && !entries.is_empty())
+            || file.index_status.entity_count() != entity_count
+        {
+            return Err(EngineError::invalid_argument(
+                "file index status does not match its fragments",
+            ));
+        }
         let file_doc = encode_file_doc(file)?;
         let mut fragments = Vec::with_capacity(entries.len());
         let mut entities = Vec::new();
@@ -282,7 +296,7 @@ impl NativeStore {
             )?;
             vectors.push(vector);
         }
-        self.delete_documents(&file.source.id)?;
+        self.delete_documents(&file.id)?;
         write_docs(&self.entities, &entities, "write entities")?;
         write_docs(&self.fragments, &fragments, "write fragments")?;
         write_docs(&self.vectors, &vectors, "write vectors")?;
@@ -439,7 +453,6 @@ fn files_schema() -> EngineResult<CollectionSchema> {
     let mut schema = native(CollectionSchema::new("files"), "create files schema")?;
     scalar(&mut schema, "source_id", DataType::String, false, true)?;
     scalar(&mut schema, "payload", DataType::String, false, false)?;
-    scalar(&mut schema, "status", DataType::String, false, false)?;
     Ok(schema)
 }
 
@@ -485,69 +498,38 @@ fn vectors_schema(dimension: u32, metric: MetricType) -> EngineResult<Collection
     Ok(schema)
 }
 
-#[derive(Serialize, Deserialize)]
-struct StatusRecord {
-    version: u8,
-    status: Option<IndexStatusRecord>,
+fn validate_indexed_owner(file: &FileRecord, file_id: &FileId) -> EngineResult<()> {
+    if file.id != *file_id
+        || !file.index_status.is_indexed()
+        || file.index_status.entity_count() == 0
+    {
+        return Err(corrupt(
+            "fragment references a file without a successful index",
+        ));
+    }
+    Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
-struct IndexStatusRecord {
-    indexed_epoch_ms: Option<u64>,
-    entity_count: usize,
-    token_count: Option<usize>,
-    truncated_fragment_count: Option<usize>,
-    error: Option<String>,
-}
-
-fn encode_file_doc(file: &StoredFile) -> EngineResult<Doc> {
+fn encode_file_doc(file: &FileRecord) -> EngineResult<Doc> {
     let mut doc = native(Doc::new(), "create file record")?;
-    let key = primary_key("file", file.source.id.as_str());
+    let key = primary_key("file", file.id.as_str());
     doc.set_pk(&key);
     native(doc.add_string("source_id", &key), "encode file identity")?;
     native(
-        doc.add_string("payload", &codec::encode_file(&file.source)?),
-        "encode source payload",
+        doc.add_string("payload", &codec::encode_file(file)?),
+        "encode file payload",
     )?;
-    let status = StatusRecord {
-        version: 1,
-        status: file.index_status.as_ref().map(|status| IndexStatusRecord {
-            indexed_epoch_ms: status.indexed_epoch_ms,
-            entity_count: status.entity_count,
-            token_count: status.token_count,
-            truncated_fragment_count: status.truncated_fragment_count,
-            error: status.error.clone(),
-        }),
-    };
-    let status = serde_json::to_string(&status)
-        .map_err(|error| corrupt(&format!("cannot encode file status: {error}")))?;
-    native(doc.add_string("status", &status), "encode file status")?;
     Ok(doc)
 }
 
-fn decode_file_doc(doc: &Doc) -> EngineResult<StoredFile> {
-    let source = codec::decode_file(&string_field(doc, "payload")?)?;
-    if doc_key(doc)? != primary_key("file", source.id.as_str())
+fn decode_file_doc(doc: &Doc) -> EngineResult<FileRecord> {
+    let file = codec::decode_file(&string_field(doc, "payload")?)?;
+    if doc_key(doc)? != primary_key("file", file.id.as_str())
         || string_field(doc, "source_id")? != doc_key(doc)?
     {
         return Err(corrupt("file identity differs from its primary key"));
     }
-    let record: StatusRecord = serde_json::from_str(&string_field(doc, "status")?)
-        .map_err(|error| corrupt(&format!("cannot decode file status: {error}")))?;
-    if record.version != 1 {
-        return Err(corrupt("unsupported file status version"));
-    }
-    let index_status = record.status.map(|status| FileIndexStatus {
-        indexed_epoch_ms: status.indexed_epoch_ms,
-        entity_count: status.entity_count,
-        token_count: status.token_count,
-        truncated_fragment_count: status.truncated_fragment_count,
-        error: status.error,
-    });
-    Ok(StoredFile {
-        source,
-        index_status,
-    })
+    Ok(file)
 }
 
 fn identity_doc(fragment: &EntityFragment) -> EngineResult<Doc> {

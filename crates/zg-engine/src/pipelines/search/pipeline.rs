@@ -17,14 +17,12 @@ use crate::{
             TimingEntry,
         },
     },
-    domain::{Entity, EntityFragment, FileId},
+    domain::{Entity, EntityFragment, FileId, FileRecord},
     models::{
         EmbeddingInput, EmbeddingModelInfo, EmbeddingOptions, EmbeddingPurpose, ModelError,
         ModelRuntimeLease,
     },
-    storage::spi::{
-        StorageSearchFilter, StorageSearchHit, StoredEntity, StoredFile, WorkspaceIndexStorage,
-    },
+    storage::spi::{StorageSearchFilter, StorageSearchHit, StoredEntity, WorkspaceIndexStorage},
 };
 
 const DEFAULT_LIMIT: usize = 7;
@@ -67,7 +65,7 @@ pub(crate) struct SearchEvidence {
 #[derive(Clone, Debug)]
 pub(crate) struct SearchHit {
     pub entity: Entity,
-    pub file: StoredFile,
+    pub file: FileRecord,
     pub evidence: Vec<SearchEvidence>,
     pub rank: usize,
     pub score: f64,
@@ -154,7 +152,7 @@ struct RecallRoute {
 struct Candidate {
     id: String,
     entity: Entity,
-    file: StoredFile,
+    file: FileRecord,
     sources: HashSet<ContextRouteMode>,
     recall: Vec<SearchRecallTrace>,
     evidence: Vec<InternalEvidence>,
@@ -668,7 +666,7 @@ fn search_plan_to_storage_filter(
 fn resolve_filtered_file_ids(
     workspace_root: &Path,
     plan: &SearchPlan,
-    files: &[StoredFile],
+    files: &[FileRecord],
 ) -> Result<Vec<FileId>, EngineError> {
     let include = plan
         .include_paths
@@ -685,8 +683,8 @@ fn resolve_filtered_file_ids(
     Ok(files
         .iter()
         .filter(|file| {
-            let absolute = normalize_path(&workspace_root.join(&file.source.relative_path));
-            let relative = normalize_path(&file.source.relative_path);
+            let absolute = normalize_path(&workspace_root.join(&file.relative_path));
+            let relative = normalize_path(&file.relative_path);
             (include.is_empty()
                 || include.iter().any(|matcher| {
                     matcher.is_match(if matcher.absolute {
@@ -703,21 +701,19 @@ fn resolve_filtered_file_ids(
                     })
                 })
                 && matches_ordered_globs(&relative, &ordered_globs)
-                && !types.matched(&file.source.relative_path, false).is_ignore()
+                && !types.matched(&file.relative_path, false).is_ignore()
                 && plan.modified_after_epoch_ms.is_none_or(|after| {
-                    file.source
-                        .snapshot
+                    file.snapshot
                         .modified_epoch_ms
                         .is_some_and(|modified| modified >= after)
                 })
                 && plan.modified_before_epoch_ms.is_none_or(|before| {
-                    file.source
-                        .snapshot
+                    file.snapshot
                         .modified_epoch_ms
                         .is_some_and(|modified| modified <= before)
                 })
         })
-        .map(|file| file.source.id.clone())
+        .map(|file| file.id.clone())
         .collect())
 }
 
@@ -917,16 +913,16 @@ mod tests {
         },
         domain::{
             Content, Entity, EntityContent, EntityFragment, EntityId, FileFormat, FileId,
-            FileSnapshot, FragmentId, SourceFile, SourceRange, TextRange, WindowFragment,
+            FileIndexStatus, FileRecord, FileSnapshot, FragmentId, SourceRange, TextRange,
+            WindowFragment,
         },
         models::{
             EmbeddingInputKind, EmbeddingMetric, EmbeddingModelInfo, EmbeddingModelLimits,
             ModelError,
         },
         storage::spi::{
-            FileIndexDiagnostics, FileIndexStatus, IndexedFragment, StorageResult,
-            StorageSearchFilter, StorageSearchHit, StorageSearchPath, StoredEntity, StoredFile,
-            WorkspaceIndexStorage,
+            IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit,
+            StorageSearchPath, StoredEntity, WorkspaceIndexStorage,
         },
     };
 
@@ -988,7 +984,7 @@ mod tests {
     }
 
     struct FixtureStorage {
-        files: Vec<StoredFile>,
+        files: Vec<FileRecord>,
         entities: HashMap<String, StoredEntity>,
         fts: HashMap<String, Vec<StorageSearchHit>>,
         vector: Vec<StorageSearchHit>,
@@ -1010,7 +1006,7 @@ mod tests {
                 .filter(|hit| {
                     filter
                         .and_then(|filter| filter.file_ids.as_ref())
-                        .is_none_or(|ids| ids.contains(&hit.file.source.id))
+                        .is_none_or(|ids| ids.contains(&hit.file.id))
                 })
                 .filter(|hit| {
                     filter
@@ -1029,7 +1025,7 @@ mod tests {
             true
         }
 
-        fn list_files(&self) -> StorageResult<Vec<StoredFile>> {
+        fn list_files(&self) -> StorageResult<Vec<FileRecord>> {
             Ok(self.files.clone())
         }
 
@@ -1061,14 +1057,13 @@ mod tests {
 
         fn replace_file(
             &self,
-            _file: &StoredFile,
+            _file: &FileRecord,
             _entries: &[IndexedFragment],
-            _diagnostics: Option<&FileIndexDiagnostics>,
         ) -> StorageResult<()> {
             Ok(())
         }
 
-        fn mark_file_failed(&self, _file: &StoredFile, _error: &str) -> StorageResult<()> {
+        fn mark_file_failed(&self, _file: &FileRecord, _error: &str) -> StorageResult<()> {
             Ok(())
         }
 
@@ -1180,7 +1175,7 @@ mod tests {
             .expect("filtered search");
 
         assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.hits[0].file.source.id.as_str(), "source");
+        assert_eq!(result.hits[0].file.id.as_str(), "source");
         let filters = filters.lock().expect("captured filters");
         assert!(filters.iter().flatten().all(|filter| {
             filter.file_ids.as_deref() == Some(&[FileId::new("source").expect("file id")])
@@ -1205,7 +1200,7 @@ mod tests {
         for root in [first_root, moved_root] {
             assert_eq!(
                 super::resolve_filtered_file_ids(root, &plan, &files).expect("relative filter"),
-                std::slice::from_ref(&source.source.id)
+                std::slice::from_ref(&source.id)
             );
         }
 
@@ -1217,7 +1212,7 @@ mod tests {
         );
         assert_eq!(
             super::resolve_filtered_file_ids(moved_root, &plan, &files).expect("moved root filter"),
-            std::slice::from_ref(&source.source.id)
+            std::slice::from_ref(&source.id)
         );
 
         plan.include_paths.clear();
@@ -1225,7 +1220,7 @@ mod tests {
         for root in [first_root, moved_root] {
             assert_eq!(
                 super::resolve_filtered_file_ids(root, &plan, &files).expect("relative glob"),
-                std::slice::from_ref(&source.source.id)
+                std::slice::from_ref(&source.id)
             );
         }
         plan.exclude_paths = vec!["/moved/workspace/src".to_owned()];
@@ -1254,37 +1249,32 @@ mod tests {
         }
     }
 
-    fn file(id: &str, relative: &str, format: &str, modified: u64) -> StoredFile {
-        StoredFile {
-            source: SourceFile {
-                id: FileId::new(id).expect("file id"),
-                relative_path: PathBuf::from(relative),
-                formats: vec![match format {
-                    "rust" => FileFormat::Rust,
-                    "markdown" => FileFormat::Markdown,
-                    _ => panic!("unexpected fixture format"),
-                }],
-                snapshot: FileSnapshot {
-                    size_bytes: 100,
-                    modified_epoch_ms: Some(modified),
-                    content_hash: None,
-                },
+    fn file(id: &str, relative: &str, format: &str, modified: u64) -> FileRecord {
+        FileRecord {
+            id: FileId::new(id).expect("file id"),
+            relative_path: PathBuf::from(relative),
+            formats: vec![match format {
+                "rust" => FileFormat::Rust,
+                "markdown" => FileFormat::Markdown,
+                _ => panic!("unexpected fixture format"),
+            }],
+            snapshot: FileSnapshot {
+                size_bytes: 100,
+                modified_epoch_ms: Some(modified),
+                content_hash: Some(crate::utils::sha256_hex(id.as_bytes())),
             },
-            index_status: Some(FileIndexStatus {
-                indexed_epoch_ms: Some(modified),
+            index_status: FileIndexStatus::Indexed {
+                indexed_epoch_ms: modified,
                 entity_count: 1,
-                token_count: None,
-                truncated_fragment_count: None,
-                error: None,
-            }),
+            },
         }
     }
 
-    fn entity(id: &str, file: &StoredFile, content: &str) -> StoredEntity {
+    fn entity(id: &str, file: &FileRecord, content: &str) -> StoredEntity {
         StoredEntity {
             entity: Entity {
                 id: EntityId::new(id).expect("entity id"),
-                file_id: file.source.id.clone(),
+                file_id: file.id.clone(),
                 range: text_range(1, 8),
                 content: EntityContent::Source(vec![Content::Text(content.to_owned())]),
                 metadata: None,
@@ -1303,7 +1293,7 @@ mod tests {
             fragment: EntityFragment::Window(WindowFragment {
                 id: FragmentId::new(fragment_id).expect("fragment id"),
                 entity_id: stored.entity.id.clone(),
-                file_id: stored.file.source.id.clone(),
+                file_id: stored.file.id.clone(),
                 range: text_range(2, 3),
                 contents: vec![Content::Text(format!(
                     "{} source",

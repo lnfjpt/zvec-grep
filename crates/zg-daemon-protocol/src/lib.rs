@@ -12,7 +12,7 @@ use zg_engine::api::{
     info::{InfoOptions, InfoResult},
 };
 
-pub const CURRENT_DAEMON_PROTOCOL_VERSION: u32 = 7;
+pub const CURRENT_DAEMON_PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DaemonRequest {
@@ -245,6 +245,40 @@ mod tests {
         let decoded: DaemonRequest =
             serde_json::from_str(&encoded).expect("daemon request should deserialize");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn indexed_source_bytes_and_entity_counts_round_trip_without_truncation_fields() {
+        use zg_engine::api::info::{
+            InfoResult,
+            result::{InfoSource, WorkspaceIndexPolicy, WorkspaceIndexStatus},
+        };
+
+        let count = u64::from(u32::MAX) + 1;
+        let reply = super::DaemonReply::Info(Box::new(InfoResult {
+            root: "/workspace".into(),
+            indexed: true,
+            index_policy: WorkspaceIndexPolicy::Enabled,
+            home: "/workspace/.zvec-grep".into(),
+            index_path: "/workspace/.zvec-grep/storage".into(),
+            source: InfoSource::Index,
+            workspace_index: None,
+            status: Some(WorkspaceIndexStatus {
+                entities_indexed: count,
+                indexed_size_bytes: count + 3,
+                ..WorkspaceIndexStatus::default()
+            }),
+            suggestion: None,
+        }));
+
+        let encoded = serde_json::to_value(&reply).expect("info reply should serialize");
+        let status = &encoded["reply"]["status"];
+        assert_eq!(status["entities_indexed"], count);
+        assert_eq!(status["indexed_size_bytes"], count + 3);
+        assert!(status.get("fragments_truncated").is_none());
+        let decoded: super::DaemonReply =
+            serde_json::from_value(encoded).expect("info reply should deserialize");
+        assert_eq!(decoded, reply);
     }
 
     #[test]

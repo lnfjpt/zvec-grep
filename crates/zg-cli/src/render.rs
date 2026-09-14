@@ -310,6 +310,11 @@ pub fn write_info_result(mut writer: impl Write, result: &InfoResult) -> io::Res
             status.files_scanned, status.files_indexed, status.files_pending, status.files_failed
         )?;
         writeln!(writer, "Entities: {}", status.entities_indexed)?;
+        writeln!(
+            writer,
+            "Indexed source size: {} bytes",
+            status.indexed_size_bytes
+        )?;
     }
     if let Some(suggestion) = &result.suggestion {
         writeln!(writer, "Suggestion: {suggestion}")?;

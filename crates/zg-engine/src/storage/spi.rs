@@ -3,11 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     EngineError,
-    domain::{Entity, EntityFragment, EntityId, FileId, SourceFile, SymbolType},
+    domain::{Entity, EntityFragment, EntityId, FileId, FileRecord, SymbolType},
     models::EmbeddingMetric,
 };
 
@@ -44,36 +43,16 @@ impl WorkspaceIndexStorageOptions {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct FileIndexStatus {
-    pub indexed_epoch_ms: Option<u64>,
-    pub entity_count: usize,
-    pub token_count: Option<usize>,
-    pub truncated_fragment_count: Option<usize>,
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredFile {
-    pub source: SourceFile,
-    pub index_status: Option<FileIndexStatus>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredEntity {
     pub entity: Entity,
-    pub file: StoredFile,
+    pub file: FileRecord,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IndexedFragment {
     pub fragment: EntityFragment,
     pub vector: Vec<f32>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct FileIndexDiagnostics {
-    pub truncated_fragment_count: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -93,7 +72,7 @@ pub(crate) enum StorageSearchPath {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StorageSearchHit {
     pub fragment: EntityFragment,
-    pub file: StoredFile,
+    pub file: FileRecord,
     pub path: StorageSearchPath,
     pub score: f64,
 }
@@ -115,7 +94,7 @@ pub(crate) trait WorkspaceIndexStorageFactory: Send + Sync {
 pub(crate) trait WorkspaceIndexStorage: Send + Sync {
     fn is_read_only(&self) -> bool;
 
-    fn list_files(&self) -> StorageResult<Vec<StoredFile>>;
+    fn list_files(&self) -> StorageResult<Vec<FileRecord>>;
 
     fn get_entity(&self, entity_id: &EntityId) -> StorageResult<Option<StoredEntity>>;
 
@@ -136,14 +115,9 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
     /// Applies a complete file replacement to the current writer. Durability is
     /// confirmed by a batch checkpoint, `finalize_writes`, or successful `close`.
     /// An interrupted batch is discarded and its files are marked for reindexing.
-    fn replace_file(
-        &self,
-        file: &StoredFile,
-        entries: &[IndexedFragment],
-        diagnostics: Option<&FileIndexDiagnostics>,
-    ) -> StorageResult<()>;
+    fn replace_file(&self, file: &FileRecord, entries: &[IndexedFragment]) -> StorageResult<()>;
 
-    fn mark_file_failed(&self, file: &StoredFile, error: &str) -> StorageResult<()>;
+    fn mark_file_failed(&self, file: &FileRecord, error: &str) -> StorageResult<()>;
 
     fn delete_file(&self, file_id: &FileId) -> StorageResult<()>;
 

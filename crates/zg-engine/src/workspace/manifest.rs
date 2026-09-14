@@ -15,7 +15,7 @@ use crate::{
 };
 
 pub(crate) const WORKSPACE_MANIFEST_FILE: &str = "manifest.json";
-pub(crate) const CURRENT_MANIFEST_VERSION: u32 = 2;
+pub(crate) const CURRENT_MANIFEST_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +42,9 @@ pub(crate) struct WorkspaceManifest {
     pub index_policy: WorkspaceIndexPolicy,
     pub embedding: Option<WorkspaceIndexEmbedding>,
     pub index_version: Option<u32>,
+    /// Relative generation directory selected by this atomic manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     pub created_time: u64,
@@ -65,6 +68,7 @@ struct ManifestInput {
     index_policy: WorkspaceIndexPolicy,
     embedding: Option<WorkspaceIndexEmbedding>,
     index_version: Option<u32>,
+    storage_generation: Option<String>,
     generation: Option<u64>,
     created_time: u64,
     updated_time: u64,
@@ -112,6 +116,7 @@ impl TryFrom<ManifestInput> for WorkspaceManifest {
             index_policy: input.index_policy,
             embedding: input.embedding,
             index_version: input.index_version,
+            storage_generation: input.storage_generation,
             generation: input.generation,
             created_time: input.created_time,
             updated_time: input.updated_time,
@@ -164,6 +169,7 @@ impl WorkspaceManifest {
             index_policy: info.policy,
             embedding: info.embedding,
             index_version: info.index_version,
+            storage_generation: None,
             generation: info.generation,
             created_time: info.created_epoch_ms,
             updated_time: info.updated_epoch_ms,
@@ -171,6 +177,21 @@ impl WorkspaceManifest {
         };
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    pub(crate) fn storage_home(&self) -> PathBuf {
+        self.storage_generation.as_ref().map_or_else(
+            || self.path.clone(),
+            |generation| self.path.join("generations").join(generation),
+        )
+    }
+
+    pub(crate) fn same_index_settings(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.index_version == other.index_version
+            && self.embedding == other.embedding
+            && self.embedding_runtime == other.embedding_runtime
+            && self.discovery == other.discovery
     }
 
     pub(crate) fn index_info(&self) -> WorkspaceIndexInfo {
@@ -189,12 +210,17 @@ impl WorkspaceManifest {
         }
     }
 
-    fn validate(&self) -> Result<(), EngineError> {
-        if !matches!(self.manifest_version, 1 | CURRENT_MANIFEST_VERSION) {
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        if !matches!(self.manifest_version, 1 | 2 | CURRENT_MANIFEST_VERSION) {
             return Err(invalid_manifest(format!(
                 "unsupported manifestVersion {}",
                 self.manifest_version
             )));
+        }
+        if let Some(generation) = &self.storage_generation
+            && uuid::Uuid::parse_str(generation).is_err()
+        {
+            return Err(invalid_manifest("storageGeneration must be a UUID"));
         }
         if self.id.is_empty() || self.name.is_empty() || self.path.as_os_str().is_empty() {
             return Err(invalid_manifest("id, name, and path must be non-empty"));

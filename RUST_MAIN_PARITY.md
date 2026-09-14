@@ -40,7 +40,7 @@ Statuses describe the audit baseline, not completed remediation.
 
 ## A. Embedding failure handling
 
-Relevant code: [indexing pipeline](crates/zg-engine/src/indexing/pipeline.rs),
+Relevant code: [indexing pipeline](crates/zg-engine/src/pipelines/indexing/pipeline.rs),
 [model interface](crates/zg-engine/src/models/spi.rs),
 [Model2Vec](crates/zg-engine/src/models/model2vec/model.rs),
 [job scheduler](crates/zg-daemon/src/job_scheduler.rs),

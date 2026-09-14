@@ -173,13 +173,33 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
         [PathBuf::from("support.txt")]
     );
 
+    let before_rebuild = engine.info(info_options(root)).await?;
     let rebuilt = engine
         .index(IndexOptions {
             rebuild: true,
             ..index_options(root)
         })
         .await?;
-    assert_eq!((rebuilt.files_added, rebuilt.generation), (3, 1));
+    assert_eq!(
+        (rebuilt.files_added, rebuilt.generation),
+        (3, updated.generation + 1)
+    );
+    let after_rebuild = engine.info(info_options(root)).await?;
+    assert_eq!(
+        after_rebuild
+            .workspace_index
+            .as_ref()
+            .expect("rebuilt workspace")
+            .id,
+        before_rebuild
+            .workspace_index
+            .as_ref()
+            .expect("original workspace")
+            .id,
+    );
+    assert_ne!(after_rebuild.index_path, before_rebuild.index_path);
+    assert!(after_rebuild.index_path.is_dir());
+    assert!(!before_rebuild.index_path.exists());
     let rebuilt_query = engine
         .context(ContextOptions {
             root: Some(root.to_path_buf()),
@@ -202,56 +222,195 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
     assert!(engine.drop_index(info_options(root)).await?);
     assert!(!engine.drop_index(info_options(root)).await?);
     assert!(!info.index_path.exists());
+    assert!(!after_rebuild.index_path.exists());
     assert!(!engine.info(info_options(root)).await?.indexed);
     assert!(root.join("auth.rs").is_file());
 
     configure_remote_model(root, server.address)?;
     engine.index(index_options(root)).await?;
+    let orphaned_index_path = engine.info(info_options(root)).await?.index_path;
+    assert!(orphaned_index_path.is_dir());
     fs::remove_file(root.join(".zvec-grep/manifest.json"))?;
     assert!(
         engine.drop_index(info_options(root)).await?,
         "orphaned backend can be removed"
     );
+    assert!(!orphaned_index_path.exists());
     assert!(!info.index_path.exists());
     engine.close();
     Ok(())
 }
 
 #[tokio::test]
-async fn public_engine_records_failed_files_and_recovers_on_auto_update() -> TestResult {
+async fn public_engine_resumes_failed_initial_build_without_publishing_it_early() -> TestResult {
     let temporary = tempdir()?;
     let root = temporary.path();
+    let home = root.join(".zvec-grep");
     let server = EmbeddingServer::start()?;
     configure_remote_model(root, server.address)?;
     fs::write(root.join("broken.txt"), [255_u8, 254, 255])?;
+    fs::write(root.join("stable.txt"), "Stable orchard baseline.\n")?;
     let engine = ZvecGrep::new();
     assert!(engine.index(index_options(root)).await.is_err());
     let info = engine.info(info_options(root)).await?;
-    assert_eq!(info.status.expect("status").files_failed, 1);
-
+    assert!(!info.indexed);
+    assert!(
+        info.status.is_none(),
+        "an unpublished stage is not the active index"
+    );
+    let pending: Value = serde_json::from_slice(&fs::read(home.join("build.json"))?)?;
+    let stage = pending["target"]["storageGeneration"]
+        .as_str()
+        .expect("stage generation");
+    let stage_path = fs::canonicalize(home.join("generations").join(stage).join("storage"))?;
+    let files = native_file_records(&stage_path)?;
+    let failed = files
+        .iter()
+        .find(|file| file["value"]["relative_path"]["value"] == "broken.txt")
+        .expect("failed source retained");
+    assert_eq!(failed["value"]["index_status"]["kind"], "failed");
+    assert!(
+        !failed["value"]["index_status"]["error"]
+            .as_str()
+            .expect("failure reason")
+            .is_empty()
+    );
+    assert_eq!(
+        files
+            .iter()
+            .filter(|file| file["value"]["index_status"]["kind"] == "indexed")
+            .count(),
+        1
+    );
+    let requests = server.requests.load(Ordering::Acquire);
     fs::write(
         root.join("broken.txt"),
         "Recovered readable nebula documentation.\n",
     )?;
-    let result = engine
+    let query = ContextOptions {
+        root: Some(root.to_path_buf()),
+        routes: vec![ContextRoute {
+            mode: ContextRouteMode::Fts,
+            query: "nebula".to_owned(),
+        }],
+        auto_update: true,
+        allow_remote: true,
+        ..ContextOptions::default()
+    };
+    assert!(
+        engine.context(query.clone()).await.is_err(),
+        "query refresh must not publish a stage"
+    );
+    assert_eq!(server.requests.load(Ordering::Acquire), requests);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(home.join("build.json"))?)?,
+        pending
+    );
+    engine.close();
+    drop(engine);
+
+    let engine = ZvecGrep::new();
+    let resumed = engine.index(index_options(root)).await?;
+    assert_eq!((resumed.files_unchanged, resumed.files_failed), (1, 0));
+    assert!(server.requests.load(Ordering::Acquire) > requests);
+    assert!(!home.join("build.json").exists());
+    let info = engine.info(info_options(root)).await?;
+    assert!(info.indexed);
+    assert_eq!(
+        info.index_path, stage_path,
+        "resume publishes the existing stage"
+    );
+    let status = info.status.expect("published status");
+    assert_eq!((status.files_failed, status.files_indexed), (0, 2));
+    let result = engine.context(query).await?;
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].relative_path, Path::new("broken.txt"));
+    assert_eq!(result.items[0].status, ContextItemStatus::Fresh);
+    engine.drop_index(info_options(root)).await?;
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_native_rebuild_preserves_active_results_until_its_stage_is_resumed() -> TestResult {
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let home = root.join(".zvec-grep");
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(root, server.address)?;
+    fs::write(
+        root.join("note.txt"),
+        "Orchard documentation remains available.\n",
+    )?;
+    let engine = ZvecGrep::new();
+    let initial = engine.index(index_options(root)).await?;
+    let original_path = engine.info(info_options(root)).await?.index_path;
+    let original_manifest = fs::read(home.join("manifest.json"))?;
+    fs::write(root.join("note.txt"), [255_u8, 254, 255])?;
+    assert!(
+        engine
+            .index(IndexOptions {
+                rebuild: true,
+                ..index_options(root)
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(home.join("manifest.json"))?, original_manifest);
+    let pending: Value = serde_json::from_slice(&fs::read(home.join("build.json"))?)?;
+    let stage = pending["target"]["storageGeneration"]
+        .as_str()
+        .expect("stage generation");
+    let stage_path = fs::canonicalize(home.join("generations").join(stage).join("storage"))?;
+    assert_ne!(stage_path, original_path);
+    let failed_records = native_file_records(&stage_path)?;
+    assert_eq!(failed_records.len(), 1);
+    assert_eq!(failed_records[0]["value"]["index_status"]["kind"], "failed");
+    let requests = server.requests.load(Ordering::Acquire);
+    let old_results = engine
         .context(ContextOptions {
             root: Some(root.to_path_buf()),
             routes: vec![ContextRoute {
                 mode: ContextRouteMode::Fts,
-                query: "nebula".to_owned(),
+                query: "orchard".into(),
             }],
+            auto_update: true,
             allow_remote: true,
             ..ContextOptions::default()
         })
         .await?;
-    assert_eq!(result.items.len(), 1);
-    assert_eq!(result.items[0].relative_path, Path::new("broken.txt"));
-    let status = engine
-        .info(info_options(root))
-        .await?
-        .status
-        .expect("status");
-    assert_eq!((status.files_failed, status.files_indexed), (0, 1));
+    assert_eq!(old_results.items.len(), 1);
+    assert_eq!(old_results.items[0].relative_path, Path::new("note.txt"));
+    assert_eq!(
+        old_results.items[0].status,
+        ContextItemStatus::PossiblyStale
+    );
+    assert_eq!(server.requests.load(Ordering::Acquire), requests);
+    assert_eq!(fs::read(home.join("manifest.json"))?, original_manifest);
+    fs::write(
+        root.join("note.txt"),
+        "Vineyard replacement documentation.\n",
+    )?;
+    engine.close();
+    drop(engine);
+
+    let engine = ZvecGrep::new();
+    let resumed = engine.index(index_options(root)).await?;
+    assert_eq!(
+        (resumed.generation, resumed.files_failed),
+        (initial.generation + 1, 0)
+    );
+    assert!(!home.join("build.json").exists());
+    assert_eq!(
+        engine.info(info_options(root)).await?.index_path,
+        stage_path
+    );
+    assert!(!original_path.exists());
+    assert!(fts_paths(&engine, root, "orchard").await?.is_empty());
+    assert_eq!(
+        fts_paths(&engine, root, "vineyard").await?,
+        [PathBuf::from("note.txt")]
+    );
     engine.drop_index(info_options(root)).await?;
     engine.close();
     Ok(())
@@ -289,13 +448,16 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
         files[0].get_string("payload")?.expect("source payload")
     };
     // A completed file can still have a pending marker after a crash before marker removal.
+    // The actual journal stores reindex intent, never a claim that the batch is complete.
+    let mut pending_source: Value = serde_json::from_str(&source)?;
+    pending_source["value"]["index_status"] = json!({"kind": "not_indexed"});
     // Preserve its full snapshot so recovery must override the ordinary unchanged-file fast path.
     let pending_path = index_path.join("pending.json");
     fs::write(
         &pending_path,
         serde_json::to_vec(&json!({
             "version": 1,
-            "files": [{ "kind": "reindex", "source": source }],
+            "files": [{ "kind": "reindex", "source": serde_json::to_string(&pending_source)? }],
         }))?,
     )?;
 
@@ -328,9 +490,23 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
         1,
         "recovery preserves the source for reindexing"
     );
+    let original: Value = serde_json::from_str(&source)?;
+    assert_eq!(original["value"]["index_status"]["kind"], "indexed");
+    let recovered: Value = serde_json::from_str(
+        &files[0]
+            .get_string("payload")?
+            .expect("recovered file payload"),
+    )?;
+    assert_eq!(recovered["version"], original["version"]);
+    for field in ["id", "relative_path", "formats", "snapshot"] {
+        assert_eq!(
+            recovered["value"][field], original["value"][field],
+            "recovery preserves {field}"
+        );
+    }
     assert_eq!(
-        files[0].get_string("payload")?.as_deref(),
-        Some(source.as_str())
+        recovered["value"]["index_status"],
+        json!({"kind": "not_indexed"})
     );
     let collections = fs::read_dir(&index_path)?
         .collect::<Result<Vec<_>, _>>()?
@@ -469,6 +645,16 @@ async fn public_engine_reuses_relative_files_after_moving_workspace() -> TestRes
     engine.drop_index(info_options(&relocated_root)).await?;
     engine.close();
     Ok(())
+}
+
+fn native_file_records(index_path: &Path) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    native_documents(&index_path.join("files"))?
+        .iter()
+        .map(|document| {
+            let payload = document.get_string("payload")?.expect("file payload");
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .collect()
 }
 
 fn native_documents(path: &Path) -> Result<Vec<zvec_rust::Doc>, Box<dyn std::error::Error>> {

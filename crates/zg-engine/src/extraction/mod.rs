@@ -8,17 +8,30 @@ mod service;
 mod spi;
 mod text;
 
-// Interface exposed to the rest of `zg-engine`.
-pub(crate) use spi::{
-    ChunkOptions, ImageSource, IndexingExtractionFragment, Source, SourceKind, TextSource,
-};
+// Extraction sources.
+pub(crate) use spi::{ImageSource, Source, SourceKind, TextSource};
+
+// Chunking options.
+pub(crate) use spi::ChunkOptions;
+
+// Indexing output.
+pub(crate) use spi::IndexingExtractionFragment;
 
 use crate::{
     EngineError,
-    domain::{Content, EntityFragment, SourceFile, TextRange},
+    domain::{Content, EntityFragment, FileRecord, TextRange},
 };
 
-pub(crate) fn source_kind(file: &SourceFile) -> Option<SourceKind> {
+// Shared implementation helpers used by the format-specific extractors.
+use service::{
+    chunk_options_for_metadata, fit_text_to_chars, make_entity_id, symbol_type_name,
+    validate_source_file,
+};
+
+#[cfg(test)]
+use service::{test_content, test_file, test_source};
+
+pub(crate) fn source_kind(file: &FileRecord) -> Option<SourceKind> {
     service::source_kind(file)
 }
 
@@ -43,12 +56,3 @@ pub(crate) fn vector_content_for_fragment(
 ) -> Vec<Content> {
     service::vector_content_for_fragment(fragment, embedding_content, max_chars)
 }
-
-// Shared implementation helpers used by the format-specific extractors.
-use service::{
-    chunk_options_for_metadata, fit_text_to_chars, make_entity_id, symbol_type_name,
-    validate_source_file,
-};
-
-#[cfg(test)]
-use service::{test_content, test_file, test_source};

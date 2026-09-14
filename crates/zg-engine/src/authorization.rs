@@ -5,8 +5,9 @@ use crate::{
     models::{EmbeddingCatalogEntry, get_embedding_model_catalog_entry},
     utils::{atomic_write, sync_directory},
     workspace::{
+        build::{has_build, read_build},
         layout::{find_nearest_workspace, workspace_index_location},
-        manifest::read_workspace_manifest,
+        manifest::{WorkspaceManifest, read_workspace_manifest},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -37,12 +38,27 @@ pub fn index_authorization(
     if options.allow_remote {
         return Ok(None);
     }
-    let location = workspace_index_location(&crate::workspace::layout::resolve_workspace_root(
-        options.root.as_deref(),
-    )?)?;
+    let requested_root = crate::workspace::layout::resolve_workspace_root(options.root.as_deref())?;
+    let location = match find_nearest_workspace(&requested_root)? {
+        Some(location) => location,
+        None => workspace_index_location(&requested_root)?,
+    };
     let existing = read_workspace_manifest(&location.home)?;
-    let model = crate::indexing::service::embedding_reference(
-        existing.as_ref(),
+    let pending = read_build(&location.home)?;
+    let existing = pending
+        .as_ref()
+        .map(|build| &build.target)
+        .or(existing.as_ref());
+    authorization_for_manifest(options, &location.root, existing)
+}
+
+fn authorization_for_manifest(
+    options: &crate::api::index::IndexOptions,
+    workspace_root: &Path,
+    existing: Option<&WorkspaceManifest>,
+) -> Result<Option<IndexAuthorization>, EngineError> {
+    let model = crate::pipelines::indexing::service::embedding_reference(
+        existing,
         options.embedding.as_ref(),
     )?;
     if model.starts_with("local/") {
@@ -59,13 +75,9 @@ pub fn index_authorization(
                     .as_ref()
                     .and_then(|e| e.endpoint.as_deref())
             })
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|m| m.embedding_runtime.endpoint.as_deref())
-            }),
+            .or_else(|| existing.and_then(|m| m.embedding_runtime.endpoint.as_deref())),
     )?;
-    let root = fs::canonicalize(&location.root).map_err(io)?;
+    let root = fs::canonicalize(workspace_root).map_err(io)?;
     if read_grant(&root)?.is_some_and(|g| g.model == model && g.endpoint == endpoint) {
         return Ok(None);
     }
@@ -103,7 +115,7 @@ pub fn query_authorization(
     if options.rg || options.allow_remote {
         return Ok(None);
     }
-    let request = crate::search::context::normalize_context_request(options)?;
+    let request = crate::pipelines::search::context::normalize_context_request(options)?;
     let query_text = request
         .routes
         .iter()
@@ -121,14 +133,22 @@ pub fn query_authorization(
     let Some(manifest) = read_workspace_manifest(&location.home)? else {
         return Ok(None);
     };
+    let workspace_content = workspace_content && !has_build(&location.home);
+    if !query_text && !workspace_content {
+        return Ok(None);
+    }
     if manifest.embedding.is_none() {
         return Ok(None);
     }
-    let target = index_authorization(&crate::api::index::IndexOptions {
-        root: Some(location.root),
-        endpoint: options.endpoint.clone(),
-        ..crate::api::index::IndexOptions::default()
-    })?;
+    let target = authorization_for_manifest(
+        &crate::api::index::IndexOptions {
+            root: Some(location.root.clone()),
+            endpoint: options.endpoint.clone(),
+            ..crate::api::index::IndexOptions::default()
+        },
+        &location.root,
+        Some(&manifest),
+    )?;
     Ok(target.map(|target| QueryAuthorization {
         target,
         query_text,
@@ -563,6 +583,92 @@ mod tests {
             query_authorization(&request)
                 .expect("explicit consent")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn resumed_build_discloses_its_destination_while_queries_use_the_active_index() {
+        use crate::{
+            api::{
+                context::{ContextOptions, options::RefreshPolicy},
+                info::result::{WorkspaceIndexEmbedding, WorkspaceIndexInfo, WorkspaceIndexPolicy},
+            },
+            workspace::{
+                build::prepare_build,
+                manifest::{EmbeddingRuntimeConfig, write_workspace_manifest},
+            },
+        };
+        let directory = tempfile::tempdir().expect("workspace");
+        let home = directory.path().join(".zvec-grep");
+        let active = WorkspaceManifest::new(
+            WorkspaceIndexInfo {
+                id: "workspace".into(),
+                name: "workspace".into(),
+                root: directory.path().to_path_buf(),
+                path: home.clone(),
+                discovery: crate::api::index::options::DiscoveryOptions::default(),
+                policy: WorkspaceIndexPolicy::Enabled,
+                embedding: Some(WorkspaceIndexEmbedding {
+                    provider: "qwen".into(),
+                    model: "text-embedding-v4".into(),
+                    dimension: 1024,
+                    metric: "cosine".into(),
+                }),
+                index_version: Some(5),
+                generation: Some(1),
+                created_epoch_ms: 1,
+                updated_epoch_ms: 1,
+            },
+            EmbeddingRuntimeConfig {
+                endpoint: Some("https://active.test/embeddings".into()),
+                ..EmbeddingRuntimeConfig::default()
+            },
+        )
+        .expect("manifest");
+        write_workspace_manifest(&home, &active).expect("write active");
+        let mut target = active.clone();
+        target.embedding_runtime.endpoint = Some("https://staging.test/embeddings".into());
+        prepare_build(
+            target,
+            Some(&active),
+            None,
+            &crate::storage::ZvecStorageFactory::new(),
+        )
+        .expect("staged build");
+        let index = index_authorization(&IndexOptions {
+            root: Some(directory.path().into()),
+            ..IndexOptions::default()
+        })
+        .expect("index disclosure")
+        .expect("remote index");
+        assert_eq!(index.endpoint_host, "staging.test");
+        let query = query_authorization(&ContextOptions {
+            root: Some(directory.path().into()),
+            query: Some("query".into()),
+            refresh: Some(RefreshPolicy::Wait),
+            ..ContextOptions::default()
+        })
+        .expect("query disclosure")
+        .expect("remote query");
+        assert_eq!(query.target.endpoint_host, "active.test");
+        assert!(query.query_text);
+        assert!(!query.workspace_content);
+
+        // An unpublished first build is still the enclosing workspace when a
+        // user resumes from a child directory.
+        fs::remove_file(home.join("manifest.json")).expect("unpublished workspace");
+        let child = directory.path().join("src/nested");
+        fs::create_dir_all(&child).expect("nested source directory");
+        let resumed = index_authorization(&IndexOptions {
+            root: Some(child),
+            ..IndexOptions::default()
+        })
+        .expect("first-build disclosure")
+        .expect("remote index");
+        assert_eq!(resumed.endpoint_host, "staging.test");
+        assert_eq!(
+            resumed.root,
+            fs::canonicalize(directory.path()).expect("workspace root")
         );
     }
 

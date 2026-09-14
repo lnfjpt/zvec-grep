@@ -53,13 +53,16 @@ pub(crate) fn workspace_index_location(root: &Path) -> Result<WorkspaceIndexLoca
 pub(crate) fn find_nearest_workspace(
     start: &Path,
 ) -> Result<Option<WorkspaceIndexLocation>, EngineError> {
-    find_nearest_workspace_location(start, |location| Ok(location.manifest_path.is_file()))
+    find_nearest_workspace_location(start, |location| {
+        Ok(location.manifest_path.is_file() || super::build::has_build(&location.home))
+    })
 }
 
 pub(crate) fn reset_workspace_index(
     location: &WorkspaceIndexLocation,
     storage_factory: &dyn WorkspaceIndexStorageFactory,
 ) -> Result<(), EngineError> {
+    super::build::drop_build_storage(&location.home, storage_factory)?;
     storage_factory.delete(&location.home)?;
     delete_workspace_manifest(&location.home)
 }
@@ -127,6 +130,25 @@ mod tests {
         assert_eq!(
             nearest.root,
             fs::canonicalize(directory.path()).expect("canonical workspace root")
+        );
+    }
+
+    #[test]
+    fn finds_an_interrupted_initial_build_before_its_first_manifest() {
+        let directory = tempdir().expect("workspace");
+        let nested = directory.path().join("src/nested");
+        fs::create_dir_all(&nested).expect("nested directory");
+        let home = directory.path().join(".zvec-grep");
+        fs::create_dir(&home).expect("workspace home");
+        fs::write(home.join("build.json"), b"{}").expect("pending build marker");
+        assert!(!home.join("manifest.json").exists());
+
+        let nearest = find_nearest_workspace(&nested)
+            .expect("workspace lookup")
+            .expect("pending parent workspace");
+        assert_eq!(
+            nearest.home,
+            fs::canonicalize(home).expect("canonical home")
         );
     }
 }

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use super::TextSource;
 use super::{
-    ChunkOptions, EntityFragment, IndexingExtractionFragment, Source, SourceFile, SourceKind, code,
+    ChunkOptions, EntityFragment, FileRecord, IndexingExtractionFragment, Source, SourceKind, code,
     image, markdown, text,
 };
 use crate::{
@@ -68,7 +68,7 @@ pub(super) fn extract_for_indexing<'source>(
     Ok(fragments)
 }
 
-pub(super) fn source_kind(file: &SourceFile) -> Option<SourceKind> {
+pub(super) fn source_kind(file: &FileRecord) -> Option<SourceKind> {
     if let Some(format) = file
         .formats
         .iter()
@@ -100,7 +100,7 @@ pub(super) fn source_kind(file: &SourceFile) -> Option<SourceKind> {
     }
 }
 
-pub(super) fn is_code_source(file: &SourceFile) -> bool {
+pub(super) fn is_code_source(file: &FileRecord) -> bool {
     !file.has_category(FileCategory::Data) && file.has_category(FileCategory::Code)
 }
 
@@ -160,7 +160,7 @@ fn project_content(content: Content, output: &mut Vec<Content>) {
     }
 }
 
-pub(super) fn validate_source_file(file: &SourceFile) -> Result<(), EngineError> {
+pub(super) fn validate_source_file(file: &FileRecord) -> Result<(), EngineError> {
     file.validate()
 }
 
@@ -262,11 +262,12 @@ pub(super) fn test_source(format: FileFormat, relative_path: &str, text: &str) -
 }
 
 #[cfg(test)]
-pub(super) fn test_file(format: FileFormat, relative_path: &str, size_bytes: u64) -> SourceFile {
-    SourceFile {
+pub(super) fn test_file(format: FileFormat, relative_path: &str, size_bytes: u64) -> FileRecord {
+    FileRecord {
         id: crate::domain::FileId::new(format!("file-{}", format.as_str())).expect("file id"),
         relative_path: PathBuf::from(relative_path),
         formats: vec![format],
+        index_status: crate::domain::FileIndexStatus::NotIndexed,
         snapshot: crate::domain::FileSnapshot {
             size_bytes,
             modified_epoch_ms: Some(1),

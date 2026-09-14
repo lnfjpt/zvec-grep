@@ -1,16 +1,16 @@
 //! Prepared inputs and indexing options for extraction.
 
-use crate::domain::{Content, EntityFragment, FileFormat, ImageContent, SourceFile};
+use crate::domain::{Content, EntityFragment, FileFormat, FileRecord, ImageContent};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TextSource {
-    pub file: SourceFile,
+    pub file: FileRecord,
     pub text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ImageSource {
-    pub file: SourceFile,
+    pub file: FileRecord,
     pub content: ImageContent,
 }
 

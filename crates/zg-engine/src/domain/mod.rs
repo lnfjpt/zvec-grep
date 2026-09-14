@@ -2,12 +2,20 @@ mod content;
 mod entity;
 mod source;
 
-pub(crate) use content::{Content, ImageContent};
-pub(crate) use content::{TableCell, TableCellRole, TableContent};
-pub(crate) use entity::{
-    Entity, EntityContent, EntityFragment, EntityId, EntityMetadata, FragmentId, SymbolType,
-    WindowFragment, validate_fragments,
-};
-pub(crate) use source::{
-    ByteRange, FileCategory, FileFormat, FileId, FileSnapshot, SourceFile, SourceRange, TextRange,
-};
+// Source files.
+pub(crate) use source::{FileId, FileIndexStatus, FileRecord, FileSnapshot};
+
+// File formats.
+pub(crate) use source::{FileCategory, FileFormat};
+
+// Source ranges.
+pub(crate) use source::{ByteRange, SourceRange, TextRange};
+
+// Content.
+pub(crate) use content::{Content, ImageContent, TableCell, TableCellRole, TableContent};
+
+// Entities.
+pub(crate) use entity::{Entity, EntityContent, EntityId, EntityMetadata, SymbolType};
+
+// Fragments.
+pub(crate) use entity::{EntityFragment, FragmentId, WindowFragment, validate_fragments};

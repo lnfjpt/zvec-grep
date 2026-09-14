@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EngineError, EngineResult,
-    domain::{EntityId, FileId, validate_fragments},
+    domain::{EntityId, FileId, FileIndexStatus, FileRecord, validate_fragments},
     models::EmbeddingMetric,
     utils::{atomic_write as write_record, sync_directory},
 };
@@ -20,14 +20,14 @@ use super::{
     codec, dictionary,
     pending::{self, PendingChange, PendingChanges},
     spi::{
-        FileIndexDiagnostics, FileIndexStatus, IndexedFragment, StorageResult, StorageSearchFilter,
-        StorageSearchHit, StoredEntity, StoredFile, WorkspaceIndexEmbeddingSchema,
-        WorkspaceIndexStorage, WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
+        IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit, StoredEntity,
+        WorkspaceIndexEmbeddingSchema, WorkspaceIndexStorage, WorkspaceIndexStorageFactory,
+        WorkspaceIndexStorageOptions,
     },
     zvec::NativeStore,
 };
 
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const CHECKPOINT_OPERATIONS: usize = 64;
 const CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 type StoreRegistry = Mutex<HashMap<PathBuf, Weak<SharedStore>>>;
@@ -319,7 +319,7 @@ impl WorkspaceIndexStorage for ZvecStorage {
         self.read_only
     }
 
-    fn list_files(&self) -> StorageResult<Vec<StoredFile>> {
+    fn list_files(&self) -> StorageResult<Vec<FileRecord>> {
         self.read(NativeStore::list_files)
     }
 
@@ -347,43 +347,36 @@ impl WorkspaceIndexStorage for ZvecStorage {
         self.read(|native| native.search_vector(vector, limit, filter))
     }
 
-    fn replace_file(
-        &self,
-        file: &StoredFile,
-        entries: &[IndexedFragment],
-        diagnostics: Option<&FileIndexDiagnostics>,
-    ) -> StorageResult<()> {
+    fn replace_file(&self, file: &FileRecord, entries: &[IndexedFragment]) -> StorageResult<()> {
         let shared = self.shared()?;
         validate_batch(file, entries, &shared.schema)?;
         let mut file = file.clone();
-        file.index_status = Some(FileIndexStatus {
-            indexed_epoch_ms: Some(now_epoch_ms()?),
-            entity_count: entries
-                .iter()
-                .filter(|entry| entry.fragment.as_entity().is_some())
-                .count(),
-            token_count: None,
-            truncated_fragment_count: diagnostics.and_then(|value| value.truncated_fragment_count),
-            error: None,
-        });
+        file.index_status = FileIndexStatus::Indexed {
+            indexed_epoch_ms: now_epoch_ms()?,
+            entity_count: u64::try_from(
+                entries
+                    .iter()
+                    .filter(|entry| entry.fragment.as_entity().is_some())
+                    .count(),
+            )
+            .map_err(|_| EngineError::invalid_argument("entity count exceeds u64"))?,
+        };
+        file.validate()?;
         self.apply(
-            PendingChange::Reindex(file.source.clone()),
+            PendingChange::reindex(&file),
             estimated_write_bytes(&file, entries),
             |native| native.apply_replace(&file, entries),
         )
     }
 
-    fn mark_file_failed(&self, file: &StoredFile, error: &str) -> StorageResult<()> {
-        file.source.validate()?;
+    fn mark_file_failed(&self, file: &FileRecord, error: &str) -> StorageResult<()> {
+        file.validate()?;
         let mut file = file.clone();
-        file.index_status = Some(FileIndexStatus {
-            indexed_epoch_ms: None,
-            entity_count: 0,
-            token_count: None,
-            truncated_fragment_count: None,
-            error: Some(error.to_owned()),
-        });
-        self.apply(PendingChange::Reindex(file.source.clone()), 0, |native| {
+        file.index_status = FileIndexStatus::Failed {
+            error: error.to_owned(),
+        };
+        file.validate()?;
+        self.apply(PendingChange::reindex(&file), 0, |native| {
             native.apply_replace(&file, &[])
         })
     }
@@ -428,12 +421,12 @@ impl WorkspaceIndexStorage for ZvecStorage {
     }
 }
 
-fn estimated_write_bytes(file: &StoredFile, entries: &[IndexedFragment]) -> u64 {
+fn estimated_write_bytes(file: &FileRecord, entries: &[IndexedFragment]) -> u64 {
     // Bound the batch using source size and raw vectors without serializing a
     // second copy of fragment contents. An oversized file forces a checkpoint.
     entries
         .iter()
-        .fold(file.source.snapshot.size_bytes, |bytes, entry| {
+        .fold(file.snapshot.size_bytes, |bytes, entry| {
             bytes.saturating_add(
                 u64::try_from(entry.vector.len())
                     .unwrap_or(u64::MAX)
@@ -445,19 +438,10 @@ fn estimated_write_bytes(file: &StoredFile, entries: &[IndexedFragment]) -> u64 
 fn recover_pending(native: &NativeStore, changes: PendingChanges) -> EngineResult<()> {
     for change in changes.into_values() {
         match change {
-            PendingChange::Reindex(source) => native.apply_replace(
-                &StoredFile {
-                    source,
-                    index_status: Some(FileIndexStatus {
-                        indexed_epoch_ms: None,
-                        entity_count: 0,
-                        token_count: None,
-                        truncated_fragment_count: None,
-                        error: None,
-                    }),
-                },
-                &[],
-            )?,
+            PendingChange::Reindex(mut file) => {
+                file.index_status = FileIndexStatus::NotIndexed;
+                native.apply_replace(&file, &[])?;
+            }
             PendingChange::Delete(id) => native.apply_delete(&id)?,
         }
     }
@@ -465,12 +449,12 @@ fn recover_pending(native: &NativeStore, changes: PendingChanges) -> EngineResul
 }
 
 fn validate_batch(
-    file: &StoredFile,
+    file: &FileRecord,
     entries: &[IndexedFragment],
     schema: &WorkspaceIndexEmbeddingSchema,
 ) -> EngineResult<()> {
-    file.source.validate()?;
-    validate_fragments(&file.source.id, entries.iter().map(|entry| &entry.fragment))?;
+    file.validate()?;
+    validate_fragments(&file.id, entries.iter().map(|entry| &entry.fragment))?;
     for entry in entries {
         codec::validate_fragment(&entry.fragment)?;
         validate_vector(&entry.vector, schema)?;

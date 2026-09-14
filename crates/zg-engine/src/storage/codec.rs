@@ -11,22 +11,22 @@ use crate::{
     EngineError, EngineResult,
     domain::{
         ByteRange, Content, Entity, EntityContent, EntityFragment, EntityId, EntityMetadata,
-        FileFormat, FileId, FileSnapshot, FragmentId, ImageContent, SourceFile, SourceRange,
-        SymbolType, TableCell, TableCellRole, TableContent, TextRange, WindowFragment,
+        FileFormat, FileId, FileIndexStatus, FileRecord, FileSnapshot, FragmentId, ImageContent,
+        SourceRange, SymbolType, TableCell, TableCellRole, TableContent, TextRange, WindowFragment,
     },
 };
 
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 // Nested tables add several JSON containers; keep records below serde's recursion limit.
 const MAX_TABLE_DEPTH: usize = 16;
 
-pub(crate) fn encode_file(file: &SourceFile) -> EngineResult<String> {
+pub(crate) fn encode_file(file: &FileRecord) -> EngineResult<String> {
     file.validate()?;
-    encode(FileRecord::from_file(file)?, "source file")
+    encode(FilePayload::from_file(file)?, "source file")
 }
 
-pub(crate) fn decode_file(json: &str) -> EngineResult<SourceFile> {
-    let record: FileRecord<'static> = decode(json, "source file")?;
+pub(crate) fn decode_file(json: &str) -> EngineResult<FileRecord> {
+    let record: FilePayload<'static> = decode(json, "source file")?;
     record
         .into_file()
         .map_err(|error| invalid_record("source file", &error))
@@ -79,11 +79,12 @@ struct Record<T> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct FileRecord<'a> {
+struct FilePayload<'a> {
     id: Cow<'a, str>,
     relative_path: PathRecord,
     formats: Vec<u16>,
     snapshot: SnapshotRecord<'a>,
+    index_status: IndexStatusRecord<'a>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -93,9 +94,59 @@ struct SnapshotRecord<'a> {
     content_hash: Option<Cow<'a, str>>,
 }
 
-impl<'a> FileRecord<'a> {
-    fn from_file(file: &'a SourceFile) -> EngineResult<Self> {
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum IndexStatusRecord<'a> {
+    NotIndexed {},
+    Indexed {
+        indexed_epoch_ms: u64,
+        entity_count: u64,
+    },
+    Failed {
+        error: Cow<'a, str>,
+    },
+}
+
+impl<'a> From<&'a FileIndexStatus> for IndexStatusRecord<'a> {
+    fn from(status: &'a FileIndexStatus) -> Self {
+        match status {
+            FileIndexStatus::NotIndexed => Self::NotIndexed {},
+            FileIndexStatus::Indexed {
+                indexed_epoch_ms,
+                entity_count,
+            } => Self::Indexed {
+                indexed_epoch_ms: *indexed_epoch_ms,
+                entity_count: *entity_count,
+            },
+            FileIndexStatus::Failed { error } => Self::Failed {
+                error: error.as_str().into(),
+            },
+        }
+    }
+}
+
+impl From<IndexStatusRecord<'_>> for FileIndexStatus {
+    fn from(status: IndexStatusRecord<'_>) -> Self {
+        match status {
+            IndexStatusRecord::NotIndexed {} => Self::NotIndexed,
+            IndexStatusRecord::Indexed {
+                indexed_epoch_ms,
+                entity_count,
+            } => Self::Indexed {
+                indexed_epoch_ms,
+                entity_count,
+            },
+            IndexStatusRecord::Failed { error } => Self::Failed {
+                error: error.into_owned(),
+            },
+        }
+    }
+}
+
+impl<'a> FilePayload<'a> {
+    fn from_file(file: &'a FileRecord) -> EngineResult<Self> {
         Ok(Self {
+            index_status: (&file.index_status).into(),
             id: file.id.as_str().into(),
             relative_path: PathRecord::from_path(&file.relative_path)?,
             formats: file.formats.iter().map(|format| *format as u16).collect(),
@@ -107,8 +158,9 @@ impl<'a> FileRecord<'a> {
         })
     }
 
-    fn into_file(self) -> EngineResult<SourceFile> {
-        let file = SourceFile {
+    fn into_file(self) -> EngineResult<FileRecord> {
+        let file = FileRecord {
+            index_status: self.index_status.into(),
             id: FileId::new(self.id.into_owned())?,
             relative_path: self.relative_path.into_path()?,
             formats: self
@@ -725,8 +777,9 @@ mod tests {
 
     use super::*;
 
-    fn file() -> SourceFile {
-        SourceFile {
+    fn file() -> FileRecord {
+        FileRecord {
+            index_status: FileIndexStatus::NotIndexed,
             id: FileId::new("source").expect("file ID"),
             relative_path: PathBuf::from("nested/tsconfig.json"),
             formats: vec![FileFormat::Json, FileFormat::TypeScript],
@@ -810,11 +863,12 @@ mod tests {
         let mut source = file();
         let encoded = encode_file(&source).expect("encode source");
         let record: Value = serde_json::from_str(&encoded).expect("JSON record");
-        assert_eq!(record["version"], 4);
+        assert_eq!(record["version"], 5);
         assert_eq!(
             record["value"],
             json!({
                 "id": "source",
+                "index_status": {"kind": "not_indexed"},
                 "relative_path": {"encoding": "utf8", "value": "nested/tsconfig.json"},
                 "formats": [FileFormat::Json as u16, FileFormat::TypeScript as u16],
                 "snapshot": {
@@ -842,6 +896,49 @@ mod tests {
     }
 
     #[test]
+    fn file_status_round_trips_and_rejects_invalid_persisted_states() {
+        let mut file = file();
+        for status in [
+            FileIndexStatus::NotIndexed,
+            FileIndexStatus::Indexed {
+                indexed_epoch_ms: 789,
+                entity_count: 0,
+            },
+            FileIndexStatus::Indexed {
+                indexed_epoch_ms: 789,
+                entity_count: u64::MAX,
+            },
+            FileIndexStatus::Failed {
+                error: "extraction failed".to_owned(),
+            },
+        ] {
+            file.index_status = status;
+            assert_eq!(
+                decode_file(&encode_file(&file).expect("encode status")).expect("decode status"),
+                file
+            );
+        }
+        let mut record: Value =
+            serde_json::from_str(&encode_file(&file).expect("valid file")).expect("file JSON");
+        for invalid in [
+            json!({"kind": "failed", "error": " "}),
+            json!({"kind": "indexed", "indexed_epoch_ms": 1, "entity_count": 0, "error": "failure"}),
+            json!({"kind": "indexed", "indexed_epoch_ms": null, "entity_count": 0}),
+            json!({"kind": "indexed", "indexed_epoch_ms": 1, "entity_count": -1}),
+            json!({"kind": "not_indexed", "entity_count": 1}),
+            json!({"kind": "running"}),
+            Value::Null,
+        ] {
+            record["value"]["index_status"] = invalid;
+            assert!(decode_file(&record.to_string()).is_err());
+        }
+        record["value"]["index_status"] =
+            json!({"kind": "indexed", "indexed_epoch_ms": 1, "entity_count": 0});
+        record["value"]["snapshot"]["content_hash"] = Value::Null;
+        assert!(decode_file(&record.to_string()).is_err());
+    }
+
+    #[test]
     fn fragment_records_preserve_compound_content_ranges_metadata_and_ownership() {
         round_trip(&fragment());
         let restored = decode_fragment(&encode_fragment(&fragment()).expect("encode fragment"))
@@ -860,7 +957,7 @@ mod tests {
             encoded["value"]["value"]["content"]["value"][1]["value"]["data"],
             "AAH/"
         );
-        assert_eq!(encoded["version"], 4);
+        assert_eq!(encoded["version"], 5);
         let ranges = [
             (SourceRange::File, json!({"kind": "file"})),
             (
@@ -977,7 +1074,7 @@ mod tests {
             serde_json::from_str(&encode_fragment(&fragment()).expect("encode fragment"))
                 .expect("fragment JSON");
         for (kind, record) in [("source file", file_record), ("fragment", original.clone())] {
-            for version in [1, 2, 3] {
+            for version in [1, 2, 3, 4] {
                 let mut record = record.clone();
                 record["version"] = json!(version);
                 if kind == "fragment" {

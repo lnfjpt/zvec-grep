@@ -840,8 +840,9 @@ struct IndexFilesOutput {
     modified: usize,
     deleted: usize,
     unchanged: usize,
-    entities: usize,
-    truncated_fragments: usize,
+    entities: u64,
+    /// Total source snapshot bytes for successfully indexed files, excluding index storage.
+    indexed_size_bytes: u64,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -1564,7 +1565,7 @@ impl From<InfoResult> for IndexStatusOutput {
             deleted: status.files_deleted,
             unchanged: status.files_unchanged,
             entities: status.entities_indexed,
-            truncated_fragments: status.fragments_truncated,
+            indexed_size_bytes: status.indexed_size_bytes,
         });
         Self {
             root: reply.root.display().to_string(),
@@ -1866,6 +1867,44 @@ mod tests {
         };
         assert!(busy.text.contains("retryable: true"));
         assert!(storage.text.contains("retryable: false"));
+    }
+
+    #[test]
+    fn index_status_exposes_exact_source_bytes_without_truncation_statistics() {
+        use zg_engine::api::info::result::WorkspaceIndexStatus;
+
+        let count = u64::from(u32::MAX) + 1;
+        let root = test_root();
+        let reply = super::InfoResult {
+            home: root.join(".zvec-grep"),
+            index_path: root.join(".zvec-grep/storage"),
+            root,
+            indexed: true,
+            index_policy: super::WorkspaceIndexPolicy::Enabled,
+            source: super::InfoSource::Index,
+            workspace_index: None,
+            status: Some(WorkspaceIndexStatus {
+                entities_indexed: count,
+                indexed_size_bytes: count + 3,
+                ..WorkspaceIndexStatus::default()
+            }),
+            suggestion: None,
+        };
+        let output = super::info_result_to_tool_result(reply, None)
+            .structured_content
+            .expect("status output");
+        let files = &output["persistent"]["files"];
+        assert_eq!(files["entities"], count);
+        assert_eq!(files["indexed_size_bytes"], count + 3);
+        assert!(files.get("truncated_fragments").is_none());
+
+        let schema = serde_json::to_value(schemars::schema_for!(super::IndexFilesOutput))
+            .expect("status schema");
+        assert!(schema["properties"].get("truncated_fragments").is_none());
+        assert_eq!(
+            schema["properties"]["indexed_size_bytes"]["type"],
+            "integer"
+        );
     }
 
     #[test]

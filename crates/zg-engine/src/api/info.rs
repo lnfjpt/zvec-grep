@@ -80,8 +80,9 @@ pub mod result {
         pub files_scanned: usize,
         pub files_stored: usize,
         pub files_indexed: usize,
-        pub entities_indexed: usize,
-        pub fragments_truncated: usize,
+        pub entities_indexed: u64,
+        /// Total source snapshot bytes for successfully indexed files, excluding index storage.
+        pub indexed_size_bytes: u64,
         pub files_pending: usize,
         pub files_failed: usize,
         pub files_added: usize,

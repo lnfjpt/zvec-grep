@@ -21,14 +21,15 @@ use crate::{
         index::{IndexOptions, IndexResult},
         info::{InfoOptions, InfoResult},
     },
-    indexing::service::WorkspaceIndexService,
     lexical::{
         LexicalSearchService,
         structure::enrich_lexical_items_with_structure,
         types::{LexicalCoverage, LexicalOptions, LexicalSearchReply, LexicalSearchRequest},
     },
     models::ModelRuntimeManager,
-    search::context::normalize_context_request,
+    pipelines::{
+        indexing::service::WorkspaceIndexService, search::context::normalize_context_request,
+    },
 };
 
 const DEFAULT_MAX_CONCURRENT_LEXICAL_SEARCHES: usize = 2;

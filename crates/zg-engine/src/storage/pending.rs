@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EngineError, EngineResult,
-    domain::{FileId, SourceFile},
+    domain::{FileId, FileIndexStatus, FileRecord},
     utils::{atomic_write, sync_directory},
 };
 
@@ -15,11 +15,17 @@ const VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PendingChange {
-    Reindex(SourceFile),
+    Reindex(FileRecord),
     Delete(FileId),
 }
 
 impl PendingChange {
+    pub(super) fn reindex(file: &FileRecord) -> Self {
+        let mut file = file.clone();
+        file.index_status = FileIndexStatus::NotIndexed;
+        Self::Reindex(file)
+    }
+
     pub(super) fn file_id(&self) -> &FileId {
         match self {
             Self::Reindex(source) => &source.id,
@@ -147,8 +153,9 @@ mod tests {
     use super::*;
     use crate::domain::{FileFormat, FileSnapshot};
 
-    fn source() -> SourceFile {
-        SourceFile {
+    fn source() -> FileRecord {
+        FileRecord {
+            index_status: crate::domain::FileIndexStatus::NotIndexed,
             id: FileId::new("source").expect("file ID"),
             relative_path: PathBuf::from("nested/source.rs"),
             formats: vec![FileFormat::Rust],
@@ -162,6 +169,25 @@ mod tests {
 
     fn decode_value(value: &Value) -> EngineResult<PendingChanges> {
         decode(&serde_json::to_vec(value).expect("encode test record"))
+    }
+
+    #[test]
+    fn reindex_intent_never_claims_a_completed_index() {
+        let mut file = source();
+        file.index_status = FileIndexStatus::Indexed {
+            indexed_epoch_ms: 7,
+            entity_count: 3,
+        };
+        let PendingChange::Reindex(pending) = PendingChange::reindex(&file) else {
+            panic!("reindex intention");
+        };
+        assert_eq!(pending.index_status, FileIndexStatus::NotIndexed);
+        assert_eq!(pending.snapshot, file.snapshot);
+        assert_eq!(pending.id, file.id);
+        assert!(
+            file.index_status.is_indexed(),
+            "input record remains intact"
+        );
     }
 
     #[test]

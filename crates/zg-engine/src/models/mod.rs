@@ -1,38 +1,47 @@
 //! Private embedding model implementations matching the TypeScript engine.
 
-mod artifacts;
+// Model definitions and selection.
 mod catalog;
-mod compute;
-mod download_progress;
 mod error;
 mod factory;
+mod resolution;
+mod spi;
+
+// Runtime and artifact management.
+mod artifacts;
+mod compute;
+mod download_progress;
+mod runtime;
+
+// Embedding backends.
 mod llama_cpp;
 mod model2vec;
 mod qwen;
-mod resolution;
-mod runtime;
-mod spi;
 mod transformers;
 
 use crate::api::index::progress::IndexProgressReporter;
 
-// Interface exposed to the rest of `zg-engine`.
+// Model catalog and reference resolution.
 pub(crate) use catalog::{EmbeddingCatalogEntry, get_embedding_model_catalog_entry};
 pub(crate) use resolution::{ResolveEmbeddingReferenceOptions, resolve_embedding_reference};
+
+// Runtime lifecycle.
 pub(crate) use runtime::ModelRuntimeManager;
 pub(crate) type ModelRuntimeLease = runtime::ModelRuntimeLease;
 pub(crate) type ModelRuntimeRequest = runtime::ModelRuntimeRequest;
 pub(crate) type ModelRuntimeSnapshot = runtime::ModelRuntimeSnapshot;
 
-// Value types required by the runtime interface. Backend traits, factories,
+// Model configuration and capabilities. Backend traits, factories, and
 // validation helpers remain private to `models`.
 pub(crate) type CreateEmbeddingModelOptions = spi::CreateEmbeddingModelOptions;
-pub(crate) type EmbeddingInput = spi::EmbeddingInput;
-pub(crate) type EmbeddingInputKind = spi::EmbeddingInputKind;
 pub(crate) type EmbeddingMetric = spi::EmbeddingMetric;
 pub(crate) type EmbeddingModelInfo = spi::EmbeddingModelInfo;
 #[cfg(test)]
 pub(crate) type EmbeddingModelLimits = spi::EmbeddingModelLimits;
+
+// Embedding requests, results, and errors.
+pub(crate) type EmbeddingInput = spi::EmbeddingInput;
+pub(crate) type EmbeddingInputKind = spi::EmbeddingInputKind;
 pub(crate) type EmbeddingOptions = spi::EmbeddingOptions;
 pub(crate) type EmbeddingPurpose = spi::EmbeddingPurpose;
 pub(crate) type EmbeddingResult = spi::EmbeddingResult;

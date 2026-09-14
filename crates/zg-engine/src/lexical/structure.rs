@@ -11,8 +11,8 @@ use crate::{
         StructureEnrichmentDiagnostics, StructureEnrichmentSource,
     },
     domain::{
-        EntityFragment, EntityMetadata, FileCategory, FileFormat, FileId, FileSnapshot, SourceFile,
-        SourceRange,
+        EntityFragment, EntityMetadata, FileCategory, FileFormat, FileId, FileIndexStatus,
+        FileRecord, FileSnapshot, SourceRange,
     },
     extraction::{ChunkOptions, TextSource, extract},
     utils::{decode_text, sha256_hex_parts},
@@ -135,12 +135,12 @@ fn parse_structural_source(
     let bytes = fs::read(absolute_path).ok()?;
     let text = decode_text(&bytes, true)?.into_owned();
     let source = TextSource {
-        file: SourceFile {
+        file: FileRecord {
             id: file_id,
             relative_path: relative_path.to_path_buf(),
             formats,
             snapshot: FileSnapshot {
-                size_bytes: metadata.len(),
+                size_bytes: u64::try_from(bytes.len()).ok()?,
                 modified_epoch_ms: metadata
                     .modified()
                     .ok()
@@ -148,6 +148,7 @@ fn parse_structural_source(
                     .and_then(|duration| duration.as_millis().try_into().ok()),
                 content_hash: None,
             },
+            index_status: FileIndexStatus::NotIndexed,
         },
         text,
     };
