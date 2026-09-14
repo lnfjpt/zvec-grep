@@ -29,14 +29,12 @@ fn open(path: &Path, read_only: bool) -> Box<dyn WorkspaceIndexStorage> {
         .expect("open real zvec storage")
 }
 
-fn fixture(root: &Path, id: &str, text: &str, vector: Vec<f32>) -> (StoredFile, IndexedFragment) {
+fn fixture(id: &str, text: &str, vector: Vec<f32>) -> (StoredFile, IndexedFragment) {
     let id = FileId::new(id).expect("file ID");
     let file = StoredFile {
         source: SourceFile {
             id: id.clone(),
-            absolute_path: root.join(format!("{}.txt", id.as_str())),
             relative_path: PathBuf::from(format!("{}.txt", id.as_str())),
-            root_path: root.to_owned(),
             formats: vec![FileFormat::Text],
             snapshot: FileSnapshot {
                 size_bytes: text.len() as u64,
@@ -76,8 +74,8 @@ fn persists_filters_and_replaces_complete_files() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
     let storage = open(home, false);
-    let (first, entry) = fixture(home, "first", "orchard\0苹果 数据库", vec![1.0, 0.0, 0.0]);
-    let (second, other) = fixture(home, "second", "orchard vineyard", vec![0.0, 1.0, 0.0]);
+    let (first, entry) = fixture("first", "orchard\0苹果 数据库", vec![1.0, 0.0, 0.0]);
+    let (second, other) = fixture("second", "orchard vineyard", vec![0.0, 1.0, 0.0]);
     storage
         .replace_file(&first, std::slice::from_ref(&entry), None)
         .expect("first file");
@@ -233,13 +231,13 @@ fn persists_filters_and_replaces_complete_files() {
 fn replays_interrupted_writes_before_serving_readers() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
-    let (file, original) = fixture(home, "source", "old apple", vec![1.0, 0.0, 0.0]);
+    let (file, original) = fixture("source", "old apple", vec![1.0, 0.0, 0.0]);
     let storage = open(home, false);
     storage
         .replace_file(&file, &[original], None)
         .expect("initial file");
     storage.close().expect("close writer");
-    let (_, replacement) = fixture(home, "source", "new banana", vec![0.0, 1.0, 0.0]);
+    let (_, replacement) = fixture("source", "new banana", vec![0.0, 1.0, 0.0]);
     let path = home.join("storage");
     let record = JournalRecord {
         version: VERSION,
@@ -251,7 +249,13 @@ fn replays_interrupted_writes_before_serving_readers() {
     )
     .expect("durable intent");
     // Simulate termination after deleting old rows but before publishing replacements.
-    let native = NativeStore::open(&path, &schema(), false).expect("native writer");
+    let native = NativeStore::open(
+        &path,
+        &schema(),
+        &dictionary::cache_path().expect("dictionary cache"),
+        false,
+    )
+    .expect("native writer");
     native
         .apply_delete(&file.source.id)
         .expect("partial mutation");
@@ -332,7 +336,7 @@ fn rejects_invalid_writes_without_poisoning_storage() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
     let storage = open(home, false);
-    let (file, mut entry) = fixture(home, "source", "healthy document", vec![1.0, 0.0, 0.0]);
+    let (file, mut entry) = fixture("source", "healthy document", vec![1.0, 0.0, 0.0]);
     for invalid in [vec![1.0], vec![f32::NAN, 0.0, 0.0], vec![0.0, 0.0, 0.0]] {
         entry.vector = invalid;
         assert_eq!(
@@ -385,18 +389,55 @@ fn rejects_invalid_writes_without_poisoning_storage() {
 }
 
 #[test]
-fn rejects_legacy_coordinate_schemas_before_opening_collections() {
+fn rejects_legacy_schemas_before_opening_collections() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
     let path = home.join("storage");
     fs::create_dir(&path).expect("storage directory");
-    let mut record = SchemaRecord::new(&schema());
-    record.version = 1;
+    for version in [1, 2, 3] {
+        let mut record = SchemaRecord::new(&schema(), &home.join("legacy-dictionary"));
+        record.version = version;
+        fs::write(
+            path.join("schema.json"),
+            serde_json::to_vec(&record).expect("legacy schema"),
+        )
+        .expect("write legacy schema");
+        for options in [
+            WorkspaceIndexStorageOptions::ReadOnly {
+                storage_path: home.to_owned(),
+            },
+            WorkspaceIndexStorageOptions::ReadWrite {
+                storage_path: home.to_owned(),
+                embedding: schema(),
+            },
+        ] {
+            let error = ZvecStorageFactory::new()
+                .open(options)
+                .err()
+                .expect("legacy schema is incompatible");
+            assert!(
+                error
+                    .message()
+                    .contains(&format!("unsupported storage schema version {version}"))
+            );
+            assert!(error.message().contains("rebuild the index"));
+        }
+    }
+    assert_eq!(fs::read_dir(path).expect("storage files").count(), 1);
+}
+
+#[test]
+fn rejects_dictionary_cache_changes_before_opening_collections() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let home = directory.path();
+    let path = home.join("storage");
+    fs::create_dir(&path).expect("storage directory");
+    let record = SchemaRecord::new(&schema(), &home.join("old-dictionary-cache"));
     fs::write(
         path.join("schema.json"),
-        serde_json::to_vec(&record).expect("legacy schema"),
+        serde_json::to_vec(&record).expect("schema with a different cache"),
     )
-    .expect("write legacy schema");
+    .expect("write old dictionary path");
     for options in [
         WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: home.to_owned(),
@@ -409,15 +450,12 @@ fn rejects_legacy_coordinate_schemas_before_opening_collections() {
         let error = ZvecStorageFactory::new()
             .open(options)
             .err()
-            .expect("legacy schema is incompatible");
-        assert!(
-            error
-                .message()
-                .contains("unsupported storage schema version 1")
-        );
+            .expect("dictionary cache changed");
+        assert!(error.message().contains("dictionary cache differs"));
         assert!(error.message().contains("rebuild the index"));
     }
     assert_eq!(fs::read_dir(path).expect("storage files").count(), 1);
+    assert!(!home.join("old-dictionary-cache").exists());
 }
 
 #[test]
@@ -425,7 +463,7 @@ fn writes_fragments_across_native_batch_boundaries() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
     let storage = open(home, false);
-    let (file, prototype) = fixture(home, "batch", "harvest", vec![1.0, 0.0, 0.0]);
+    let (file, prototype) = fixture("batch", "harvest", vec![1.0, 0.0, 0.0]);
     let entries = (0..1025)
         .map(|index| {
             let mut entity = prototype.fragment.as_entity().expect("standalone").clone();

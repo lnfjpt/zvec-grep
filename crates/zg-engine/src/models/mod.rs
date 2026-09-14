@@ -1,5 +1,6 @@
 //! Private embedding model implementations matching the TypeScript engine.
 
+mod artifacts;
 mod catalog;
 mod compute;
 mod download_progress;

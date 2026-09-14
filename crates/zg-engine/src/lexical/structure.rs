@@ -15,7 +15,7 @@ use crate::{
         SourceRange,
     },
     extraction::{ChunkOptions, TextSource, extract},
-    utils::{decode_text, sha256_hex},
+    utils::{decode_text, sha256_hex_parts},
 };
 
 pub(crate) const RG_STRUCTURE_ENRICH_FILE_LIMIT: usize = 100;
@@ -101,6 +101,21 @@ fn parse_structural_source(
     absolute_path: &Path,
     explicit_max_size: Option<u64>,
 ) -> Option<Vec<EntityFragment>> {
+    // Direct lexical searches may target a single file or files outside the requested root.
+    // Their extraction sources are ephemeral and use a local base for relative paths.
+    let (source_root, relative_path) = match absolute_path.strip_prefix(root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => (root, relative),
+        _ => (
+            absolute_path.parent()?,
+            Path::new(absolute_path.file_name()?),
+        ),
+    };
+    let namespace = sha256_hex_parts([
+        STRUCTURE_FILE_ID_NAMESPACE.as_bytes(),
+        b"\0",
+        source_root.as_os_str().as_encoded_bytes(),
+    ]);
+    let file_id = FileId::for_path(&namespace, relative_path).ok()?;
     let metadata = fs::metadata(absolute_path).ok()?;
     if !metadata.is_file() || metadata.len() == 0 {
         return None;
@@ -119,19 +134,10 @@ fn parse_structural_source(
     }
     let bytes = fs::read(absolute_path).ok()?;
     let text = decode_text(&bytes, true)?.into_owned();
-    let (source_root, relative_path) = match absolute_path.strip_prefix(root) {
-        Ok(relative) if !relative.as_os_str().is_empty() => (root, relative),
-        _ => (
-            absolute_path.parent()?,
-            Path::new(absolute_path.file_name()?),
-        ),
-    };
     let source = TextSource {
         file: SourceFile {
-            id: FileId::new(structure_file_id(absolute_path)).ok()?,
-            absolute_path: absolute_path.to_path_buf(),
+            id: file_id,
             relative_path: relative_path.to_path_buf(),
-            root_path: source_root.to_path_buf(),
             formats,
             snapshot: FileSnapshot {
                 size_bytes: metadata.len(),
@@ -220,11 +226,6 @@ fn fragment_specificity(fragment: &EntityFragment) -> u8 {
     }
 }
 
-fn structure_file_id(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    sha256_hex(format!("{STRUCTURE_FILE_ID_NAMESPACE}\0{normalized}").as_bytes())
-}
-
 fn lexical_item_key(item: &ContextItem) -> String {
     format!("{}:{:?}", item.absolute_path.display(), item.range)
 }
@@ -310,7 +311,39 @@ mod tests {
                 None,
             );
             assert_eq!(result.diagnostics.enriched_items, 1, "{}", root.display());
+            assert_eq!(result.diagnostics.parsed_files, 1, "{}", root.display());
+            assert_eq!(
+                result.items[0]
+                    .container
+                    .as_ref()
+                    .map(|container| &container.entity_id),
+                structured
+                    .container
+                    .as_ref()
+                    .map(|container| &container.entity_id),
+            );
         }
+    }
+
+    #[test]
+    fn distinguishes_identical_relative_paths_in_different_source_roots() {
+        let first = tempdir().expect("first source root");
+        let second = tempdir().expect("second source root");
+        let ids = [first.path(), second.path()].map(|root| {
+            fs::write(root.join("section.md"), "# Section\n\nneedle\n").expect("markdown fixture");
+            let result = enrich_lexical_items_with_structure(
+                root,
+                vec![lexical_item(root, "section.md", 3, "needle")],
+                None,
+            );
+            result.items[0]
+                .container
+                .as_ref()
+                .expect("section container")
+                .entity_id
+                .clone()
+        });
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]

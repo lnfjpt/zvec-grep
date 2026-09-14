@@ -37,9 +37,7 @@ use zg_engine::{
         },
         index::{
             IndexOptions,
-            options::{
-                Device, DiscoveryOptions as IndexDiscoveryOptions, EmbeddingModelSpec, RootPath,
-            },
+            options::{Device, DiscoveryOptions as IndexDiscoveryOptions, EmbeddingModelSpec},
         },
         info::{
             InfoOptions, InfoResult,
@@ -1128,11 +1126,6 @@ impl IndexInput {
             ..IndexDiscoveryOptions::default()
         };
         validate_scoped_paths(&root, &discovery.ignore_files, "ignore file")?;
-        let root_spec = RootPath {
-            path: root.clone(),
-            recursive: true,
-            discovery: discovery.clone(),
-        };
         let embedding = if let Some(reference) = self.embedding {
             let reference = reference.trim().to_owned();
             validate_text("embedding", &reference, 1, 256)?;
@@ -1149,7 +1142,6 @@ impl IndexInput {
         Ok(IndexToolRequest::Index {
             options: Box::new(IndexOptions {
                 root: Some(root),
-                roots: vec![root_spec],
                 rebuild: self.rebuild.unwrap_or(false),
                 reset_paths: self.reset_paths.unwrap_or(false),
                 discovery,
@@ -1550,7 +1542,7 @@ impl From<InfoResult> for IndexStatusOutput {
             id: info.id,
             name: info.name,
             path: info.path.display().to_string(),
-            root_paths: info.roots.into_iter().map(RootSpecOutput::from).collect(),
+            root_paths: vec![RootSpecOutput::new(&info.root, info.discovery)],
             embedding: info.embedding.map(|embedding| IndexedEmbeddingOutput {
                 provider: embedding.provider,
                 model: embedding.model,
@@ -1649,28 +1641,27 @@ const fn index_job_state(state: IndexOperationState) -> IndexJobState {
     }
 }
 
-impl From<RootPath> for RootSpecOutput {
-    fn from(root: RootPath) -> Self {
+impl RootSpecOutput {
+    fn new(root: &Path, discovery: IndexDiscoveryOptions) -> Self {
         Self {
-            absolute_path: root.path.display().to_string(),
-            recursive: root.recursive,
-            include: root.discovery.include_paths,
-            exclude: root.discovery.exclude_paths,
-            globs: root.discovery.globs,
-            insensitive_globs: root.discovery.insensitive_globs,
-            file_types: root.discovery.file_types,
-            excluded_file_types: root.discovery.excluded_file_types,
-            hidden: root.discovery.hidden,
-            no_ignore: root.discovery.no_ignore,
-            ignore_files: root
-                .discovery
+            absolute_path: root.display().to_string(),
+            recursive: true,
+            include: discovery.include_paths,
+            exclude: discovery.exclude_paths,
+            globs: discovery.globs,
+            insensitive_globs: discovery.insensitive_globs,
+            file_types: discovery.file_types,
+            excluded_file_types: discovery.excluded_file_types,
+            hidden: discovery.hidden,
+            no_ignore: discovery.no_ignore,
+            ignore_files: discovery
                 .ignore_files
                 .into_iter()
                 .map(|path| path.display().to_string())
                 .collect(),
-            max_depth: root.discovery.max_depth,
-            max_file_size_bytes: root.discovery.max_file_size_bytes,
-            follow: root.discovery.follow,
+            max_depth: discovery.max_depth,
+            max_file_size_bytes: discovery.max_file_size_bytes,
+            follow: discovery.follow,
         }
     }
 }
@@ -1979,7 +1970,6 @@ mod tests {
         assert!(wait);
         assert!(debug);
         assert_eq!(request.root, Some(test_root()));
-        assert_eq!(request.roots.len(), 1);
         assert_eq!(request.discovery.globs, ["*.rs"]);
         assert_eq!(
             request

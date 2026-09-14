@@ -19,7 +19,8 @@ use crate::{
 use self::adapter::{LanguageAdapter, named_children, resolve_adapter, text};
 use super::{
     ChunkOptions, IndexingExtractionFragment, TextRange, TextSource, chunk_options_for_metadata,
-    make_entity_id, symbol_type_name, text::extract_plain_text_fragments, validate_source_file,
+    fit_text_to_chars, make_entity_id, symbol_type_name, text::extract_plain_text_fragments,
+    validate_source_file,
 };
 
 const DEFAULT_CODE_CHUNK_CHARS: usize = 3_600;
@@ -35,7 +36,7 @@ pub(super) fn extract_for_indexing(
 ) -> Result<Vec<IndexingExtractionFragment>, EngineError> {
     let jsx = source
         .file
-        .absolute_path
+        .relative_path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"));
     extract_code(source, options, jsx)
@@ -663,7 +664,7 @@ fn code_entity_outline(
             lines.push(format!("calls: {}", calls.join(", ")));
         }
     }
-    truncate_outline(lines.join("\n").trim(), max_chars)
+    fit_text_to_chars(lines.join("\n").trim(), max_chars)
 }
 
 fn extract_code_header(value: &str) -> String {
@@ -759,7 +760,7 @@ fn format_outline_member(member: &OutlineMember) -> String {
         .signature
         .as_deref()
         .map(collapse_whitespace)
-        .map(|value| truncate_outline(&value, OUTLINE_MAX_LINE_CHARS))
+        .map(|value| fit_text_to_chars(&value, OUTLINE_MAX_LINE_CHARS))
         .unwrap_or_default();
     let symbol = symbol_type_name(member.symbol_type);
     if !signature.is_empty() {
@@ -823,16 +824,6 @@ fn extract_call_name(node: Node<'_>, source: &[u8]) -> Option<String> {
         None
     } else {
         Some(cleaned.to_owned())
-    }
-}
-
-fn truncate_outline(value: &str, max_chars: usize) -> String {
-    if utf16_len(value) <= max_chars {
-        value.to_owned()
-    } else if max_chars <= 3 {
-        ".".repeat(max_chars)
-    } else {
-        format!("{}...", take_utf16(value, max_chars - 3).trim_end())
     }
 }
 

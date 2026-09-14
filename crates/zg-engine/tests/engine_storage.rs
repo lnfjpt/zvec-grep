@@ -19,8 +19,9 @@ use zg_engine::{
         context::{
             ContextOptions,
             options::{ContextRoute, ContextRouteMode},
+            result::ContextItemStatus,
         },
-        index::IndexOptions,
+        index::{IndexOptions, options::WorkspaceChange},
         info::InfoOptions,
     },
 };
@@ -252,6 +253,78 @@ async fn public_engine_records_failed_files_and_recovers_on_auto_update() -> Tes
         .expect("status");
     assert_eq!((status.files_failed, status.files_indexed), (0, 1));
     engine.drop_index(info_options(root)).await?;
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_engine_reuses_relative_files_after_moving_workspace() -> TestResult {
+    let temporary = tempdir()?;
+    let original_root = temporary.path().join("original");
+    fs::create_dir_all(original_root.join("src"))?;
+    let original_root = fs::canonicalize(original_root)?;
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(&original_root, server.address)?;
+    fs::write(
+        original_root.join("src/note.txt"),
+        "Orchard relocation preserves workspace identity.\n",
+    )?;
+    let query = |root: &Path, term: &str| ContextOptions {
+        root: Some(root.to_path_buf()),
+        routes: vec![ContextRoute {
+            mode: ContextRouteMode::Fts,
+            query: term.to_owned(),
+        }],
+        auto_update: false,
+        allow_remote: true,
+        ..ContextOptions::default()
+    };
+    let engine = ZvecGrep::new();
+    engine.index(index_options(&original_root)).await?;
+    let before = engine.context(query(&original_root, "orchard")).await?;
+    assert_eq!(before.items.len(), 1);
+    let entity_id = before.items[0].entity_id.clone();
+    assert!(entity_id.is_some());
+    engine.close();
+    drop(engine);
+
+    let relocated_root = temporary.path().join("relocated");
+    fs::rename(&original_root, &relocated_root)?;
+    let relocated_root = fs::canonicalize(relocated_root)?;
+    let engine = ZvecGrep::new();
+    let after = engine
+        .context(query(&relocated_root.join("src"), "orchard"))
+        .await?;
+    assert_eq!(after.items.len(), 1);
+    assert_eq!(after.items[0].entity_id, entity_id);
+    assert_eq!(after.items[0].relative_path, Path::new("src/note.txt"));
+    assert_eq!(
+        after.items[0].absolute_path,
+        relocated_root.join("src/note.txt")
+    );
+    assert_eq!(after.items[0].status, ContextItemStatus::Fresh);
+
+    let calls = server.requests.load(Ordering::Acquire);
+    let unchanged = engine.index(index_options(&relocated_root)).await?;
+    assert_eq!(unchanged.files_unchanged, 1);
+    assert_eq!((unchanged.files_added, unchanged.files_deleted), (0, 0));
+    assert_eq!(server.requests.load(Ordering::Acquire), calls);
+
+    fs::write(
+        relocated_root.join("src/note.txt"),
+        "Vineyard updated content.\n",
+    )?;
+    let updated = engine
+        .index(IndexOptions {
+            changes: vec![WorkspaceChange::Upsert(PathBuf::from("src/note.txt"))],
+            ..index_options(&relocated_root)
+        })
+        .await?;
+    assert_eq!(updated.files_modified, 1);
+    let result = engine.context(query(&relocated_root, "vineyard")).await?;
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].entity_id, entity_id);
+    engine.drop_index(info_options(&relocated_root)).await?;
     engine.close();
     Ok(())
 }

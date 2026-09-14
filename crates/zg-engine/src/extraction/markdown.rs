@@ -9,7 +9,8 @@ use crate::{
 
 use super::{
     ChunkOptions, EntityFragment, TextRange, TextSource, chunk_options_for_metadata,
-    fit_text_to_chars, make_entity_id, text::extract_plain_text_fragments, validate_source_file,
+    chunking::find_line_cut, fit_text_to_chars, make_entity_id, text::extract_plain_text_fragments,
+    validate_source_file,
 };
 
 const DEFAULT_MARKDOWN_CHUNK_CHARS: usize = 3_600;
@@ -405,11 +406,7 @@ fn split_long_line(
     let mut byte_offset = 0;
     while byte_offset < line.len() {
         let rest = &line[byte_offset..];
-        let slice_chars = if utf16_len(rest) <= max_chars {
-            utf16_len(rest)
-        } else {
-            find_line_cut(rest, max_chars)
-        };
+        let slice_chars = find_line_cut(rest, max_chars);
         let slice_bytes = byte_offset_at_utf16_ceil(rest, slice_chars);
         let text = &rest[..slice_bytes];
         windows.push(MarkdownWindow {
@@ -487,31 +484,6 @@ fn compute_markdown_overlap_lines(
         count += 1;
     }
     count.min((end_index - start_index) / 2)
-}
-
-fn find_line_cut(line: &str, max_chars: usize) -> usize {
-    let min_position = max_chars.saturating_mul(7) / 10;
-    let mut best_position = None;
-    let mut best_score = 0;
-    let mut position = 0;
-    for character in line.chars() {
-        if position >= max_chars {
-            break;
-        }
-        let score = match character {
-            '.' | '!' | '?' => 4,
-            ',' | ';' | ':' => 3,
-            ' ' | '\t' => 2,
-            '-' | '/' | '\\' => 1,
-            _ => 0,
-        };
-        if position >= min_position && score > 0 && score >= best_score {
-            best_score = score;
-            best_position = Some(position + character.len_utf16());
-        }
-        position += character.len_utf16();
-    }
-    best_position.unwrap_or(max_chars)
 }
 
 fn markdown_metadata(section: &Section) -> EntityMetadata {

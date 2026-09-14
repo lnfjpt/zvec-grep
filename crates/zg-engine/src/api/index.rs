@@ -12,12 +12,14 @@ pub mod options {
 
     use super::progress::IndexProgressReporter;
     #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+    // Reject old root lists instead of silently widening their scan scope.
+    #[serde(deny_unknown_fields)]
     #[allow(clippy::struct_excessive_bools)]
     pub struct IndexOptions {
         /// Workspace whose index is being updated. `None` uses the working directory.
         pub root: Option<PathBuf>,
-        pub roots: Vec<RootPath>,
         pub rebuild: bool,
+        /// Resets saved discovery options before applying this request's overrides.
         pub reset_paths: bool,
         /// Normalized watcher changes for a narrow incremental index operation.
         /// An empty list means normal discovery rather than "no work".
@@ -69,14 +71,7 @@ pub mod options {
         pub follow: bool,
     }
 
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    pub struct RootPath {
-        pub path: PathBuf,
-        pub recursive: bool,
-        pub discovery: DiscoveryOptions,
-    }
-
-    /// A normalized filesystem change relative to its [`RootPath`].
+    /// A normalized filesystem change relative to the workspace root.
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(rename_all = "snake_case", tag = "kind", content = "path")]
     pub enum WorkspaceChange {
@@ -347,5 +342,13 @@ mod tests {
         assert!(decoded.on_progress.is_none());
         assert!(decoded.signal.is_none());
         assert_eq!(decoded.root, request.root);
+    }
+
+    #[test]
+    fn rejects_requests_with_the_removed_roots_field() {
+        let mut request = serde_json::to_value(IndexOptions::default()).expect("index request");
+        request["roots"] = serde_json::json!([{"path": "src"}]);
+        let error = serde_json::from_value::<IndexOptions>(request).expect_err("legacy root list");
+        assert!(error.to_string().contains("roots"));
     }
 }

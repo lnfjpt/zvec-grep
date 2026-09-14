@@ -16,6 +16,7 @@ use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::models::{
+    artifacts::publish_downloaded_file,
     catalog::Model2VecConfig,
     compute::ModelComputeRuntime,
     download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
@@ -25,6 +26,7 @@ use crate::models::{
         EmbeddingPurpose, EmbeddingResult, ModelError, validate_inputs, validate_result,
     },
 };
+use crate::utils::atomic_write;
 
 use super::safetensors::{StaticEmbeddingTable, load_static_embedding_table};
 
@@ -183,13 +185,19 @@ impl Model2VecEmbeddingModel {
         .await?;
         let config_path = tokenizer_directory.join("tokenizer_config.json");
         if !is_usable_model_file(&config_path).await {
-            fs::write(
-                &config_path,
-                b"{\"tokenizer_class\":\"PreTrainedTokenizer\"}\n",
-            )
+            tokio::task::spawn_blocking(move || {
+                atomic_write(
+                    &config_path,
+                    b"{\"tokenizer_class\":\"PreTrainedTokenizer\"}\n",
+                )
+            })
             .await
             .map_err(|error| {
-                ModelError::storage_failure(format!("Unable to write tokenizer config: {error}"))
+                ModelError::storage_failure("Unable to complete tokenizer config write")
+                    .with_cause(error)
+            })?
+            .map_err(|error| {
+                ModelError::storage_failure("Unable to write tokenizer config").with_cause(error)
             })?;
         }
         Ok(tokenizer_directory)
@@ -231,7 +239,7 @@ impl Model2VecEmbeddingModel {
             .await;
         let result = match result {
             Ok(()) if is_usable_model_file(&partial_path).await => {
-                fs::rename(&partial_path, local_path)
+                publish_downloaded_file(&partial_path, local_path)
                     .await
                     .map_err(|error| {
                         ModelError::storage_failure(format!(
@@ -619,7 +627,7 @@ mod tests {
 
     use super::{
         ArtifactDownloadProgress, Model2VecDependencies, Model2VecEmbeddingModel,
-        StaticEmbeddingTable, TokenizerRuntime,
+        ModelDownloadProgressReporter, StaticEmbeddingTable, TokenizerRuntime,
     };
 
     #[tokio::test]
@@ -725,6 +733,47 @@ mod tests {
         assert!(
             loaded.upgrade().is_none(),
             "dropping the model releases its loaded resources"
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_failure_preserves_destination_and_removes_partial_artifact() {
+        let root = TempDir::new().expect("temporary directory");
+        let destination = root.path().join("artifact.safetensors");
+        tokio::fs::create_dir(&destination)
+            .await
+            .expect("conflicting destination directory");
+        let model = Model2VecEmbeddingModel::with_dependencies(
+            fixture_entry(),
+            CreateEmbeddingModelOptions {
+                model_cache_dir: Some(root.path().to_path_buf()),
+                ..CreateEmbeddingModelOptions::default()
+            },
+            Arc::new(FixtureDependencies::new(FixtureTokenizerMode::Oracle)),
+        );
+        let reporter = ModelDownloadProgressReporter::new(
+            model.entry.reference,
+            None,
+            [model.entry.model_file.to_owned()],
+        );
+
+        let error = model
+            .resolve_cached_file(model.entry.model_file, &destination, &reporter)
+            .await
+            .expect_err("directory destination must reject publication");
+
+        assert_eq!(error.code(), crate::EngineError::STORAGE_FAILURE);
+        assert!(
+            error
+                .cause()
+                .is_some_and(|cause| cause.contains("Unable to publish Model2Vec artifact"))
+        );
+        assert!(destination.is_dir());
+        assert_eq!(
+            std::fs::read_dir(root.path())
+                .expect("cache directory")
+                .count(),
+            1
         );
     }
 

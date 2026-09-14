@@ -26,7 +26,7 @@ use super::{
     zvec::NativeStore,
 };
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const JOURNAL: &str = "pending.json";
 type StoreRegistry = Mutex<HashMap<PathBuf, Weak<SharedStore>>>;
 static STORES: OnceLock<StoreRegistry> = OnceLock::new();
@@ -67,10 +67,12 @@ struct SchemaRecord {
     model: String,
     dimension: usize,
     metric: String,
+    #[serde(default)]
+    dictionary_cache: PathBuf,
 }
 
 impl SchemaRecord {
-    fn new(schema: &WorkspaceIndexEmbeddingSchema) -> Self {
+    fn new(schema: &WorkspaceIndexEmbeddingSchema, dictionary_cache: &Path) -> Self {
         Self {
             version: VERSION,
             provider: schema.provider.clone(),
@@ -82,15 +84,21 @@ impl SchemaRecord {
                 EmbeddingMetric::Euclidean => "euclidean",
             }
             .to_owned(),
+            dictionary_cache: dictionary_cache.to_path_buf(),
         }
     }
 
-    fn schema(self) -> EngineResult<WorkspaceIndexEmbeddingSchema> {
+    fn schema(self, dictionary_cache: &Path) -> EngineResult<WorkspaceIndexEmbeddingSchema> {
         if self.version != VERSION {
             return Err(EngineError::storage_failure(format!(
                 "unsupported storage schema version {}; expected {VERSION}; rebuild the index",
                 self.version
             )));
+        }
+        if self.dictionary_cache != dictionary_cache {
+            return Err(EngineError::storage_failure(
+                "stored full-text dictionary cache differs from the current cache; rebuild the index",
+            ));
         }
         if !(1..=20_000).contains(&self.dimension) {
             return Err(EngineError::storage_failure(
@@ -186,8 +194,9 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
                 "workspace storage is already open",
             ));
         }
-        let (lock, schema) = prepare_storage(&home, &path, &options)?;
-        let native = NativeStore::open(&path, &schema, read_only)?;
+        let dictionary_cache = dictionary::cache_path()?;
+        let (lock, schema) = prepare_storage(&home, &path, &options, &dictionary_cache)?;
+        let native = NativeStore::open(&path, &schema, &dictionary_cache, read_only)?;
         if !read_only {
             // Repeat the same range after failures that leave directories in place.
             sync_directory(&path)?;
@@ -481,10 +490,11 @@ fn initialize() -> EngineResult<()> {
 fn load_schema(
     path: &Path,
     options: &WorkspaceIndexStorageOptions,
+    dictionary_cache: &Path,
 ) -> EngineResult<WorkspaceIndexEmbeddingSchema> {
     let descriptor = path.join("schema.json");
     if descriptor.exists() {
-        let schema = read_json::<SchemaRecord>(&descriptor)?.schema()?;
+        let schema = read_json::<SchemaRecord>(&descriptor)?.schema(dictionary_cache)?;
         if let WorkspaceIndexStorageOptions::ReadWrite { embedding, .. } = options
             && &schema != embedding
         {
@@ -506,7 +516,8 @@ fn load_schema(
     }
     write_record(
         &descriptor,
-        &serde_json::to_vec(&SchemaRecord::new(embedding)).map_err(|error| json_error(&error))?,
+        &serde_json::to_vec(&SchemaRecord::new(embedding, dictionary_cache))
+            .map_err(|error| json_error(&error))?,
     )?;
     Ok(embedding.clone())
 }
@@ -531,6 +542,7 @@ fn prepare_storage(
     home: &Path,
     path: &Path,
     options: &WorkspaceIndexStorageOptions,
+    dictionary_cache: &Path,
 ) -> EngineResult<(File, WorkspaceIndexEmbeddingSchema)> {
     let read_only = options.is_read_only();
     let mut shared = read_only;
@@ -556,10 +568,10 @@ fn prepare_storage(
                 return Err(io_error("create storage directory", path, &error));
             }
         }
-        let schema = load_schema(path, options)?;
-        dictionary::prepare(&path.join("dictionary"))?;
+        let schema = load_schema(path, options, dictionary_cache)?;
+        dictionary::prepare_cache(dictionary_cache)?;
         if journal.exists() {
-            let native = NativeStore::open(path, &schema, false)?;
+            let native = NativeStore::open(path, &schema, dictionary_cache, false)?;
             replay(&native, &schema, read_json(&journal)?)?;
             native.flush()?;
             clear_journal(path)?;

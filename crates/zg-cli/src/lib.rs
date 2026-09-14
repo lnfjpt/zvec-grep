@@ -24,7 +24,7 @@ use zg_engine::api::{
     },
     index::{
         IndexOptions,
-        options::{Device, DiscoveryOptions, EmbeddingModelSpec, RootPath},
+        options::{Device, DiscoveryOptions, EmbeddingModelSpec},
     },
     info::InfoOptions,
 };
@@ -1080,17 +1080,11 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
         endpoint: args.endpoint.clone(),
         device: args.device.unwrap_or(DeviceArg::Auto).into(),
     });
-    let root_path = RootPath {
-        path: root.clone(),
-        recursive: true,
-        discovery: discovery.clone(),
-    };
     Ok(CliPlan::Index {
         mode,
         home,
         operation: IndexOperation::Build(Box::new(IndexOptions {
             root: Some(root),
-            roots: vec![root_path],
             rebuild: args.rebuild,
             reset_paths: args.reset_paths,
             discovery,

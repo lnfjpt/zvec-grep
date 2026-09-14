@@ -14,7 +14,7 @@ use crate::{
         context::{ContextOptions, ContextResult},
         index::{
             IndexOptions, IndexResult,
-            options::{Device, DiscoveryOptions, EmbeddingModelSpec, RootPath},
+            options::{Device, DiscoveryOptions, EmbeddingModelSpec},
         },
         info::{
             InfoOptions, InfoResult,
@@ -48,7 +48,7 @@ use crate::{
 use super::pipeline::{IndexingContext, get_workspace_index_status, index_workspace};
 
 const DEFAULT_LOCAL_EMBEDDING: &str = "local/potion-code-16m-v2";
-const CURRENT_INDEX_VERSION: u32 = 3;
+const CURRENT_INDEX_VERSION: u32 = 4;
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceIndexService {
@@ -90,6 +90,7 @@ impl WorkspaceIndexService {
         }
         let factory = &self.storage_factory;
         let location = workspace_index_location_from_option(options.root.as_deref())?;
+        validate_workspace_root(&location.root)?;
         let _lock = acquire_home_lock(
             &location.home,
             LockMode::Write,
@@ -124,7 +125,7 @@ impl WorkspaceIndexService {
         } else {
             existing.as_ref()
         };
-        let roots = resolve_root_paths(&location.root, existing.as_ref(), &options);
+        let discovery = resolve_discovery(existing.as_ref(), &options);
         let now = epoch_millis();
         let info = WorkspaceIndexInfo {
             id: existing_for_manifest.map_or_else(
@@ -136,7 +137,8 @@ impl WorkspaceIndexService {
                 |manifest| manifest.name.clone(),
             ),
             path: location.home.clone(),
-            roots,
+            root: location.root.clone(),
+            discovery,
             policy: WorkspaceIndexPolicy::Enabled,
             embedding: Some(embedding_schema(&model)),
             index_version: Some(CURRENT_INDEX_VERSION),
@@ -639,29 +641,19 @@ fn assert_embedding_compatible(
     ))
 }
 
-pub(crate) fn resolve_root_paths(
-    workspace_root: &Path,
+pub(crate) fn resolve_discovery(
     existing: Option<&WorkspaceManifest>,
     options: &IndexOptions,
-) -> Vec<RootPath> {
-    let mut roots = if options.roots.is_empty() {
-        existing.map_or_else(
-            || vec![default_root_path(workspace_root)],
-            |manifest| manifest.index_info().roots,
-        )
+) -> DiscoveryOptions {
+    let mut discovery = if options.reset_paths {
+        DiscoveryOptions::default()
     } else {
-        options.roots.clone()
+        existing.map_or_else(DiscoveryOptions::default, |manifest| {
+            manifest.index_info().discovery
+        })
     };
-    for root in &mut roots {
-        if !root.path.is_absolute() {
-            root.path = workspace_root.join(&root.path);
-        }
-        if options.reset_paths {
-            root.discovery = DiscoveryOptions::default();
-        }
-        apply_discovery_overrides(&mut root.discovery, &options.discovery);
-    }
-    roots
+    apply_discovery_overrides(&mut discovery, &options.discovery);
+    discovery
 }
 
 fn apply_discovery_overrides(target: &mut DiscoveryOptions, overrides: &DiscoveryOptions) {
@@ -790,6 +782,16 @@ fn is_indexed(manifest: &WorkspaceManifest) -> bool {
         && manifest.index_version.is_some()
 }
 
+fn validate_workspace_root(root: &Path) -> Result<(), EngineError> {
+    if !root.is_dir() {
+        return Err(EngineError::invalid_argument(format!(
+            "workspace root must be an existing directory: {}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
 fn workspace_index_location_from_option(
     root: Option<&Path>,
 ) -> Result<WorkspaceIndexLocation, EngineError> {
@@ -806,14 +808,6 @@ fn resolve_root(root: Option<&Path>) -> Result<PathBuf, EngineError> {
         env::current_dir()
             .map(|current| current.join(root))
             .map_err(|error| EngineError::from_io("failed to resolve workspace root", &error))
-    }
-}
-
-fn default_root_path(root: &Path) -> RootPath {
-    RootPath {
-        path: root.to_path_buf(),
-        recursive: true,
-        discovery: DiscoveryOptions::default(),
     }
 }
 
@@ -878,7 +872,7 @@ mod tests {
         api::{
             index::{
                 IndexOptions,
-                options::{Device, DiscoveryOptions, EmbeddingModelSpec, RootPath},
+                options::{Device, DiscoveryOptions, EmbeddingModelSpec},
             },
             info::InfoOptions,
         },
@@ -985,16 +979,177 @@ mod tests {
         }
     }
 
+    fn write_legacy_manifest(
+        home: &std::path::Path,
+        manifest: &crate::workspace::manifest::WorkspaceManifest,
+    ) {
+        let mut legacy = serde_json::to_value(manifest).expect("legacy manifest value");
+        legacy["manifestVersion"] = 1.into();
+        legacy["indexVersion"] = 3.into();
+        let root = legacy
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("root")
+            .expect("workspace root");
+        let mut discovery = legacy
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("discovery")
+            .expect("discovery");
+        discovery["absolutePath"] = root;
+        discovery["recursive"] = true.into();
+        legacy["rootPaths"] = serde_json::json!([discovery]);
+        std::fs::write(
+            home.join("manifest.json"),
+            serde_json::to_vec(&legacy).expect("legacy manifest json"),
+        )
+        .expect("legacy manifest write");
+    }
+
     #[test]
     fn rejects_incompatible_index_versions() {
         for version in [None, Some(super::CURRENT_INDEX_VERSION)] {
             super::assert_index_version(version).expect("supported or unbuilt index");
         }
-        for version in [1, 2, super::CURRENT_INDEX_VERSION + 1] {
+        for version in [1, 2, 3, super::CURRENT_INDEX_VERSION + 1] {
             let error = super::assert_index_version(Some(version))
                 .expect_err("incompatible text coordinates");
             assert!(error.message().contains("rebuild the index"));
         }
+    }
+
+    #[test]
+    fn discovery_overrides_preserve_saved_settings_until_reset() {
+        let directory = tempdir().expect("workspace");
+        let manifest = crate::workspace::manifest::WorkspaceManifest::new(
+            crate::api::info::result::WorkspaceIndexInfo {
+                id: "workspace".into(),
+                name: "workspace".into(),
+                path: directory.path().join(".zvec-grep"),
+                root: directory.path().to_path_buf(),
+                discovery: DiscoveryOptions {
+                    include_paths: vec!["src".into()],
+                    globs: vec!["*.rs".into()],
+                    hidden: true,
+                    ..DiscoveryOptions::default()
+                },
+                policy: crate::api::info::result::WorkspaceIndexPolicy::Enabled,
+                embedding: None,
+                index_version: None,
+                generation: None,
+                created_epoch_ms: 0,
+                updated_epoch_ms: 0,
+            },
+            crate::workspace::manifest::EmbeddingRuntimeConfig::default(),
+        )
+        .expect("manifest");
+        let mut options = IndexOptions {
+            discovery: DiscoveryOptions {
+                globs: vec!["*.md".into()],
+                ..DiscoveryOptions::default()
+            },
+            ..IndexOptions::default()
+        };
+        let resolved = super::resolve_discovery(Some(&manifest), &options);
+        assert_eq!(resolved.include_paths, ["src"]);
+        assert_eq!(resolved.globs, ["*.md"]);
+        assert!(resolved.hidden);
+        options.reset_paths = true;
+        assert_eq!(
+            super::resolve_discovery(Some(&manifest), &options),
+            options.discovery
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_cannot_be_a_workspace_root() {
+        let directory = tempdir().expect("workspace");
+        let file = directory.path().join("file.txt");
+        std::fs::write(&file, "text").expect("source file");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        let error = service
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(file),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect_err("workspace requires a directory");
+        assert!(error.message().contains("existing directory"));
+        assert_eq!(models.snapshot().cached_runtimes, 0);
+    }
+
+    #[tokio::test]
+    async fn reopening_a_moved_workspace_uses_its_current_root() {
+        let directory = tempdir().expect("temporary directory");
+        let original = directory.path().join("original");
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&original).expect("workspace root");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(original.clone()),
+                    discovery: DiscoveryOptions {
+                        globs: vec!["*.rs".into()],
+                        ..DiscoveryOptions::default()
+                    },
+                    embedding: Some(EmbeddingModelSpec {
+                        reference: "local/potion-code-16m-v2".into(),
+                        revision: None,
+                        cache_dir: None,
+                        endpoint: None,
+                        device: Device::Cpu,
+                    }),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect("empty workspace index");
+        let before = super::read_workspace_manifest(&original.join(".zvec-grep"))
+            .expect("manifest read")
+            .expect("manifest");
+        std::fs::rename(&original, &moved).expect("move workspace");
+        let info = service
+            .info(InfoOptions {
+                root: Some(moved.clone()),
+                include_status: true,
+            })
+            .await
+            .expect("moved workspace info");
+        let workspace = info.workspace_index.expect("workspace index");
+        assert_eq!(workspace.id, before.id);
+        assert_eq!(
+            workspace.root,
+            std::fs::canonicalize(&moved).expect("moved root")
+        );
+        assert_eq!(workspace.path, workspace.root.join(".zvec-grep"));
+        assert_eq!(workspace.discovery.globs, ["*.rs"]);
+        assert_eq!(info.status.expect("status").files_scanned, 0);
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(moved.clone()),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect("update moved workspace");
+        let after = super::read_workspace_manifest(&moved.join(".zvec-grep"))
+            .expect("manifest read")
+            .expect("manifest");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.discovery, before.discovery);
+        assert_eq!(after.root, moved);
+        models.close();
     }
 
     #[test]
@@ -1025,11 +1180,10 @@ mod tests {
                 &models,
                 IndexOptions {
                     root: Some(directory.path().to_path_buf()),
-                    roots: vec![RootPath {
-                        path: sources,
-                        recursive: true,
-                        discovery: DiscoveryOptions::default(),
-                    }],
+                    discovery: DiscoveryOptions {
+                        include_paths: vec!["sources".into()],
+                        ..DiscoveryOptions::default()
+                    },
                     embedding: Some(EmbeddingModelSpec {
                         reference: "local/potion-code-16m-v2".to_owned(),
                         revision: None,
@@ -1045,11 +1199,12 @@ mod tests {
         assert_eq!(result.files_scanned, 0);
         assert!(factory.exists.load(Ordering::Acquire));
 
+        let info_options = InfoOptions {
+            root: Some(directory.path().to_path_buf()),
+            include_status: true,
+        };
         let info = service
-            .info(InfoOptions {
-                root: Some(directory.path().to_path_buf()),
-                include_status: true,
-            })
+            .info(info_options.clone())
             .await
             .expect("workspace info");
         assert!(info.indexed);
@@ -1080,6 +1235,20 @@ mod tests {
         );
         drop(lease);
 
+        // Legacy metadata remains readable long enough to request an explicit rebuild.
+        write_legacy_manifest(&info.home, &manifest);
+        let error = service
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(directory.path().to_path_buf()),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect_err("legacy index needs rebuild");
+        assert!(error.message().contains("rebuild the index"));
+
         service
             .index(
                 &models,
@@ -1090,22 +1259,16 @@ mod tests {
                 },
             )
             .await
-            .expect("rebuild preserves configured roots and model runtime");
+            .expect("rebuild preserves discovery and model runtime");
         let rebuilt = super::read_workspace_manifest(&info.home)
             .expect("manifest read")
             .expect("manifest");
-        assert_eq!(rebuilt.root_paths, manifest.root_paths);
+        assert_eq!(rebuilt.root, manifest.root);
+        assert_eq!(rebuilt.discovery, manifest.discovery);
         assert_eq!(rebuilt.embedding_runtime, manifest.embedding_runtime);
         assert_eq!(rebuilt.generation, Some(1));
 
-        assert!(
-            service
-                .drop_index(&InfoOptions {
-                    root: Some(directory.path().to_path_buf()),
-                    include_status: false,
-                })
-                .expect("drop index")
-        );
+        assert!(service.drop_index(&info_options).expect("drop index"));
         assert!(!factory.exists.load(Ordering::Acquire));
         models.close();
     }

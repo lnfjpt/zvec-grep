@@ -5,7 +5,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use zvec_rust::{
     Collection, CollectionOptions, CollectionSchema, DataType, Doc, FieldSchema, Fts, IndexParams,
     MetricType, SearchQuery,
@@ -25,6 +24,7 @@ use crate::{
         validate_fragments,
     },
     models::EmbeddingMetric,
+    utils::sha256_hex_parts,
 };
 
 const WRITE_BATCH: usize = 1024;
@@ -43,6 +43,7 @@ impl NativeStore {
     pub(super) fn open(
         path: &Path,
         embedding: &WorkspaceIndexEmbeddingSchema,
+        dictionary_cache: &Path,
         read_only: bool,
     ) -> EngineResult<Self> {
         let dimension = u32::try_from(embedding.dimension)
@@ -53,8 +54,7 @@ impl NativeStore {
                     "storage embedding dimension must be between 1 and 20,000",
                 )
             })?;
-        let dictionary = path.join("dictionary");
-        let dictionary = native_path(&dictionary)?;
+        let dictionary = native_path(dictionary_cache)?;
         let params = serde_json::json!({"jieba_dict_dir": dictionary}).to_string();
         let files = open_collection(&path.join("files"), &files_schema()?, read_only)?;
         let entities = open_collection(&path.join("entities"), &entities_schema()?, read_only)?;
@@ -819,11 +819,7 @@ fn symbol_type_name(value: SymbolType) -> &'static str {
 }
 
 fn primary_key(namespace: &str, value: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(namespace.as_bytes());
-    digest.update([0]);
-    digest.update(value.as_bytes());
-    hex::encode(digest.finalize())
+    sha256_hex_parts([namespace.as_bytes(), b"\0", value.as_bytes()])
 }
 
 fn doc_key(doc: &Doc) -> EngineResult<&str> {

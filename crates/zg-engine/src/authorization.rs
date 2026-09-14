@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Resolved destination and source roots disclosed before an index operation.
+/// Resolved workspace and destination disclosed before an index operation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IndexAuthorization {
     pub root: PathBuf,
@@ -75,12 +75,7 @@ pub fn index_authorization(
         Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
         None => url.host_str().unwrap_or_default().to_owned(),
     };
-    // Resolve source roots through the same path selection used by indexing.
-    let workspace_roots =
-        crate::indexing::service::resolve_root_paths(&root, existing.as_ref(), options)
-            .into_iter()
-            .map(|source| source.path)
-            .collect();
+    let workspace_roots = vec![root.clone()];
     Ok(Some(IndexAuthorization {
         root,
         workspace_roots,
@@ -269,6 +264,7 @@ fn signing_key(create: bool) -> Result<Vec<u8>, EngineError> {
         {
             return Err(io(error));
         }
+        sync_directory(parent)?;
     }
     let key = fs::read(path).map_err(io)?;
     if key.len() < 32 {
@@ -449,11 +445,12 @@ pub fn status(root: &Path) -> Result<String, EngineError> {
 /// Removes workspace consent. Repeated revocations are harmless.
 ///
 /// # Errors
-/// Returns an error when the authorization file cannot be removed.
+/// Returns an error when the authorization file cannot be removed or its deletion synced.
 pub fn revoke(root: &Path) -> Result<String, EngineError> {
     let root = root_path(root)?;
-    match fs::remove_file(root.join(".zvec-grep/authorization.json")) {
-        Ok(()) => {}
+    let home = root.join(".zvec-grep");
+    match fs::remove_file(home.join("authorization.json")) {
+        Ok(()) => sync_directory(&home)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(io(e)),
     }
@@ -487,7 +484,7 @@ mod tests {
     use super::*;
     use crate::api::index::{
         IndexOptions,
-        options::{Device, DiscoveryOptions, EmbeddingModelSpec, RootPath},
+        options::{Device, EmbeddingModelSpec},
     };
 
     #[tokio::test]
@@ -574,11 +571,6 @@ mod tests {
         let directory = tempfile::tempdir().expect("workspace");
         let mut options = IndexOptions {
             root: Some(directory.path().into()),
-            roots: vec![RootPath {
-                path: "docs".into(),
-                recursive: true,
-                discovery: DiscoveryOptions::default(),
-            }],
             embedding: Some(EmbeddingModelSpec {
                 reference: "qwen/text-embedding-v4".into(),
                 revision: None,
@@ -592,7 +584,7 @@ mod tests {
             .expect("plan")
             .expect("remote consent");
         assert_eq!(target.endpoint_host, "provider.test:8443");
-        assert_eq!(target.workspace_roots, vec![target.root.join("docs")]);
+        assert_eq!(target.workspace_roots, vec![target.root.clone()]);
         assert_eq!(target.model, "qwen/text-embedding-v4");
         assert!(!directory.path().join(".zvec-grep").exists());
         options.endpoint = Some("https://override.test/embeddings".into());

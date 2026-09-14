@@ -27,7 +27,7 @@ use tokenizers::{
 use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::index::options::Device;
+use crate::{api::index::options::Device, models::artifacts::publish_downloaded_file};
 
 use super::{
     catalog::TransformersConfig,
@@ -336,13 +336,14 @@ impl TransformersEmbeddingModel {
         file.flush().await.map_err(|error| {
             ModelError::storage_failure("Unable to flush Transformers artifact").with_cause(error)
         })?;
+        drop(file);
         if !usable_file(&partial).await {
             let _ = fs::remove_file(&partial).await;
             return Err(ModelError::storage_failure(
                 "Downloaded model artifact is empty",
             ));
         }
-        if let Err(error) = fs::rename(&partial, destination).await {
+        if let Err(error) = publish_downloaded_file(&partial, destination).await {
             let _ = fs::remove_file(&partial).await;
             return Err(
                 ModelError::storage_failure("Unable to publish Transformers artifact")

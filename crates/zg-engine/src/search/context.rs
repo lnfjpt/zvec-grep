@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, fs, path::Path};
 
 use crate::{
     EngineError,
@@ -181,6 +177,7 @@ pub(crate) async fn context_from_index(
     for group in &groups {
         searches.push(
             search_workspace_index(
+                &workspace_index.root,
                 SearchPlan {
                     routes: group.routes.clone(),
                     limit: Some(limit),
@@ -222,7 +219,7 @@ fn build_context_result(
     let group_items = searches
         .iter()
         .zip(groups)
-        .map(|(search, group)| search_plan_to_context_items(search, root, group))
+        .map(|(search, group)| search_plan_to_context_items(search, &workspace_index.root, group))
         .collect::<Vec<_>>();
     let coverage_groups = groups
         .iter()
@@ -305,7 +302,7 @@ fn context_group_limit(limit: Option<usize>, group_count: usize) -> usize {
 
 fn search_plan_to_context_items(
     result: &SearchPlanResult,
-    root: &Path,
+    workspace_root: &Path,
     group: &NormalizedContextGroup,
 ) -> Vec<ContextItem> {
     result
@@ -316,14 +313,14 @@ fn search_plan_to_context_items(
             ContextItem {
                 kind: ContextItemKind::IndexedEntity,
                 rank: hit.rank,
-                absolute_path: hit.file.source.absolute_path.clone(),
-                relative_path: display_relative_path(root, &hit.file),
+                absolute_path: workspace_root.join(&hit.file.source.relative_path),
+                relative_path: hit.file.source.relative_path.clone(),
                 range: hit.entity.range.into(),
                 excerpt_range: target.excerpt_range,
                 content: target.content,
                 content_role: Some(target.content_role),
                 outline: target.outline,
-                status: file_freshness_status(&hit.file),
+                status: file_freshness_status(workspace_root, &hit.file),
                 score: Some(hit.score),
                 matched_by: hit.matched_by,
                 metadata: hit.entity.metadata.as_ref().map(Into::into),
@@ -342,17 +339,6 @@ fn search_plan_to_context_items(
             }
         })
         .collect()
-}
-
-fn display_relative_path(root: &Path, file: &StoredFile) -> PathBuf {
-    if file.source.relative_path.as_os_str().is_empty() {
-        file.source
-            .absolute_path
-            .strip_prefix(root)
-            .map_or_else(|_| file.source.absolute_path.clone(), Path::to_path_buf)
-    } else {
-        file.source.relative_path.clone()
-    }
 }
 
 fn select_and_rank_context_items(
@@ -556,7 +542,7 @@ fn context_item_target(hit: &SearchHit) -> ContextItemTarget {
     }
 }
 
-fn file_freshness_status(file: &StoredFile) -> ContextItemStatus {
+fn file_freshness_status(workspace_root: &Path, file: &StoredFile) -> ContextItemStatus {
     let Some(indexed) = file
         .index_status
         .as_ref()
@@ -564,7 +550,8 @@ fn file_freshness_status(file: &StoredFile) -> ContextItemStatus {
     else {
         return ContextItemStatus::PossiblyStale;
     };
-    let Ok(metadata) = fs::metadata(&file.source.absolute_path) else {
+    let absolute_path = workspace_root.join(&file.source.relative_path);
+    let Ok(metadata) = fs::metadata(&absolute_path) else {
         return ContextItemStatus::PossiblyStale;
     };
     if !metadata.is_file() {
@@ -579,7 +566,7 @@ fn file_freshness_status(file: &StoredFile) -> ContextItemStatus {
         return ContextItemStatus::Fresh;
     }
     if let Some(expected) = &file.source.snapshot.content_hash
-        && fs::read(&file.source.absolute_path).is_ok_and(|bytes| sha256_hex(&bytes) == *expected)
+        && fs::read(&absolute_path).is_ok_and(|bytes| sha256_hex(&bytes) == *expected)
     {
         return ContextItemStatus::Fresh;
     }
@@ -710,9 +697,7 @@ mod tests {
             file: StoredFile {
                 source: SourceFile {
                     id: file_id.clone(),
-                    absolute_path: PathBuf::from("/workspace/file.txt"),
                     relative_path: PathBuf::from("file.txt"),
-                    root_path: PathBuf::from("/workspace"),
                     formats: vec![FileFormat::Text],
                     snapshot: FileSnapshot {
                         size_bytes: 100,
@@ -755,6 +740,125 @@ mod tests {
         assert_eq!(target.content, "Exact source");
         assert_eq!(target.outline.as_deref(), Some("Function outline"));
         assert_eq!(target.excerpt_range, Some(window_range.into()));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The complete fixture keeps relocation, subdirectory lookup, and freshness checks in one scenario"
+    )]
+    fn resolves_context_paths_and_freshness_after_workspace_relocation() {
+        use crate::{
+            api::{
+                index::options::DiscoveryOptions,
+                info::result::{WorkspaceIndexInfo, WorkspaceIndexPolicy},
+            },
+            domain::{
+                Content, Entity, EntityContent, EntityId, FileFormat, FileId, FileSnapshot,
+                SourceFile, SourceRange, TextRange,
+            },
+            search::pipeline::{SearchHit, SearchPlanResult},
+            storage::spi::{FileIndexStatus, StoredFile},
+            utils::sha256_hex,
+        };
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let original_root = directory.path().join("original");
+        let moved_root = directory.path().join("moved");
+        std::fs::create_dir_all(original_root.join("src")).expect("source directory");
+        let content = "source contents";
+        std::fs::write(original_root.join("src/file.txt"), content).expect("source file");
+        let source = SourceFile {
+            id: FileId::for_path("workspace", std::path::Path::new("src/file.txt"))
+                .expect("file id"),
+            relative_path: PathBuf::from("src/file.txt"),
+            formats: vec![FileFormat::Text],
+            snapshot: FileSnapshot {
+                size_bytes: content.len() as u64,
+                modified_epoch_ms: None,
+                content_hash: Some(sha256_hex(content.as_bytes())),
+            },
+        };
+        let file = StoredFile {
+            source: source.clone(),
+            index_status: Some(FileIndexStatus {
+                indexed_epoch_ms: Some(0),
+                entity_count: 1,
+                token_count: None,
+                truncated_fragment_count: None,
+                error: None,
+            }),
+        };
+        let search = SearchPlanResult {
+            routes: Vec::new(),
+            hits: vec![SearchHit {
+                entity: Entity {
+                    id: EntityId::new("entity").expect("entity id"),
+                    file_id: source.id.clone(),
+                    range: SourceRange::Text(
+                        TextRange::from_coordinates(0, content.len(), 1, 1, 0, content.len())
+                            .expect("range"),
+                    ),
+                    content: EntityContent::Source(vec![Content::Text(content.to_owned())]),
+                    metadata: None,
+                },
+                file: file.clone(),
+                evidence: Vec::new(),
+                rank: 1,
+                score: 1.0,
+                matched_by: MatchedBy::Fts,
+                trace: None,
+            }],
+            timings: Vec::new(),
+        };
+        let request = normalize_context_request(&ContextOptions {
+            query: Some("source".to_owned()),
+            ..ContextOptions::default()
+        })
+        .expect("request");
+        let mut index = WorkspaceIndexInfo {
+            id: "workspace".to_owned(),
+            name: "workspace".to_owned(),
+            path: directory.path().join("index"),
+            root: original_root.clone(),
+            discovery: DiscoveryOptions::default(),
+            policy: WorkspaceIndexPolicy::Enabled,
+            embedding: None,
+            index_version: None,
+            generation: None,
+            created_epoch_ms: 0,
+            updated_epoch_ms: 0,
+        };
+
+        for root in [&original_root, &moved_root] {
+            if root == &moved_root {
+                std::fs::rename(&original_root, &moved_root).expect("move workspace");
+                index.root = moved_root.clone();
+            }
+            // The request may start in a subdirectory; source paths retain the workspace base.
+            let requested_root = root.join("src");
+            let result = super::build_context_result(
+                &requested_root,
+                &index,
+                &request,
+                &request.groups,
+                vec![search.clone()],
+            );
+            assert_eq!(result.root, requested_root);
+            assert_eq!(result.items[0].absolute_path, root.join("src/file.txt"));
+            assert_eq!(result.items[0].relative_path, PathBuf::from("src/file.txt"));
+            assert_eq!(result.items[0].status, ContextItemStatus::Fresh);
+        }
+        assert_eq!(
+            super::file_freshness_status(&original_root, &file),
+            ContextItemStatus::PossiblyStale
+        );
+        std::fs::write(moved_root.join("src/file.txt"), "changed contents")
+            .expect("change moved source");
+        assert_eq!(
+            super::file_freshness_status(&moved_root, &file),
+            ContextItemStatus::PossiblyStale
+        );
     }
 
     #[test]

@@ -1,7 +1,15 @@
 use sha2::{Digest, Sha256};
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    sha256_hex_parts([bytes])
+}
+
+pub(crate) fn sha256_hex_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update(part);
+    }
+    hex::encode(digest.finalize())
 }
 
 #[cfg(test)]

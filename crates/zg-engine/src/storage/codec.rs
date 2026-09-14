@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 // Nested tables add several JSON containers; keep records below serde's recursion limit.
 const MAX_TABLE_DEPTH: usize = 16;
 
@@ -81,9 +81,7 @@ struct Record<T> {
 #[derive(Serialize, Deserialize)]
 struct FileRecord<'a> {
     id: Cow<'a, str>,
-    absolute_path: PathRecord,
     relative_path: PathRecord,
-    root_path: PathRecord,
     formats: Vec<u16>,
     snapshot: SnapshotRecord<'a>,
 }
@@ -99,9 +97,7 @@ impl<'a> FileRecord<'a> {
     fn from_file(file: &'a SourceFile) -> EngineResult<Self> {
         Ok(Self {
             id: file.id.as_str().into(),
-            absolute_path: PathRecord::from_path(&file.absolute_path)?,
             relative_path: PathRecord::from_path(&file.relative_path)?,
-            root_path: PathRecord::from_path(&file.root_path)?,
             formats: file.formats.iter().map(|format| *format as u16).collect(),
             snapshot: SnapshotRecord {
                 size_bytes: file.snapshot.size_bytes,
@@ -114,9 +110,7 @@ impl<'a> FileRecord<'a> {
     fn into_file(self) -> EngineResult<SourceFile> {
         let file = SourceFile {
             id: FileId::new(self.id.into_owned())?,
-            absolute_path: self.absolute_path.into_path()?,
             relative_path: self.relative_path.into_path()?,
-            root_path: self.root_path.into_path()?,
             formats: self
                 .formats
                 .into_iter()
@@ -129,9 +123,6 @@ impl<'a> FileRecord<'a> {
             },
         };
         file.validate()?;
-        for path in [&file.absolute_path, &file.relative_path, &file.root_path] {
-            validate_path(path)?;
-        }
         Ok(file)
     }
 }
@@ -735,12 +726,9 @@ mod tests {
     use super::*;
 
     fn file() -> SourceFile {
-        let root = std::env::current_dir().expect("current directory");
         SourceFile {
             id: FileId::new("source").expect("file ID"),
-            absolute_path: root.join("nested/tsconfig.json"),
             relative_path: PathBuf::from("nested/tsconfig.json"),
-            root_path: root,
             formats: vec![FileFormat::Json, FileFormat::TypeScript],
             snapshot: FileSnapshot {
                 size_bytes: 123,
@@ -822,9 +810,19 @@ mod tests {
         let mut source = file();
         let encoded = encode_file(&source).expect("encode source");
         let record: Value = serde_json::from_str(&encoded).expect("JSON record");
+        assert_eq!(record["version"], 4);
         assert_eq!(
-            record["value"]["formats"],
-            json!([FileFormat::Json as u16, FileFormat::TypeScript as u16])
+            record["value"],
+            json!({
+                "id": "source",
+                "relative_path": {"encoding": "utf8", "value": "nested/tsconfig.json"},
+                "formats": [FileFormat::Json as u16, FileFormat::TypeScript as u16],
+                "snapshot": {
+                    "size_bytes": 123,
+                    "modified_epoch_ms": 456,
+                    "content_hash": "content-hash",
+                },
+            })
         );
         assert_eq!(decode_file(&encoded).expect("decode source"), source);
 
@@ -839,7 +837,6 @@ mod tests {
             source.relative_path =
                 std::ffi::OsString::from_wide(&[0x0066, 0xd800, 0x002e, 0x0072, 0x0073]).into();
         }
-        source.absolute_path = source.root_path.join(&source.relative_path);
         let encoded = encode_file(&source).expect("encode native path");
         assert_eq!(decode_file(&encoded).expect("decode native path"), source);
     }
@@ -863,7 +860,7 @@ mod tests {
             encoded["value"]["value"]["content"]["value"][1]["value"]["data"],
             "AAH/"
         );
-        assert_eq!(encoded["version"], 3);
+        assert_eq!(encoded["version"], 4);
         let ranges = [
             (SourceRange::File, json!({"kind": "file"})),
             (
@@ -980,7 +977,7 @@ mod tests {
             serde_json::from_str(&encode_fragment(&fragment()).expect("encode fragment"))
                 .expect("fragment JSON");
         for (kind, record) in [("source file", file_record), ("fragment", original.clone())] {
-            for version in [1, 2] {
+            for version in [1, 2, 3] {
                 let mut record = record.clone();
                 record["version"] = json!(version);
                 if kind == "fragment" {

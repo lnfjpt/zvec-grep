@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     EngineError,
     api::{
-        index::options::{Device, DiscoveryOptions, RootPath},
+        index::options::{Device, DiscoveryOptions},
         info::result::{WorkspaceIndexEmbedding, WorkspaceIndexInfo, WorkspaceIndexPolicy},
     },
     utils::{atomic_write, sync_directory},
 };
 
 pub(crate) const WORKSPACE_MANIFEST_FILE: &str = "manifest.json";
-pub(crate) const CURRENT_MANIFEST_VERSION: u32 = 1;
+pub(crate) const CURRENT_MANIFEST_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,13 +31,14 @@ pub(crate) struct EmbeddingRuntimeConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "ManifestInput")]
 pub(crate) struct WorkspaceManifest {
     pub manifest_version: u32,
     pub id: String,
     pub name: String,
     pub path: PathBuf,
-    pub root_paths: Vec<ManifestRootPath>,
+    pub root: PathBuf,
+    pub discovery: ManifestDiscovery,
     pub index_policy: WorkspaceIndexPolicy,
     pub embedding: Option<WorkspaceIndexEmbedding>,
     pub index_version: Option<u32>,
@@ -48,15 +49,80 @@ pub(crate) struct WorkspaceManifest {
     pub embedding_runtime: EmbeddingRuntimeConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// Read legacy rootPaths without requiring the new fields, so an older index can
+// still supply its embedding and discovery settings to an explicit rebuild.
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "this persisted DTO mirrors main's root discovery schema"
-)]
-pub(crate) struct ManifestRootPath {
-    pub absolute_path: PathBuf,
-    pub recursive: bool,
+struct ManifestInput {
+    manifest_version: u32,
+    id: String,
+    name: String,
+    path: PathBuf,
+    root: Option<PathBuf>,
+    #[serde(default)]
+    discovery: ManifestDiscovery,
+    root_paths: Option<Vec<LegacyRootPath>>,
+    index_policy: WorkspaceIndexPolicy,
+    embedding: Option<WorkspaceIndexEmbedding>,
+    index_version: Option<u32>,
+    generation: Option<u64>,
+    created_time: u64,
+    updated_time: u64,
+    embedding_runtime: EmbeddingRuntimeConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyRootPath {
+    absolute_path: PathBuf,
+    recursive: bool,
+    #[serde(flatten)]
+    discovery: ManifestDiscovery,
+}
+
+impl TryFrom<ManifestInput> for WorkspaceManifest {
+    type Error = String;
+
+    fn try_from(input: ManifestInput) -> Result<Self, Self::Error> {
+        let (root, discovery) = match (input.root, input.root_paths) {
+            (Some(root), None) => (root, input.discovery),
+            (None, Some(mut roots)) => {
+                if roots.len() != 1 {
+                    return Err("legacy rootPaths must contain exactly one workspace root; multiple-root workspaces are unsupported".into());
+                }
+                let mut root = roots.remove(0);
+                if input.path.parent() != Some(root.absolute_path.as_path()) {
+                    return Err("legacy source root differs from the workspace directory; recreate the index with one workspace root".into());
+                }
+                if !root.recursive {
+                    root.discovery.max_depth = Some(root.discovery.max_depth.unwrap_or(1).min(1));
+                }
+                (root.absolute_path, root.discovery)
+            }
+            (Some(_), Some(_)) => return Err("specify root or legacy rootPaths, not both".into()),
+            (None, None) => return Err("workspace root is missing".into()),
+        };
+        Ok(Self {
+            manifest_version: input.manifest_version,
+            id: input.id,
+            name: input.name,
+            path: input.path,
+            root,
+            discovery,
+            index_policy: input.index_policy,
+            embedding: input.embedding,
+            index_version: input.index_version,
+            generation: input.generation,
+            created_time: input.created_time,
+            updated_time: input.updated_time,
+            embedding_runtime: input.embedding_runtime,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManifestDiscovery {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -93,7 +159,8 @@ impl WorkspaceManifest {
             id: info.id,
             name: info.name,
             path: info.path,
-            root_paths: info.roots.into_iter().map(Into::into).collect(),
+            root: info.root,
+            discovery: info.discovery.into(),
             index_policy: info.policy,
             embedding: info.embedding,
             index_version: info.index_version,
@@ -111,7 +178,8 @@ impl WorkspaceManifest {
             id: self.id.clone(),
             name: self.name.clone(),
             path: self.path.clone(),
-            roots: self.root_paths.iter().cloned().map(Into::into).collect(),
+            root: self.root.clone(),
+            discovery: self.discovery.clone().into(),
             policy: self.index_policy,
             embedding: self.embedding.clone(),
             index_version: self.index_version,
@@ -122,7 +190,7 @@ impl WorkspaceManifest {
     }
 
     fn validate(&self) -> Result<(), EngineError> {
-        if self.manifest_version != CURRENT_MANIFEST_VERSION {
+        if !matches!(self.manifest_version, 1 | CURRENT_MANIFEST_VERSION) {
             return Err(invalid_manifest(format!(
                 "unsupported manifestVersion {}",
                 self.manifest_version
@@ -131,15 +199,8 @@ impl WorkspaceManifest {
         if self.id.is_empty() || self.name.is_empty() || self.path.as_os_str().is_empty() {
             return Err(invalid_manifest("id, name, and path must be non-empty"));
         }
-        if self.root_paths.is_empty()
-            || self
-                .root_paths
-                .iter()
-                .any(|root| root.absolute_path.as_os_str().is_empty())
-        {
-            return Err(invalid_manifest(
-                "rootPaths must contain non-empty absolutePath values",
-            ));
+        if !self.root.is_absolute() {
+            return Err(invalid_manifest("root must be an absolute workspace path"));
         }
         if self.index_policy == WorkspaceIndexPolicy::Undecided {
             return Err(invalid_manifest("indexPolicy must be enabled or disabled"));
@@ -156,12 +217,9 @@ impl WorkspaceManifest {
     }
 }
 
-impl From<RootPath> for ManifestRootPath {
-    fn from(root: RootPath) -> Self {
-        let discovery = root.discovery;
+impl From<DiscoveryOptions> for ManifestDiscovery {
+    fn from(discovery: DiscoveryOptions) -> Self {
         Self {
-            absolute_path: root.path,
-            recursive: root.recursive,
             include: discovery.include_paths,
             exclude: discovery.exclude_paths,
             globs: discovery.globs,
@@ -178,25 +236,21 @@ impl From<RootPath> for ManifestRootPath {
     }
 }
 
-impl From<ManifestRootPath> for RootPath {
-    fn from(root: ManifestRootPath) -> Self {
+impl From<ManifestDiscovery> for DiscoveryOptions {
+    fn from(discovery: ManifestDiscovery) -> Self {
         Self {
-            path: root.absolute_path,
-            recursive: root.recursive,
-            discovery: DiscoveryOptions {
-                include_paths: root.include,
-                exclude_paths: root.exclude,
-                globs: root.globs,
-                insensitive_globs: root.insensitive_globs,
-                file_types: root.file_types,
-                excluded_file_types: root.excluded_file_types,
-                hidden: root.hidden,
-                no_ignore: root.no_ignore,
-                ignore_files: root.ignore_files,
-                max_depth: root.max_depth,
-                max_file_size_bytes: root.max_file_size_bytes,
-                follow: root.follow,
-            },
+            include_paths: discovery.include,
+            exclude_paths: discovery.exclude,
+            globs: discovery.globs,
+            insensitive_globs: discovery.insensitive_globs,
+            file_types: discovery.file_types,
+            excluded_file_types: discovery.excluded_file_types,
+            hidden: discovery.hidden,
+            no_ignore: discovery.no_ignore,
+            ignore_files: discovery.ignore_files,
+            max_depth: discovery.max_depth,
+            max_file_size_bytes: discovery.max_file_size_bytes,
+            follow: discovery.follow,
         }
     }
 }
@@ -214,9 +268,18 @@ pub(crate) fn read_workspace_manifest(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(manifest_io("read", &path, &error)),
     };
-    let manifest: WorkspaceManifest = serde_json::from_str(&text)
+    let mut manifest: WorkspaceManifest = serde_json::from_str(&text)
         .map_err(|error| invalid_manifest(format!("path={} cause={error}", path.display())))?;
     manifest.validate()?;
+    // The directory containing the manifest defines the workspace location.
+    // Persisted absolute paths may refer to where the workspace lived before a move.
+    manifest.path = std::path::absolute(home)
+        .map_err(|error| manifest_io("resolve directory for", home, &error))?;
+    manifest.root = manifest
+        .path
+        .parent()
+        .ok_or_else(|| invalid_manifest("workspace home has no parent directory"))?
+        .to_path_buf();
     Ok(Some(manifest))
 }
 
@@ -252,7 +315,7 @@ pub(crate) fn write_workspace_manifest(
 pub(crate) fn delete_workspace_manifest(home: &Path) -> Result<(), EngineError> {
     let path = workspace_manifest_path(home);
     match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_directory(home),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(manifest_io("delete", &path, &error)),
     }
@@ -294,15 +357,12 @@ mod tests {
                 id: "workspace-id".to_owned(),
                 name: "fixture".to_owned(),
                 path: home.to_path_buf(),
-                roots: vec![RootPath {
-                    path: home.parent().expect("workspace root").to_path_buf(),
-                    recursive: true,
-                    discovery: DiscoveryOptions {
-                        globs: vec!["*.rs".to_owned()],
-                        hidden: true,
-                        ..DiscoveryOptions::default()
-                    },
-                }],
+                root: home.parent().expect("workspace root").to_path_buf(),
+                discovery: DiscoveryOptions {
+                    globs: vec!["*.rs".to_owned()],
+                    hidden: true,
+                    ..DiscoveryOptions::default()
+                },
                 policy: WorkspaceIndexPolicy::Enabled,
                 embedding: Some(WorkspaceIndexEmbedding {
                     provider: "local".to_owned(),
@@ -325,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_and_reads_the_main_manifest_schema() {
+    fn writes_and_reads_a_single_workspace_root() {
         let directory = tempdir().expect("temporary directory");
         let home = directory.path().join(".zvec-grep");
         let manifest = fixture_manifest(&home);
@@ -334,12 +394,10 @@ mod tests {
         let text = fs::read_to_string(workspace_manifest_path(&home)).expect("manifest text");
         let json: serde_json::Value = serde_json::from_str(&text).expect("manifest json");
 
-        assert_eq!(json["manifestVersion"], 1);
-        assert_eq!(
-            json["rootPaths"][0]["absolutePath"],
-            directory.path().to_string_lossy().as_ref()
-        );
-        assert_eq!(json["rootPaths"][0]["globs"][0], "*.rs");
+        assert_eq!(json["manifestVersion"], CURRENT_MANIFEST_VERSION);
+        assert!(json.get("rootPaths").is_none());
+        assert_eq!(json["root"], directory.path().to_string_lossy().as_ref());
+        assert_eq!(json["discovery"]["globs"][0], "*.rs");
         assert_eq!(json["embeddingRuntime"]["device"], "cpu");
         assert_eq!(json["generation"], 7);
         assert_eq!(
@@ -366,20 +424,99 @@ mod tests {
     }
 
     #[test]
+    fn legacy_single_root_keeps_metadata_available_for_rebuild() {
+        let directory = tempdir().expect("temporary directory");
+        let home = directory.path().join(".zvec-grep");
+        let mut manifest = fixture_manifest(&home);
+        manifest.manifest_version = 1;
+        let mut json = serde_json::to_value(&manifest).expect("manifest json");
+        let root = json
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("root")
+            .expect("root");
+        let mut discovery = json
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("discovery")
+            .expect("discovery");
+        discovery["absolutePath"] = root;
+        discovery["recursive"] = true.into();
+        json["rootPaths"] = serde_json::json!([discovery.clone()]);
+        fs::create_dir(&home).expect("workspace home");
+        fs::write(
+            workspace_manifest_path(&home),
+            serde_json::to_vec(&json).expect("legacy json"),
+        )
+        .expect("legacy manifest");
+        let legacy = read_workspace_manifest(&home)
+            .expect("legacy read")
+            .expect("manifest");
+        assert_eq!(legacy, manifest);
+
+        let mut subtree = json.clone();
+        subtree["rootPaths"][0]["absolutePath"] = serde_json::json!(directory.path().join("src"));
+        let error = serde_json::from_value::<WorkspaceManifest>(subtree)
+            .expect_err("legacy source scope cannot be widened to the workspace");
+        assert!(error.to_string().contains("legacy source root differs"));
+
+        let mut shallow = json.clone();
+        shallow["rootPaths"][0]["recursive"] = false.into();
+        let shallow: WorkspaceManifest =
+            serde_json::from_value(shallow).expect("nonrecursive legacy workspace");
+        assert_eq!(shallow.discovery.max_depth, Some(1));
+
+        json["rootPaths"] = serde_json::json!([discovery.clone(), discovery]);
+        fs::write(
+            workspace_manifest_path(&home),
+            serde_json::to_vec(&json).expect("legacy json"),
+        )
+        .expect("multiple legacy roots");
+        let error = read_workspace_manifest(&home).expect_err("multiple roots are unsupported");
+        assert!(error.message().contains("exactly one workspace root"));
+    }
+
+    #[test]
+    fn reading_a_moved_workspace_rebases_only_its_location() {
+        let directory = tempdir().expect("temporary directory");
+        let original = directory.path().join("original");
+        let moved = directory.path().join("moved");
+        fs::create_dir(&original).expect("original workspace");
+        let mut manifest = fixture_manifest(&original.join(".zvec-grep"));
+        write_workspace_manifest(&manifest.path, &manifest).expect("original manifest");
+        fs::rename(&original, &moved).expect("move workspace");
+        let relocated = read_workspace_manifest(&moved.join(".zvec-grep"))
+            .expect("relocated manifest read")
+            .expect("manifest");
+        manifest.root = moved.clone();
+        manifest.path = moved.join(".zvec-grep");
+        assert_eq!(relocated, manifest);
+    }
+
+    #[test]
     fn rejects_invalid_or_unsupported_manifests() {
         let directory = tempdir().expect("temporary directory");
         let home = directory.path().join(".zvec-grep");
         fs::create_dir_all(&home).expect("workspace home");
         fs::write(workspace_manifest_path(&home), r#"{"manifestVersion":2}"#)
             .expect("invalid manifest");
-
         assert!(read_workspace_manifest(&home).is_err());
+        let mut unsupported = fixture_manifest(&home);
+        unsupported.manifest_version = CURRENT_MANIFEST_VERSION + 1;
+        fs::write(
+            workspace_manifest_path(&home),
+            serde_json::to_vec(&unsupported).expect("unsupported manifest json"),
+        )
+        .expect("unsupported manifest");
+        let error = read_workspace_manifest(&home).expect_err("unsupported manifest version");
+        assert!(error.message().contains("unsupported manifestVersion"));
     }
 
     #[test]
     fn deleting_a_missing_manifest_is_idempotent() {
         let directory = tempdir().expect("temporary directory");
         assert!(delete_workspace_manifest(directory.path()).is_ok());
+        assert!(delete_workspace_manifest(&directory.path().join("missing")).is_ok());
     }
 
     #[cfg(unix)]

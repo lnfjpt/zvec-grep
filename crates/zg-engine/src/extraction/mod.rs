@@ -1,5 +1,6 @@
 //! Deterministic source extraction used by the indexing and lexical-enrichment paths.
 
+mod chunking;
 mod code;
 mod image;
 mod markdown;

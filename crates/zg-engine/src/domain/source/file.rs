@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use crate::{EngineError, EngineResult};
+use crate::{EngineError, EngineResult, utils::sha256_hex_parts};
 
 use super::format::{FileCategory, FileFormat};
 
@@ -20,6 +20,23 @@ impl FileId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// File identity is scoped to the workspace, independent of its current root directory.
+    pub(crate) fn for_path(workspace_id: &str, relative_path: &Path) -> EngineResult<Self> {
+        if workspace_id.trim().is_empty() {
+            return Err(EngineError::invalid_argument(
+                "workspace id must not be blank",
+            ));
+        }
+        validate_relative_path(relative_path)?;
+        // Components remove redundant separators and interior `.` segments before hashing.
+        let relative_path: PathBuf = relative_path.components().collect();
+        Ok(Self(sha256_hex_parts([
+            workspace_id.as_bytes(),
+            b"\0",
+            relative_path.as_os_str().as_encoded_bytes(),
+        ])))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,13 +46,11 @@ pub(crate) struct FileSnapshot {
     pub content_hash: Option<String>,
 }
 
-/// Describes the original file and its last observed state.
+/// Describes a file relative to its workspace's sole root and its last observed state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceFile {
     pub id: FileId,
-    pub absolute_path: PathBuf,
     pub relative_path: PathBuf,
-    pub root_path: PathBuf,
     pub formats: Vec<FileFormat>,
     pub snapshot: FileSnapshot,
 }
@@ -49,31 +64,7 @@ impl SourceFile {
 
     #[track_caller]
     pub(crate) fn validate(&self) -> EngineResult<()> {
-        if !self.absolute_path.is_absolute() || !self.root_path.is_absolute() {
-            return Err(EngineError::invalid_argument(
-                "source file and root paths must be absolute",
-            ));
-        }
-        if self.relative_path.as_os_str().is_empty()
-            || self
-                .relative_path
-                .components()
-                .any(|part| !matches!(part, Component::Normal(_)))
-        {
-            return Err(EngineError::invalid_argument(
-                "source relative path must stay within its root",
-            ));
-        }
-        let expected = if self.root_path == self.absolute_path {
-            self.root_path.file_name().map(Path::new)
-        } else {
-            self.absolute_path.strip_prefix(&self.root_path).ok()
-        };
-        if expected != Some(self.relative_path.as_path()) {
-            return Err(EngineError::invalid_argument(
-                "source paths do not identify the same file",
-            ));
-        }
+        validate_relative_path(&self.relative_path)?;
         if self.formats.is_empty()
             || (self.formats.len() > 1 && self.formats.contains(&FileFormat::Unknown))
             || self
@@ -88,6 +79,24 @@ impl SourceFile {
         }
         Ok(())
     }
+}
+
+fn validate_relative_path(path: &Path) -> EngineResult<()> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(EngineError::invalid_argument(
+            "source relative path must stay within its workspace root",
+        ));
+    }
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(EngineError::invalid_argument(
+            "source file path must not contain NUL",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -107,12 +116,9 @@ mod tests {
 
     #[test]
     fn validates_paths_and_format_sets_without_reading_the_file() {
-        let root = std::env::current_dir().expect("current directory");
         let file = SourceFile {
             id: FileId::new("file").expect("id"),
-            absolute_path: root.join("nested/fixture.rs"),
             relative_path: PathBuf::from("nested/fixture.rs"),
-            root_path: root,
             formats: vec![FileFormat::Rust],
             snapshot: FileSnapshot {
                 size_bytes: 0,
@@ -123,11 +129,15 @@ mod tests {
         file.validate().expect("valid source");
         assert!(file.has_category(FileCategory::Code));
         assert!(!file.has_category(FileCategory::Binary));
-        let mut root_file = file.clone();
-        root_file.root_path = file.absolute_path.clone();
-        root_file.relative_path = PathBuf::from("fixture.rs");
-        root_file.validate().expect("root may be a file");
-        for path in ["", "../fixture.rs", "other.rs"] {
+        for path in [
+            "",
+            ".",
+            "./fixture.rs",
+            "../fixture.rs",
+            "nested/../fixture.rs",
+            "/fixture.rs",
+            "bad\0path",
+        ] {
             let mut invalid = file.clone();
             invalid.relative_path = PathBuf::from(path);
             assert!(invalid.validate().is_err(), "{path}");
@@ -146,5 +156,63 @@ mod tests {
         unknown
             .validate()
             .expect("unknown is a valid classification");
+    }
+
+    #[test]
+    fn file_identity_uses_workspace_and_normalized_relative_path() {
+        let id = FileId::for_path("workspace", Path::new("nested/fixture.rs")).expect("file ID");
+        for path in [
+            "nested/fixture.rs",
+            "nested//fixture.rs",
+            "nested/./fixture.rs",
+        ] {
+            assert_eq!(
+                FileId::for_path("workspace", Path::new(path)).expect("file ID"),
+                id
+            );
+        }
+        assert_ne!(
+            FileId::for_path("other", Path::new("nested/fixture.rs")).expect("other workspace"),
+            id
+        );
+        assert_ne!(
+            FileId::for_path("workspace", Path::new("other.rs")).expect("other file"),
+            id
+        );
+        assert!(FileId::for_path(" ", Path::new("fixture.rs")).is_err());
+        for path in ["", ".", "../fixture.rs", "/fixture.rs", "bad\0path"] {
+            assert!(
+                FileId::for_path("workspace", Path::new(path)).is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_identity_preserves_non_unicode_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let first = Path::new(std::ffi::OsStr::from_bytes(b"file-\xff.rs"));
+        let second = Path::new(std::ffi::OsStr::from_bytes(b"file-\xfe.rs"));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(
+            FileId::for_path("workspace", first).expect("first ID"),
+            FileId::for_path("workspace", second).expect("second ID"),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_identity_preserves_non_unicode_path_units() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let first = PathBuf::from(std::ffi::OsString::from_wide(&[0x0066, 0xd800]));
+        let second = PathBuf::from(std::ffi::OsString::from_wide(&[0x0066, 0xd801]));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(
+            FileId::for_path("workspace", &first).expect("first ID"),
+            FileId::for_path("workspace", &second).expect("second ID"),
+        );
     }
 }

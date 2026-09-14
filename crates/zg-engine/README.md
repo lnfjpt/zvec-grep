@@ -4,6 +4,8 @@
 
 One `ZvecGrep` instance can serve multiple workspaces and reuse embedding models across requests. Each workspace stores its manifest and persistent Zvec index under `.zvec-grep`.
 
+Each workspace has one root directory. Source file records store paths relative to that root; scanning a subdirectory does not change the path base. File IDs depend on the workspace identity and relative path, so moving a workspace together with its `.zvec-grep` directory preserves file identity. Reads resolve absolute paths against the workspace's current location.
+
 ## Usage
 
 ```rust,no_run
@@ -49,7 +51,9 @@ Request and result types live in `api::{index, context, info}`. `EngineError::co
 
 The index keeps files, entities, fragments, and vectors in separate collections. File replacements are journaled before mutation and recovered when the index reopens; reads cannot observe an index awaiting recovery. The versioned storage codec preserves numeric format IDs and encodes image bytes as base64.
 
-The full-text dictionary is bundled as compressed data, checked for integrity, and expanded locally without a download. Files without a supported extractor are skipped; format recognition alone does not imply parsing support.
+Indexes created before the workspace-relative file schema require a rebuild (`IndexOptions::rebuild` or `zg index --rebuild`). Old single-root manifests can still supply embedding and discovery settings for the rebuild.
+
+The full-text dictionary is bundled as compressed data, checked for integrity, and expanded locally without a download. It lives in the shared `~/.zvec-grep/cache/jieba-v1` cache so moving a workspace on the same machine preserves full-text search. `ZVEC_GREP_DICTIONARY_CACHE` can override the cache with an absolute UTF-8 path; changing that path requires rebuilding existing indexes. Files without a supported extractor are skipped; format recognition alone does not imply parsing support.
 
 ## Native runtime
 

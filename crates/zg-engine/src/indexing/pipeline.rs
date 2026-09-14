@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,7 +21,7 @@ use crate::{
     EngineError, ErrorSite,
     api::{
         index::{
-            options::{RootPath, WorkspaceChange},
+            options::WorkspaceChange,
             progress::{
                 IndexEmbeddingProgress, IndexProgress, IndexProgressPhase, IndexProgressReporter,
             },
@@ -206,7 +206,7 @@ pub(crate) async fn get_workspace_index_status(
     let snapshot = scanner
         .discover(
             &ScanRequest {
-                roots: host_roots(&workspace_index.roots),
+                roots: vec![host_root(workspace_index)],
                 scope_paths: Vec::new(),
             },
             &control,
@@ -356,16 +356,16 @@ async fn run_index_pass(
         },
     );
 
-    let scope = ChangeScope::from_changes(&context.workspace_index.roots, context.changes);
+    let scope = ChangeScope::from_changes(&context.workspace_index.root, context.changes)?;
     let all_stored = context.storage.list_files()?;
-    let existing = scope.filter_stored(&all_stored);
+    let existing = scope.filter_stored(&context.workspace_index.root, &all_stored);
     let scan_started = Instant::now();
     let control = task_control(context.signal.clone());
     let snapshot = context
         .scanner
         .discover(
             &ScanRequest {
-                roots: host_roots(&context.workspace_index.roots),
+                roots: vec![host_root(context.workspace_index)],
                 scope_paths: scope.scan_paths(),
             },
             &control,
@@ -382,7 +382,7 @@ async fn run_index_pass(
     .await?;
     skipped.extend(classification_skips);
     skipped.truncate(MAX_SKIPPED_FILE_SAMPLES);
-    let scanned = scope.filter_scanned(scanned);
+    let scanned = scope.filter_scanned(&context.workspace_index.root, scanned);
     timings.record("index_scan", scan_started.elapsed(), scanned.len());
 
     let diff_started = Instant::now();
@@ -486,7 +486,7 @@ fn compute_diff(scanned: Vec<ScannedFile>, existing_files: &[StoredFile]) -> Dif
         .filter(|file| !seen.contains(&file.source.id))
         .collect();
     plan.deleted
-        .sort_by(|left, right| left.source.absolute_path.cmp(&right.source.absolute_path));
+        .sort_by(|left, right| left.source.relative_path.cmp(&right.source.relative_path));
     plan
 }
 
@@ -838,7 +838,7 @@ async fn prepare_candidate(
     if source.source_fingerprint != candidate.discovered.source_fingerprint {
         return Err(EngineError::resource_busy(format!(
             "source changed while being indexed: {}",
-            candidate.file.source.absolute_path.display()
+            candidate.file.source.relative_path.display()
         )));
     }
 
@@ -859,7 +859,7 @@ async fn prepare_candidate(
         None => {
             return Err(EngineError::unsupported(format!(
                 "no source reader is available for {}",
-                file.source.absolute_path.display()
+                file.source.relative_path.display()
             )));
         }
     };
@@ -867,7 +867,7 @@ async fn prepare_candidate(
         Some(decode_text(&source.bytes, true).ok_or_else(|| {
             EngineError::invalid_argument(format!(
                 "cannot extract text from {}: expected UTF-8 or BOM-marked UTF-16/32",
-                file.source.absolute_path.display()
+                file.source.relative_path.display()
             ))
         })?)
     } else {
@@ -1610,9 +1610,9 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
             "indexing requires a workspace index id",
         ));
     }
-    if context.workspace_index.roots.is_empty() {
+    if !context.workspace_index.root.is_absolute() {
         return Err(EngineError::invalid_argument(
-            "indexing requires at least one workspace root",
+            "indexing requires an absolute workspace root",
         ));
     }
     if context.workspace_index.policy != WorkspaceIndexPolicy::Enabled {
@@ -1653,28 +1653,26 @@ const fn metric_name(metric: crate::models::EmbeddingMetric) -> &'static str {
     }
 }
 
-fn host_roots(roots: &[RootPath]) -> Vec<RootSpec> {
-    roots
-        .iter()
-        .map(|root| RootSpec {
-            path: root.path.clone(),
-            recursive: root.recursive,
-            discovery: HostDiscoveryOptions {
-                include_paths: root.discovery.include_paths.clone(),
-                exclude_paths: root.discovery.exclude_paths.clone(),
-                globs: root.discovery.globs.clone(),
-                insensitive_globs: root.discovery.insensitive_globs.clone(),
-                file_types: root.discovery.file_types.clone(),
-                excluded_file_types: root.discovery.excluded_file_types.clone(),
-                hidden: root.discovery.hidden,
-                no_ignore: root.discovery.no_ignore,
-                ignore_files: root.discovery.ignore_files.clone(),
-                max_depth: root.discovery.max_depth,
-                max_file_size_bytes: root.discovery.max_file_size_bytes,
-                follow: root.discovery.follow,
-            },
-        })
-        .collect()
+fn host_root(workspace: &WorkspaceIndexInfo) -> RootSpec {
+    let discovery = &workspace.discovery;
+    RootSpec {
+        path: workspace.root.clone(),
+        recursive: true,
+        discovery: HostDiscoveryOptions {
+            include_paths: discovery.include_paths.clone(),
+            exclude_paths: discovery.exclude_paths.clone(),
+            globs: discovery.globs.clone(),
+            insensitive_globs: discovery.insensitive_globs.clone(),
+            file_types: discovery.file_types.clone(),
+            excluded_file_types: discovery.excluded_file_types.clone(),
+            hidden: discovery.hidden,
+            no_ignore: discovery.no_ignore,
+            ignore_files: discovery.ignore_files.clone(),
+            max_depth: discovery.max_depth,
+            max_file_size_bytes: discovery.max_file_size_bytes,
+            follow: discovery.follow,
+        },
+    }
 }
 
 async fn classify_files(
@@ -1704,14 +1702,20 @@ fn scanned_files(
 ) -> Result<Vec<ScannedFile>, EngineError> {
     let existing = stored
         .iter()
-        .map(|file| (&file.source.absolute_path, &file.source))
+        .map(|file| (&file.source.relative_path, &file.source))
         .collect::<HashMap<_, _>>();
     let mut scanned = Vec::with_capacity(files.len());
     throw_if_cancelled(Some(signal))?;
     for discovered in files {
         throw_if_cancelled(Some(signal))?;
-        let absolute_path = discovered_absolute_path(&discovered);
-        let detected = match existing.get(&absolute_path) {
+        if discovered.root != workspace.root {
+            return Err(EngineError::invalid_argument(
+                "discovered file must belong to the workspace root",
+            ));
+        }
+        let id = FileId::for_path(&workspace.id, &discovered.relative_path)?;
+        let absolute_path = workspace.root.join(&discovered.relative_path);
+        let detected = match existing.get(&discovered.relative_path) {
             Some(file)
                 if file.snapshot.modified_epoch_ms.is_some()
                     && file.snapshot.size_bytes == discovered.size_bytes
@@ -1725,16 +1729,14 @@ fn scanned_files(
             Ok(formats) => (formats, None),
             Err(error) => (
                 existing
-                    .get(&absolute_path)
+                    .get(&discovered.relative_path)
                     .map_or_else(|| vec![FileFormat::Unknown], |file| file.formats.clone()),
                 Some(error),
             ),
         };
         let source = SourceFile {
-            id: FileId::new(make_file_id(&workspace.id, &absolute_path))?,
-            absolute_path,
+            id,
             relative_path: discovered.relative_path.clone(),
-            root_path: discovered.root.clone(),
             formats,
             snapshot: FileSnapshot {
                 size_bytes: discovered.size_bytes,
@@ -1753,11 +1755,7 @@ fn scanned_files(
         ]
         .into_iter()
         .any(|category| source.has_category(category));
-        let explicit_maximum = workspace
-            .roots
-            .iter()
-            .find(|root| root.path == source.root_path)
-            .and_then(|root| root.discovery.max_file_size_bytes);
+        let explicit_maximum = workspace.discovery.max_file_size_bytes;
         let maximum = explicit_maximum.unwrap_or_else(|| default_file_size_limit(&source));
         let reason = if !supported_category {
             Some(if source.has_category(FileCategory::Binary) {
@@ -1775,7 +1773,7 @@ fn scanned_files(
         if let Some(reason) = reason.filter(|_| detection_error.is_none()) {
             if skipped.len() < MAX_SKIPPED_FILE_SAMPLES {
                 skipped.push(SkippedFile {
-                    path: source.absolute_path,
+                    path: absolute_path,
                     reason,
                     size_bytes: Some(source.snapshot.size_bytes),
                     limit_bytes: (reason == SkippedFileReason::TooLarge).then_some(maximum),
@@ -1804,14 +1802,6 @@ fn default_file_size_limit(file: &SourceFile) -> u64 {
         1024 * 1024
     } else {
         256 * 1024 * 1024
-    }
-}
-
-fn discovered_absolute_path(file: &DiscoveredFile) -> PathBuf {
-    if file.root.is_file() {
-        file.root.clone()
-    } else {
-        file.root.join(&file.relative_path)
     }
 }
 
@@ -1857,11 +1847,6 @@ fn skipped_files(snapshot: &ScanSnapshot) -> Vec<SkippedFile> {
         .collect()
 }
 
-fn make_file_id(workspace_index_id: &str, absolute_path: &Path) -> String {
-    let normalized = absolute_path.to_string_lossy().replace('\\', "/");
-    sha256_hex(format!("{workspace_index_id}\0{normalized}").as_bytes())
-}
-
 #[derive(Debug)]
 enum ChangeScope {
     All,
@@ -1869,13 +1854,16 @@ enum ChangeScope {
 }
 
 impl ChangeScope {
-    fn from_changes(roots: &[RootPath], changes: &[WorkspaceChange]) -> Self {
+    fn from_changes(
+        workspace_root: &Path,
+        changes: &[WorkspaceChange],
+    ) -> Result<Self, EngineError> {
         if changes.is_empty()
             || changes
                 .iter()
                 .any(|change| matches!(change, WorkspaceChange::Rescan))
         {
-            return Self::All;
+            return Ok(Self::All);
         }
         let mut paths = Vec::new();
         for change in changes {
@@ -1886,15 +1874,28 @@ impl ChangeScope {
                 | WorkspaceChange::DeletePrefix(path) => path,
                 WorkspaceChange::Rescan => continue,
             };
-            if path.is_absolute() {
-                paths.push(path.clone());
+            let relative = if path.is_absolute() {
+                path.strip_prefix(workspace_root).map_err(|_| {
+                    EngineError::invalid_argument(
+                        "changed path must stay within the workspace root",
+                    )
+                })?
             } else {
-                paths.extend(roots.iter().map(|root| root.path.join(path)));
+                path.as_path()
+            };
+            if relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+            {
+                return Err(EngineError::invalid_argument(
+                    "changed path must stay within the workspace root",
+                ));
             }
+            paths.push(workspace_root.join(relative));
         }
         paths.sort();
         paths.dedup();
-        Self::Paths(paths)
+        Ok(Self::Paths(paths))
     }
 
     fn contains(&self, path: &Path) -> bool {
@@ -1913,18 +1914,18 @@ impl ChangeScope {
         }
     }
 
-    fn filter_stored(&self, files: &[StoredFile]) -> Vec<StoredFile> {
+    fn filter_stored(&self, workspace_root: &Path, files: &[StoredFile]) -> Vec<StoredFile> {
         files
             .iter()
-            .filter(|file| self.contains(&file.source.absolute_path))
+            .filter(|file| self.contains(&workspace_root.join(&file.source.relative_path)))
             .cloned()
             .collect()
     }
 
-    fn filter_scanned(&self, files: Vec<ScannedFile>) -> Vec<ScannedFile> {
+    fn filter_scanned(&self, workspace_root: &Path, files: Vec<ScannedFile>) -> Vec<ScannedFile> {
         files
             .into_iter()
-            .filter(|file| self.contains(&file.file.source.absolute_path))
+            .filter(|file| self.contains(&workspace_root.join(&file.file.source.relative_path)))
             .collect()
     }
 }
@@ -2257,14 +2258,11 @@ mod tests {
             id: "workspace-id".to_owned(),
             name: "fixture".to_owned(),
             path: root.join(".zvec-grep"),
-            roots: vec![RootPath {
-                path: root.to_path_buf(),
-                recursive: true,
-                discovery: DiscoveryOptions {
-                    no_ignore: true,
-                    ..DiscoveryOptions::default()
-                },
-            }],
+            root: root.to_path_buf(),
+            discovery: DiscoveryOptions {
+                no_ignore: true,
+                ..DiscoveryOptions::default()
+            },
             policy: WorkspaceIndexPolicy::Enabled,
             embedding: Some(WorkspaceIndexEmbedding {
                 provider: "local".to_owned(),
@@ -2398,13 +2396,39 @@ mod tests {
         let stored = storage.list_files().expect("stored files");
         let untouched = stored
             .iter()
-            .find(|file| file.source.absolute_path == second_path)
+            .find(|file| file.source.relative_path == Path::new("second.txt"))
             .expect("second stored file");
         let changed_hash = sha256_hex(b"second changed");
         assert_ne!(
             untouched.source.snapshot.content_hash.as_deref(),
             Some(changed_hash.as_str())
         );
+    }
+
+    #[test]
+    fn changed_paths_share_the_workspace_base_and_reject_outside_paths() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("workspace");
+        let absolute = root.join("nested/source.rs");
+        let scope = ChangeScope::from_changes(
+            &root,
+            &[
+                WorkspaceChange::Upsert(PathBuf::from("nested/source.rs")),
+                WorkspaceChange::Upsert(absolute.clone()),
+            ],
+        )
+        .expect("workspace-relative change scope");
+        assert_eq!(scope.scan_paths(), std::slice::from_ref(&absolute));
+        assert!(scope.contains(&absolute));
+        assert!(!scope.contains(&root.join("source.rs")));
+
+        for path in [
+            PathBuf::from("../outside.rs"),
+            directory.path().join("outside.rs"),
+            root.join("../outside.rs"),
+        ] {
+            assert!(ChangeScope::from_changes(&root, &[WorkspaceChange::Upsert(path)]).is_err());
+        }
     }
 
     #[tokio::test]

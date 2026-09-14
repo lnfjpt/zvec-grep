@@ -170,6 +170,7 @@ struct InternalEvidence {
 }
 
 pub(crate) async fn search_workspace_index(
+    workspace_root: &Path,
     plan: SearchPlan,
     storage: &dyn WorkspaceIndexStorage,
     embedding_model: Option<&dyn SearchEmbeddingRuntime>,
@@ -182,7 +183,7 @@ pub(crate) async fn search_workspace_index(
     let plan_duration = plan_started.elapsed();
 
     let filter_started = Instant::now();
-    let filter = search_plan_to_storage_filter(&plan, storage)?;
+    let filter = search_plan_to_storage_filter(workspace_root, &plan, storage)?;
     let filter_duration = filter_started.elapsed();
     let has_searchable_files = !filter_matches_no_files(filter.as_ref());
 
@@ -636,6 +637,7 @@ fn extract_symbol_names(query: &str) -> Vec<String> {
 }
 
 fn search_plan_to_storage_filter(
+    workspace_root: &Path,
     plan: &SearchPlan,
     storage: &dyn WorkspaceIndexStorage,
 ) -> Result<Option<StorageSearchFilter>, EngineError> {
@@ -648,7 +650,7 @@ fn search_plan_to_storage_filter(
         || plan.modified_after_epoch_ms.is_some()
         || plan.modified_before_epoch_ms.is_some();
     let file_ids = needs_file_filter
-        .then(|| resolve_filtered_file_ids(plan, &storage.list_files()?))
+        .then(|| resolve_filtered_file_ids(workspace_root, plan, &storage.list_files()?))
         .transpose()?;
     let symbol_types = (!plan.symbol_types.is_empty())
         .then(|| plan.symbol_types.iter().copied().map(Into::into).collect());
@@ -664,6 +666,7 @@ fn search_plan_to_storage_filter(
 }
 
 fn resolve_filtered_file_ids(
+    workspace_root: &Path,
     plan: &SearchPlan,
     files: &[StoredFile],
 ) -> Result<Vec<FileId>, EngineError> {
@@ -682,7 +685,7 @@ fn resolve_filtered_file_ids(
     Ok(files
         .iter()
         .filter(|file| {
-            let absolute = normalize_path(&file.source.absolute_path);
+            let absolute = normalize_path(&workspace_root.join(&file.source.relative_path));
             let relative = normalize_path(&file.source.relative_path);
             (include.is_empty()
                 || include.iter().any(|matcher| {
@@ -1101,6 +1104,7 @@ mod tests {
         let model = FixtureModel::new();
 
         let result = search_workspace_index(
+            Path::new("/workspace"),
             plan(vec![
                 ContextRoute {
                     mode: ContextRouteMode::Fts,
@@ -1171,7 +1175,7 @@ mod tests {
         plan.file_types = vec!["rs".to_owned()];
         plan.prefer_symbol = true;
 
-        let result = search_workspace_index(plan, &storage, None)
+        let result = search_workspace_index(Path::new("/workspace"), plan, &storage, None)
             .await
             .expect("filtered search");
 
@@ -1187,6 +1191,49 @@ mod tests {
                 .as_ref()
                 .is_some_and(|names| names.contains(&"Service".to_owned()))
         }));
+    }
+
+    #[test]
+    fn resolves_absolute_and_relative_filters_against_the_current_workspace_root() {
+        let source = file("source", "src/service.rs", "rust", 200);
+        let files = [source.clone()];
+        let first_root = Path::new("/original/workspace");
+        let moved_root = Path::new("/moved/workspace");
+        let mut plan = plan(Vec::new());
+
+        plan.include_paths = vec!["src/**/*.rs".to_owned()];
+        for root in [first_root, moved_root] {
+            assert_eq!(
+                super::resolve_filtered_file_ids(root, &plan, &files).expect("relative filter"),
+                std::slice::from_ref(&source.source.id)
+            );
+        }
+
+        plan.include_paths = vec!["/moved/workspace/src/**/*.rs".to_owned()];
+        assert!(
+            super::resolve_filtered_file_ids(first_root, &plan, &files)
+                .expect("old root filter")
+                .is_empty()
+        );
+        assert_eq!(
+            super::resolve_filtered_file_ids(moved_root, &plan, &files).expect("moved root filter"),
+            std::slice::from_ref(&source.source.id)
+        );
+
+        plan.include_paths.clear();
+        plan.globs = vec!["src/**/*.rs".to_owned()];
+        for root in [first_root, moved_root] {
+            assert_eq!(
+                super::resolve_filtered_file_ids(root, &plan, &files).expect("relative glob"),
+                std::slice::from_ref(&source.source.id)
+            );
+        }
+        plan.exclude_paths = vec!["/moved/workspace/src".to_owned()];
+        assert!(
+            super::resolve_filtered_file_ids(moved_root, &plan, &files)
+                .expect("absolute exclusion")
+                .is_empty()
+        );
     }
 
     fn plan(routes: Vec<ContextRoute>) -> SearchPlan {
@@ -1211,9 +1258,7 @@ mod tests {
         StoredFile {
             source: SourceFile {
                 id: FileId::new(id).expect("file id"),
-                absolute_path: PathBuf::from("/workspace").join(relative),
                 relative_path: PathBuf::from(relative),
-                root_path: PathBuf::from("/workspace"),
                 formats: vec![match format {
                     "rust" => FileFormat::Rust,
                     "markdown" => FileFormat::Markdown,

@@ -5,7 +5,8 @@ use crate::{
 };
 
 use super::{
-    ChunkOptions, EntityFragment, TextRange, TextSource, make_entity_id, validate_source_file,
+    ChunkOptions, EntityFragment, TextRange, TextSource, chunking::find_line_cut, make_entity_id,
+    validate_source_file,
 };
 
 const DEFAULT_TEXT_CHUNK_CHARS: usize = 3_600;
@@ -138,11 +139,7 @@ fn split_long_line(
     let mut byte_offset = 0;
     while byte_offset < line.len() {
         let rest = &line[byte_offset..];
-        let slice_chars = if utf16_len(rest) <= max_chars {
-            utf16_len(rest)
-        } else {
-            find_line_cut(rest, max_chars)
-        };
+        let slice_chars = find_line_cut(rest, max_chars);
         let slice_bytes = byte_offset_at_utf16_ceil(rest, slice_chars);
         let slice = &rest[..slice_bytes];
         if !slice.trim().is_empty() {
@@ -188,35 +185,6 @@ fn compute_next_start_line(
     } else {
         end_index
     }
-}
-
-fn find_line_cut(line: &str, max_chars: usize) -> usize {
-    if utf16_len(line) <= max_chars {
-        return utf16_len(line);
-    }
-
-    let min_position = max_chars.saturating_mul(7) / 10;
-    let mut best_position = None;
-    let mut best_score = 0;
-    let mut position = 0;
-    for character in line.chars() {
-        if position >= max_chars {
-            break;
-        }
-        let score = match character {
-            '.' | '!' | '?' => 4,
-            ',' | ';' | ':' => 3,
-            ' ' | '\t' => 2,
-            '-' | '/' | '\\' => 1,
-            _ => 0,
-        };
-        if position >= min_position && score > 0 && score >= best_score {
-            best_score = score;
-            best_position = Some(position + character.len_utf16());
-        }
-        position += character.len_utf16();
-    }
-    best_position.unwrap_or(max_chars)
 }
 
 #[cfg(test)]

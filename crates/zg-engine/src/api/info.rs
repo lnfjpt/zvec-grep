@@ -21,7 +21,7 @@ pub mod result {
 
     use serde::{Deserialize, Serialize};
 
-    use crate::api::index::options::RootPath;
+    use crate::api::index::options::DiscoveryOptions;
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub struct InfoResult {
@@ -56,7 +56,9 @@ pub mod result {
         pub id: String,
         pub name: String,
         pub path: PathBuf,
-        pub roots: Vec<RootPath>,
+        /// The single base directory for every source file in this workspace.
+        pub root: PathBuf,
+        pub discovery: DiscoveryOptions,
         pub policy: WorkspaceIndexPolicy,
         pub embedding: Option<WorkspaceIndexEmbedding>,
         pub index_version: Option<u32>,

@@ -25,7 +25,7 @@ use llama_cpp_2::{
 use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::index::options::Device;
+use crate::{api::index::options::Device, models::artifacts::publish_downloaded_file};
 
 use super::{
     catalog::LlamaCppConfig,
@@ -237,7 +237,7 @@ impl LlamaCppEmbeddingModel {
                     .with_cause(error),
             );
         }
-        if let Err(error) = fs::rename(&partial, &destination).await {
+        if let Err(error) = publish_downloaded_file(&partial, &destination).await {
             let _ = fs::remove_file(&partial).await;
             return Err(
                 ModelError::storage_failure("Unable to publish llama.cpp model artifact")

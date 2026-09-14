@@ -48,9 +48,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_source_metadata() {
-        let mut missing_absolute_path = image_source(vec![1]);
-        missing_absolute_path.file.absolute_path.clear();
-        assert!(extract(&missing_absolute_path).is_err());
+        let mut escaping_relative_path = image_source(vec![1]);
+        escaping_relative_path.file.relative_path = "../fixture.png".into();
+        assert!(extract(&escaping_relative_path).is_err());
 
         let mut missing_relative_path = image_source(vec![1]);
         missing_relative_path.file.relative_path.clear();
