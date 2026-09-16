@@ -141,9 +141,16 @@ fn status(pid: u32, url: &str) -> DaemonStatus {
 }
 
 #[test]
-fn daemon_identity_requires_the_same_ready_process_and_url() {
+fn daemon_identity_requires_the_same_running_process_and_url() {
     let connected = status(10, "http://127.0.0.1:7999/mcp");
     assert!(same_daemon(&connected, &connected));
+    let mut busy = connected.clone();
+    busy.ready = false;
+    assert!(same_daemon(&connected, &busy));
+    assert!(!same_daemon(
+        &connected,
+        &status(10, "http://127.0.0.1:8000/mcp")
+    ));
     assert!(!same_daemon(
         &connected,
         &status(11, "http://127.0.0.1:7999/mcp")
@@ -153,6 +160,69 @@ fn daemon_identity_requires_the_same_ready_process_and_url() {
     stopped.running = false;
     stopped.ready = false;
     assert!(!same_daemon(&connected, &stopped));
+}
+
+#[tokio::test]
+async fn health_probe_timeout_does_not_interrupt_an_inflight_tool() {
+    use tokio::{io::AsyncReadExt, net::TcpListener};
+
+    let home = tempfile::tempdir().expect("daemon home");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("health listener");
+    let config = crate::ServerConfig::new(
+        listener
+            .local_addr()
+            .expect("health address")
+            .to_string()
+            .parse()
+            .expect("listen address"),
+        home.path().to_owned(),
+    );
+    let mut instance = crate::controller::InstanceLock::acquire(&config)
+        .await
+        .expect("instance record");
+    instance.mark_ready().await.expect("ready instance");
+    let connected = status(std::process::id(), &config.listen.server_url());
+    let (downstream, mut client) = transport();
+    let (upstream, mut daemon) = transport();
+    let task =
+        tokio::spawn(async move { relay(downstream, upstream, &connected, &config.home).await });
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "index", "arguments": {}}
+    }));
+    daemon
+        .receive()
+        .await
+        .complete
+        .send(Ok(()))
+        .expect("request sent");
+
+    // Keep MCP open while the independent health connection gets no response.
+    // Wait for its client-side timeout to close the socket, not a guessed delay.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut stream, _) = listener.accept().await.expect("health probe");
+        let mut request = Vec::new();
+        stream
+            .read_to_end(&mut request)
+            .await
+            .expect("probe timed out");
+        assert!(request.starts_with(b"GET /healthz "));
+    })
+    .await
+    .expect("health probe must time out");
+    assert!(
+        !client.closed.load(Ordering::SeqCst),
+        "a slow health endpoint must not close stdio"
+    );
+    daemon.send(json!({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}));
+    let response = client.receive().await;
+    assert_eq!(response.message["id"], 1);
+    response.complete.send(Ok(())).expect("tool response sent");
+    drop(client.incoming);
+    finish_relay(task).await.expect("stdio closes normally");
+    instance.release().await.expect("release instance");
 }
 
 #[tokio::test]

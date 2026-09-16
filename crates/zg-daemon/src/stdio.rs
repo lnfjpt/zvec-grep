@@ -133,10 +133,9 @@ async fn send_next<E>(sends: &mut VecDeque<BoxFuture<'static, Result<(), E>>>) -
 }
 
 fn same_daemon(connected: &DaemonStatus, current: &DaemonStatus) -> bool {
-    current.running
-        && current.ready
-        && current.pid == connected.pid
-        && current.server_url == connected.server_url
+    // Startup checks readiness before opening MCP. Once connected, a slow health
+    // probe must not tear down in-flight tools while the same process is alive.
+    current.running && current.pid == connected.pid && current.server_url == connected.server_url
 }
 
 #[cfg(test)]
