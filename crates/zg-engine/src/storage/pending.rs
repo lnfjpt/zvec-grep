@@ -13,6 +13,11 @@ use super::codec;
 pub(super) const NAME: &str = "pending.json";
 const VERSION: u32 = 1;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static WRITE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PendingChange {
     Reindex(FileRecord),
@@ -51,6 +56,8 @@ enum ChangeRecord {
 }
 
 pub(super) fn write(storage_path: &Path, changes: &PendingChanges) -> EngineResult<()> {
+    #[cfg(test)]
+    WRITE_COUNT.with(|count| count.set(count.get() + 1));
     if changes.is_empty() {
         return Err(invalid("pending batch must not be empty"));
     }

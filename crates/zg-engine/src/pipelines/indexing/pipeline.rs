@@ -48,6 +48,7 @@ use crate::{
 use super::input_budget::index_chunk_options;
 
 const MAX_SKIPPED_FILE_SAMPLES: usize = 20;
+const COMMIT_BATCH_FILES: usize = 64;
 const EMBEDDING_TRANSIENT_MAX_RETRIES: usize = 3;
 const EMBEDDING_RATE_LIMIT_MAX_RETRIES: usize = 6;
 const EMBEDDING_TRANSIENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
@@ -682,7 +683,39 @@ fn apply_embedding_outcome(
     outcome: EmbeddingBatchOutcome,
 ) -> Result<(), EngineError> {
     timings.record("index_embedding", outcome.duration, outcome.outcomes.len());
-    for outcome in outcome.outcomes {
+    let mut outcomes = outcome.outcomes.into_iter();
+    loop {
+        let batch = outcomes
+            .by_ref()
+            .take(COMMIT_BATCH_FILES)
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            return Ok(());
+        }
+        throw_if_cancelled(context.signal.as_ref())?;
+        let files = batch
+            .iter()
+            .map(|outcome| match outcome {
+                EmbeddedFileOutcome::Success { file, .. }
+                | EmbeddedFileOutcome::Failed { file, .. } => &file.file,
+            })
+            .collect::<Vec<_>>();
+        let commit_started = Instant::now();
+        context.storage.prepare_file_replacements(&files)?;
+        timings.record("index_commit", commit_started.elapsed(), 0);
+        apply_embedding_files(context, diff, progress_base, timings, stats, batch)?;
+    }
+}
+
+fn apply_embedding_files(
+    context: &IndexingContext<'_>,
+    diff: &DiffPlan,
+    progress_base: Option<ProgressBase>,
+    timings: &mut TimingCollector,
+    stats: &mut IndexStats,
+    outcomes: Vec<EmbeddedFileOutcome>,
+) -> Result<(), EngineError> {
+    for outcome in outcomes {
         throw_if_cancelled(context.signal.as_ref())?;
         match outcome {
             EmbeddedFileOutcome::Success { file, vectors } => {
@@ -1987,6 +2020,7 @@ mod tests {
     struct MemoryStorage {
         files: Mutex<Vec<FileRecord>>,
         finalized: AtomicUsize,
+        prepared_batches: Mutex<Vec<Vec<FileId>>>,
     }
 
     #[async_trait]
@@ -2048,6 +2082,14 @@ mod tests {
             } else {
                 files.push(stored);
             }
+            Ok(())
+        }
+
+        fn prepare_file_replacements(&self, files: &[&FileRecord]) -> StorageResult<()> {
+            self.prepared_batches
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(files.iter().map(|file| file.id.clone()).collect());
             Ok(())
         }
 
@@ -2279,6 +2321,50 @@ mod tests {
         assert_eq!(status.files_failed, 1);
         assert_eq!(status.indexed_size_bytes, 0);
         assert_eq!(status.entities_indexed, 0);
+    }
+
+    #[tokio::test]
+    async fn prepares_bounded_recovery_batches_for_multi_file_embedding_results() {
+        let directory = tempdir().expect("temporary directory");
+        for index in 0..=COMMIT_BATCH_FILES {
+            std::fs::write(
+                directory.path().join(format!("file-{index}.txt")),
+                "orchard",
+            )
+            .expect("fixture file");
+        }
+        let workspace = workspace(directory.path());
+        let scanner = NativeScanner::default();
+        let storage = MemoryStorage::default();
+        let mut model = ConcurrentModel::new();
+        model.info.limits.max_batch_size = COMMIT_BATCH_FILES * 2;
+        let result = index_workspace(&IndexingContext {
+            workspace_index: &workspace,
+            storage: &storage,
+            scanner: &scanner,
+            embedding_model: &model,
+            embedding_concurrency: None,
+            on_progress: None,
+            signal: None,
+            changes: &[],
+        })
+        .await
+        .expect("index batch");
+        assert_eq!(result.files_added, COMMIT_BATCH_FILES + 1);
+        assert_eq!(result.entities_created, COMMIT_BATCH_FILES + 1);
+        assert_eq!(model.calls.load(Ordering::Acquire), 1);
+        let batches = storage
+            .prepared_batches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            [COMMIT_BATCH_FILES, 1]
+        );
+        assert_eq!(
+            batches.iter().flatten().collect::<HashSet<_>>().len(),
+            COMMIT_BATCH_FILES + 1
+        );
     }
 
     #[tokio::test]

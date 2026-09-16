@@ -269,10 +269,14 @@ impl ZvecStorage {
         // Keep every file changed since the last checkpoint. A crash may require
         // reindexing even files whose native writes already completed in memory.
         state.needs_recovery = true;
-        state
-            .pending
-            .insert(change.file_id().as_str().to_owned(), change);
-        pending::write(&shared.path, &state.pending)?;
+        // A prepared batch already has durable intent for matching snapshots.
+        // Check again here: a checkpoint, deletion, or new snapshot invalidates it.
+        if state.pending.get(change.file_id().as_str()) != Some(&change) {
+            state
+                .pending
+                .insert(change.file_id().as_str().to_owned(), change);
+            pending::write(&shared.path, &state.pending)?;
+        }
         operation(&state.native)?;
         state.pending_operations = state.pending_operations.saturating_add(1);
         state.pending_bytes = state.pending_bytes.saturating_add(bytes);
@@ -367,6 +371,39 @@ impl WorkspaceIndexStorage for ZvecStorage {
             estimated_write_bytes(&file, entries),
             |native| native.apply_replace(&file, entries),
         )
+    }
+
+    fn prepare_file_replacements(&self, files: &[&FileRecord]) -> StorageResult<()> {
+        if self.read_only {
+            return Err(EngineError::invalid_argument(
+                "cannot write read-only workspace storage",
+            ));
+        }
+        for file in files {
+            file.validate()?;
+        }
+        let shared = self.shared()?;
+        let mut state = lock_state(&shared)?;
+        assert_usable(&state)?;
+        let changes = files
+            .iter()
+            .map(|file| PendingChange::reindex(file))
+            .filter(|change| state.pending.get(change.file_id().as_str()) != Some(change))
+            .collect::<Vec<_>>();
+        if changes.is_empty() {
+            return Ok(());
+        }
+        state.needs_recovery = true;
+        for change in changes {
+            state
+                .pending
+                .insert(change.file_id().as_str().to_owned(), change);
+        }
+        // Publish the whole recovery set before any corresponding native mutation.
+        // Prepared but unwritten files can safely be reindexed after an interruption.
+        pending::write(&shared.path, &state.pending)?;
+        state.needs_recovery = false;
+        Ok(())
     }
 
     fn mark_file_failed(&self, file: &FileRecord, error: &str) -> StorageResult<()> {

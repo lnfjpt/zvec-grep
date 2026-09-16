@@ -117,6 +117,14 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
     /// An interrupted batch is discarded and its files are marked for reindexing.
     fn replace_file(&self, file: &FileRecord, entries: &[IndexedFragment]) -> StorageResult<()>;
 
+    /// Optionally persists recovery intent for upcoming file replacements together.
+    /// This does not publish replacements or confirm durability of previous writes.
+    /// Recovery may mark every prepared file for reindexing, including unwritten files.
+    /// `replace_file` remains safe without this hint or after an intervening checkpoint.
+    fn prepare_file_replacements(&self, _files: &[&FileRecord]) -> StorageResult<()> {
+        Ok(())
+    }
+
     fn mark_file_failed(&self, file: &FileRecord, error: &str) -> StorageResult<()>;
 
     fn delete_file(&self, file_id: &FileId) -> StorageResult<()>;

@@ -393,6 +393,145 @@ fn invalidates_interrupted_batches_before_serving_readers() {
 }
 
 #[test]
+fn prepared_replacements_share_one_durable_marker_and_recover_unwritten_files() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let home = directory.path();
+    let storage = open(home, false);
+    let fixtures = (0..4)
+        .map(|index| fixture(&format!("prepared-{index}"), "orchard", vec![1.0, 0.0, 0.0]))
+        .collect::<Vec<_>>();
+    let files = fixtures.iter().map(|(file, _)| file).collect::<Vec<_>>();
+    let before = pending::WRITE_COUNT.get();
+    storage
+        .prepare_file_replacements(&files)
+        .expect("prepare batch");
+    assert_eq!(pending::WRITE_COUNT.get(), before + 1);
+    assert_eq!(
+        pending::read(&home.join("storage"))
+            .expect("durable intent")
+            .len(),
+        4
+    );
+    assert!(storage.list_files().expect("not yet published").is_empty());
+    storage
+        .prepare_file_replacements(&files)
+        .expect("repeat hint");
+    for (file, entry) in &fixtures[..3] {
+        storage
+            .replace_file(file, std::slice::from_ref(entry))
+            .expect("prepared write");
+    }
+    assert_eq!(
+        pending::WRITE_COUNT.get(),
+        before + 1,
+        "no per-file marker rewrite"
+    );
+    assert_eq!(
+        storage
+            .search_fts("orchard", 10, None)
+            .expect("writer reads its writes")
+            .len(),
+        3
+    );
+    drop(storage);
+
+    let reader = open(home, true);
+    let recovered = reader.list_files().expect("recovered batch");
+    assert_eq!(recovered.len(), 4);
+    assert!(recovered.iter().all(|file| !file.index_status.is_indexed()));
+    assert!(
+        reader
+            .search_fts("orchard", 10, None)
+            .expect("discard interrupted batch")
+            .is_empty()
+    );
+    reader.close().expect("close recovered reader");
+}
+
+#[test]
+fn prepared_replacements_are_rejournaled_after_a_checkpoint() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let home = directory.path();
+    let storage = open(home, false);
+    let fixtures = (0..=CHECKPOINT_OPERATIONS)
+        .map(|index| fixture(&format!("prepared-{index}"), "orchard", vec![1.0, 0.0, 0.0]))
+        .collect::<Vec<_>>();
+    let files = fixtures.iter().map(|(file, _)| file).collect::<Vec<_>>();
+    storage
+        .prepare_file_replacements(&files)
+        .expect("prepare batch");
+    let before = pending::WRITE_COUNT.get();
+    for (file, entry) in &fixtures[..CHECKPOINT_OPERATIONS] {
+        storage
+            .replace_file(file, std::slice::from_ref(entry))
+            .expect("prepared write");
+    }
+    assert_eq!(pending::WRITE_COUNT.get(), before);
+    assert!(!home.join("storage").join(pending::NAME).exists());
+    let (last, entry) = fixtures.last().expect("last fixture");
+    storage
+        .replace_file(last, std::slice::from_ref(entry))
+        .expect("fresh intent after checkpoint");
+    assert_eq!(pending::WRITE_COUNT.get(), before + 1);
+    assert_eq!(
+        pending::read(&home.join("storage"))
+            .expect("new batch")
+            .len(),
+        1
+    );
+    drop(storage);
+    let reader = open(home, true);
+    let files = reader.list_files().expect("recover only the last write");
+    assert_eq!(
+        files
+            .iter()
+            .filter(|file| file.index_status.is_indexed())
+            .count(),
+        CHECKPOINT_OPERATIONS
+    );
+    assert!(
+        !files
+            .iter()
+            .find(|file| file.id == last.id)
+            .expect("last file")
+            .index_status
+            .is_indexed()
+    );
+    reader.close().expect("close reader");
+}
+
+#[test]
+fn changed_prepared_metadata_and_deletions_refresh_recovery_intent() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let home = directory.path();
+    let storage = open(home, false);
+    let (old, _) = fixture("source", "old orchard", vec![1.0, 0.0, 0.0]);
+    storage
+        .prepare_file_replacements(&[&old])
+        .expect("prepare old snapshot");
+    let before = pending::WRITE_COUNT.get();
+    let (latest, entry) = fixture("source", "new orchard", vec![1.0, 0.0, 0.0]);
+    storage
+        .replace_file(&latest, &[entry])
+        .expect("changed snapshot");
+    assert_eq!(pending::WRITE_COUNT.get(), before + 1);
+    assert_eq!(
+        pending::read(&home.join("storage"))
+            .expect("latest intent")
+            .get(latest.id.as_str()),
+        Some(&PendingChange::reindex(&latest))
+    );
+    storage
+        .delete_file(&latest.id)
+        .expect("delete prepared file");
+    assert_eq!(pending::WRITE_COUNT.get(), before + 2);
+    drop(storage);
+    let reader = open(home, true);
+    assert!(reader.list_files().expect("deletion wins").is_empty());
+    reader.close().expect("close reader");
+}
+
+#[test]
 fn checkpoints_batches_at_the_operation_limit() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
@@ -582,6 +721,15 @@ fn retains_only_the_latest_intent_for_repeated_file_updates() {
 
 #[tokio::test]
 async fn failed_marker_write_blocks_access_and_close_releases_the_lease() {
+    assert_failed_marker_write(false).await;
+}
+
+#[tokio::test]
+async fn failed_batch_marker_write_blocks_access_and_close_releases_the_lease() {
+    assert_failed_marker_write(true).await;
+}
+
+async fn assert_failed_marker_write(prepared: bool) {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
     let path = home.join("storage");
@@ -595,7 +743,11 @@ async fn failed_marker_write_blocks_access_and_close_releases_the_lease() {
     fs::rename(&marker, &preserved).expect("preserve durable intent");
     fs::create_dir(&marker).expect("obstruct marker replacement");
     let (other, replacement) = fixture("other", "banana", vec![0.0, 1.0, 0.0]);
-    assert!(storage.replace_file(&other, &[replacement]).is_err());
+    if prepared {
+        assert!(storage.prepare_file_replacements(&[&other]).is_err());
+    } else {
+        assert!(storage.replace_file(&other, &[replacement]).is_err());
+    }
     for error in [
         storage
             .list_files()
@@ -639,6 +791,32 @@ async fn failed_marker_write_blocks_access_and_close_releases_the_lease() {
             .is_empty()
     );
     assert!(!marker.exists());
+    reader.close().expect("close reader");
+}
+
+#[test]
+fn invalid_prepared_files_leave_the_writer_usable_and_readers_reject_preparation() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let home = directory.path();
+    let storage = open(home, false);
+    let (file, entry) = fixture("source", "orchard", vec![1.0, 0.0, 0.0]);
+    let mut invalid = file.clone();
+    invalid.relative_path = PathBuf::from("../outside.txt");
+    assert!(
+        storage
+            .prepare_file_replacements(&[&file, &invalid])
+            .is_err()
+    );
+    assert!(!home.join("storage").join(pending::NAME).exists());
+    storage.prepare_file_replacements(&[]).expect("empty hint");
+    assert!(!home.join("storage").join(pending::NAME).exists());
+    storage
+        .replace_file(&file, &[entry])
+        .expect("writer remains usable");
+    storage.close().expect("close writer");
+    let reader = open(home, true);
+    assert!(reader.prepare_file_replacements(&[&file]).is_err());
+    assert!(!home.join("storage").join(pending::NAME).exists());
     reader.close().expect("close reader");
 }
 
