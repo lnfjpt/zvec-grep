@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::{
     EngineError,
-    domain::{Entity, EntityFragment, EntityId, FileId, FileRecord, SymbolType},
+    domain::{DirectoryId, Entity, EntityFragment, EntityId, FileId, FileRecord, SymbolType},
     models::EmbeddingMetric,
 };
 
@@ -24,9 +24,13 @@ pub(crate) struct WorkspaceIndexEmbeddingSchema {
 pub(crate) enum WorkspaceIndexStorageOptions {
     ReadOnly {
         storage_path: PathBuf,
+        /// Resolved workspace home for the shared identity catalog, not the source root.
+        workspace_path: PathBuf,
     },
     ReadWrite {
         storage_path: PathBuf,
+        /// Resolved workspace home for the shared identity catalog, not the source root.
+        workspace_path: PathBuf,
         embedding: WorkspaceIndexEmbeddingSchema,
     },
 }
@@ -34,7 +38,17 @@ pub(crate) enum WorkspaceIndexStorageOptions {
 impl WorkspaceIndexStorageOptions {
     pub(crate) fn storage_path(&self) -> &Path {
         match self {
-            Self::ReadOnly { storage_path } | Self::ReadWrite { storage_path, .. } => storage_path,
+            Self::ReadOnly { storage_path, .. } | Self::ReadWrite { storage_path, .. } => {
+                storage_path
+            }
+        }
+    }
+
+    pub(crate) fn workspace_path(&self) -> &Path {
+        match self {
+            Self::ReadOnly { workspace_path, .. } | Self::ReadWrite { workspace_path, .. } => {
+                workspace_path
+            }
         }
     }
 
@@ -57,10 +71,25 @@ pub(crate) struct IndexedFragment {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StorageSearchFilter {
+    pub path: Option<StoragePathFilter>,
     pub file_ids: Option<Vec<FileId>>,
     pub entity_ids: Option<Vec<EntityId>>,
     pub symbol_names: Option<Vec<String>>,
     pub symbol_types: Option<Vec<SymbolType>>,
+}
+
+/// Boolean predicates over metadata duplicated on both retrieval collections.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StoragePathFilter {
+    All,
+    None,
+    Directory(DirectoryId),
+    FileNameExact(String),
+    FileNamePrefix(String),
+    FileNameSuffix(String),
+    And(Vec<Self>),
+    Or(Vec<Self>),
+    Not(Box<Self>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +125,35 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
 
     fn list_files(&self) -> StorageResult<Vec<FileRecord>>;
 
+    /// Enumerate every stored file path without loading content or index status.
+    /// This includes failed and pending files, but excludes historical identities.
+    fn list_file_paths(&self) -> StorageResult<Vec<(FileId, PathBuf)>> {
+        Ok(self
+            .list_files()?
+            .into_iter()
+            .map(|file| (file.id, file.relative_path.into_path_buf()))
+            .collect())
+    }
+
+    /// Durably reserves workspace identities before extraction or index writes.
+    fn resolve_file_ids(&self, _paths: &[PathBuf]) -> StorageResult<Vec<FileId>> {
+        Err(EngineError::storage_failure(
+            "file identity allocation is unsupported",
+        ))
+    }
+
+    fn supports_path_filters(&self) -> bool {
+        false
+    }
+
+    fn directory_id(&self, _path: &Path) -> StorageResult<Option<DirectoryId>> {
+        Ok(None)
+    }
+
+    fn has_non_unicode_file_names(&self) -> StorageResult<bool> {
+        Ok(true)
+    }
+
     fn get_entity(&self, entity_id: &EntityId) -> StorageResult<Option<StoredEntity>>;
 
     fn search_fts(
@@ -127,7 +185,7 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
 
     fn mark_file_failed(&self, file: &FileRecord, error: &str) -> StorageResult<()>;
 
-    fn delete_file(&self, file_id: &FileId) -> StorageResult<()>;
+    fn delete_file(&self, file_id: FileId) -> StorageResult<()>;
 
     /// Persists all accepted writes and clears their pending recovery records.
     async fn finalize_writes(&self) -> StorageResult<()>;
@@ -148,6 +206,7 @@ mod tests {
         let path = PathBuf::from("workspace-index");
         let options = WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: path.clone(),
+            workspace_path: path.clone(),
         };
 
         assert!(options.is_read_only());

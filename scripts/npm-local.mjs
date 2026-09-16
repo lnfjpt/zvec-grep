@@ -21,6 +21,7 @@ import {
   run,
   selectPlatform,
   sha256File,
+  stageZvecRuntime,
   workspaceDir,
 } from "./npm-package-core.mjs";
 
@@ -109,6 +110,12 @@ async function stagePackage(
     await chmod(packagedBinary, 0o755);
   }
 
+  const runtimeFiles = await stageZvecRuntime(
+    join(workspaceDir, "target", "release"),
+    join(temporaryDir, "bin"),
+    descriptor.platform,
+  );
+
   const binaryStat = await stat(packagedBinary);
   const packageJson = {
     name: "@zvec/zvec-grep",
@@ -135,6 +142,13 @@ async function stagePackage(
       },
     },
   };
+  for (const file of runtimeFiles) {
+    const path = join(temporaryDir, file);
+    checksums.files[file] = {
+      bytes: (await stat(path)).size,
+      sha256: await sha256File(path),
+    };
+  }
   const packageReadme = [
     "# Local zvec-grep npm package",
     "",

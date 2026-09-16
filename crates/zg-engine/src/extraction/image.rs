@@ -1,34 +1,28 @@
-use crate::{
-    EngineError,
-    domain::{Content, Entity, EntityContent, SourceRange},
-};
+use crate::domain::{Content, EntityContent, SourceRange};
 
-use super::{EntityFragment, ImageSource, make_entity_id, validate_source_file};
+use super::{ExtractedEntity, ExtractedFragment, ImageSource};
 
-pub(super) fn extract(source: &ImageSource) -> Result<Vec<EntityFragment>, EngineError> {
-    validate_source_file(&source.file)?;
-    Ok(vec![EntityFragment::Standalone(Entity {
-        id: make_entity_id(&source.file.id, 0),
-        file_id: source.file.id.clone(),
+pub(super) fn extract(source: &ImageSource) -> Vec<ExtractedFragment> {
+    vec![ExtractedFragment::Standalone(ExtractedEntity {
+        index: 0,
         range: SourceRange::File,
         content: EntityContent::Source(vec![Content::Image(source.content.clone())]),
         metadata: None,
-    })])
+    })]
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{Content, EntityFragment, FileFormat, ImageContent, SourceRange};
+    use crate::domain::{Content, FileFormat, ImageContent, SourceRange};
 
     use super::super::{
-        ChunkOptions, ImageSource, extract as extract_source, extract_for_indexing, test_content,
-        test_file,
+        ChunkOptions, ExtractedFragment, ImageSource, extract as extract_source,
+        extract_for_indexing, test_content,
     };
     use super::extract;
 
     fn image_source(data: Vec<u8>) -> ImageSource {
         ImageSource {
-            file: test_file(FileFormat::Png, "fixture.png", data.len() as u64),
             content: ImageContent::new(data, FileFormat::Png).expect("image content"),
         }
     }
@@ -36,25 +30,13 @@ mod tests {
     #[test]
     fn preserves_image_bytes_format_and_file_range() {
         let source = image_source(vec![1, 2, 3]);
-        let fragments = extract(&source).expect("image extraction");
+        let fragments = extract(&source);
         assert_eq!(fragments.len(), 1);
-        assert_eq!(fragments[0].document_id().len(), 64);
-        assert_eq!(fragments[0].file_id(), &source.file.id);
+        assert_eq!(fragments[0].index(), 0);
         assert_eq!(fragments[0].range(), &SourceRange::File);
-        assert!(matches!(fragments[0], EntityFragment::Standalone(_)));
+        assert!(matches!(fragments[0], ExtractedFragment::Standalone(_)));
         assert_eq!(fragments[0].metadata(), None);
         assert_eq!(test_content(&fragments[0]), Content::Image(source.content));
-    }
-
-    #[test]
-    fn rejects_invalid_source_metadata() {
-        let mut escaping_relative_path = image_source(vec![1]);
-        escaping_relative_path.file.relative_path = "../fixture.png".into();
-        assert!(extract(&escaping_relative_path).is_err());
-
-        let mut missing_relative_path = image_source(vec![1]);
-        missing_relative_path.file.relative_path.clear();
-        assert!(extract(&missing_relative_path).is_err());
     }
 
     #[test]

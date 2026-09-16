@@ -1,16 +1,13 @@
 use crate::{
     EngineError,
-    domain::{
-        Content, Entity, EntityContent, EntityId, EntityMetadata, FileFormat, FragmentId,
-        SourceRange, WindowFragment,
-    },
+    domain::{Content, EntityContent, EntityMetadata, FileFormat, SourceRange},
     utils::{byte_offset_at_utf16_ceil, line_byte_offsets, utf16_len},
 };
 
 use super::{
-    ChunkOptions, EntityFragment, TextRange, TextSource, chunk_options_for_metadata,
-    chunking::find_line_cut, fit_text_to_chars, make_entity_id, text::extract_plain_text_fragments,
-    validate_source_file,
+    ChunkOptions, ExtractedEntity, ExtractedFragment, ExtractedWindow, TextRange, TextSource,
+    chunk_options_for_metadata, chunking::find_line_cut, fit_text_to_chars,
+    text::extract_plain_text_fragments, validate_formats,
 };
 
 const DEFAULT_MARKDOWN_CHUNK_CHARS: usize = 3_600;
@@ -40,11 +37,11 @@ struct MarkdownWindow {
 pub(super) fn extract(
     source: &TextSource,
     options: ChunkOptions,
-) -> Result<Vec<EntityFragment>, EngineError> {
-    if !source.file.formats.contains(&FileFormat::Markdown) {
+) -> Result<Vec<ExtractedFragment>, EngineError> {
+    if !source.formats.contains(&FileFormat::Markdown) {
         return Ok(Vec::new());
     }
-    validate_source_file(&source.file)?;
+    validate_formats(&source.formats)?;
     let (max_chars, overlap_chars) = resolve_options(options)?;
     let lines = source.text.split('\n').collect::<Vec<_>>();
     let headings = scan_headings(&lines);
@@ -75,16 +72,15 @@ pub(super) fn extract(
         );
 
         if windows.len() > 1 {
-            let id = make_entity_id(&source.file.id, fragments.len());
+            let entity_index = fragments.len();
             let section_window = lines_to_window(
                 &lines,
                 &line_offsets,
                 section.start_index,
                 section.end_index,
             );
-            fragments.push(EntityFragment::Representative(Entity {
-                id: id.clone(),
-                file_id: source.file.id.clone(),
+            fragments.push(ExtractedFragment::Representative(ExtractedEntity {
+                index: entity_index,
                 range: SourceRange::Text(section_window.range),
                 content: EntityContent::Outline(fit_text_to_chars(
                     metadata_heading(&metadata).unwrap_or("markdown section"),
@@ -96,18 +92,16 @@ pub(super) fn extract(
             for window in windows {
                 let index = fragments.len();
                 fragments.push(markdown_window_to_fragment(
-                    source,
                     metadata.clone(),
                     window,
                     index,
-                    Some(id.clone()),
+                    Some(entity_index),
                 ));
             }
         } else {
             for window in windows {
                 let index = fragments.len();
                 fragments.push(markdown_window_to_fragment(
-                    source,
                     metadata.clone(),
                     window,
                     index,
@@ -149,27 +143,23 @@ fn resolve_options(options: ChunkOptions) -> Result<(usize, usize), EngineError>
 }
 
 fn markdown_window_to_fragment(
-    source: &TextSource,
     metadata: EntityMetadata,
     window: MarkdownWindow,
     index: usize,
-    owner: Option<EntityId>,
-) -> EntityFragment {
-    let id = make_entity_id(&source.file.id, index);
+    owner: Option<usize>,
+) -> ExtractedFragment {
     let range = SourceRange::Text(window.range);
     let contents = vec![Content::Text(window.text)];
     match owner {
-        Some(entity_id) => EntityFragment::Window(WindowFragment {
-            id: FragmentId::new(id.as_str()).expect("generated fragment id"),
-            entity_id,
-            file_id: source.file.id.clone(),
+        Some(entity_index) => ExtractedFragment::Window(ExtractedWindow {
+            index,
+            entity_index,
             range,
             contents,
             metadata: Some(metadata),
         }),
-        None => EntityFragment::Standalone(Entity {
-            id,
-            file_id: source.file.id.clone(),
+        None => ExtractedFragment::Standalone(ExtractedEntity {
+            index,
             range,
             content: EntityContent::Source(contents),
             metadata: Some(metadata),
@@ -503,13 +493,11 @@ fn metadata_heading(metadata: &EntityMetadata) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{
-        Content, EntityFragment, EntityMetadata, FileFormat, SourceRange, TextRange,
-    };
+    use crate::domain::{Content, EntityMetadata, FileFormat, SourceRange, TextRange};
 
     use super::super::test_content;
 
-    use super::super::{ChunkOptions, test_source};
+    use super::super::{ChunkOptions, ExtractedFragment, test_source};
     use super::extract;
 
     #[test]
@@ -562,7 +550,7 @@ mod tests {
         )));
         assert!(fragments.iter().any(|item| matches!(
             item,
-            EntityFragment::Representative(_) | EntityFragment::Window(_)
+            ExtractedFragment::Representative(_) | ExtractedFragment::Window(_)
         )));
         assert_eq!(
             *fragments[0].range(),
@@ -572,11 +560,17 @@ mod tests {
             )
         );
 
-        for fragment in fragments {
-            if matches!(fragment, EntityFragment::Representative(_)) {
+        for (index, fragment) in fragments.iter().enumerate() {
+            assert_eq!(fragment.index(), index);
+            if let ExtractedFragment::Window(window) = fragment {
+                let owner = &fragments[window.entity_index];
+                assert!(matches!(owner, ExtractedFragment::Representative(_)));
+                assert_eq!(owner.metadata(), fragment.metadata());
+            }
+            if matches!(fragment, ExtractedFragment::Representative(_)) {
                 continue;
             }
-            let Content::Text(content) = test_content(&fragment) else {
+            let Content::Text(content) = test_content(fragment) else {
                 panic!("text content expected");
             };
             let SourceRange::Text(range) = *fragment.range() else {

@@ -163,9 +163,13 @@ impl IndexJobScheduler {
     pub(crate) fn submit(
         &self,
         canonical_root: PathBuf,
-        options: IndexOptions,
+        mut options: IndexOptions,
         reason: JobReason,
     ) -> Result<SubmitIndexJobResult, SchedulerError> {
+        // Naming is an explicit caller mutation, never a background refresh setting.
+        if reason == JobReason::Watch {
+            options.name = None;
+        }
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(SchedulerError::Closed);
         }
@@ -179,7 +183,8 @@ impl IndexJobScheduler {
             let active_snapshot = lock(&active.snapshot).clone();
             let needs_followup = reason == JobReason::Watch
                 || active_snapshot.reason == JobReason::Watch
-                || options.rebuild;
+                || options.rebuild
+                || options.name.is_some();
             if needs_followup && active_snapshot.state == JobState::Queued {
                 let queued_full_manual = active_snapshot.reason == JobReason::Manual
                     && reason == JobReason::Watch
@@ -536,7 +541,13 @@ fn merge_options(current: &mut Option<IndexOptions>, mut incoming: IndexOptions)
     let Some(current) = current.as_mut() else {
         return;
     };
+    // An omitted name leaves a pending explicit rename intact. Only another
+    // explicit name replaces it, including when the request updates narrow paths.
+    if let Some(name) = incoming.name.take() {
+        current.name = Some(name);
+    }
     if incoming.changes.is_empty() {
+        incoming.name = current.name.take();
         *current = incoming;
         return;
     }
@@ -736,7 +747,7 @@ mod tests {
     use tokio::sync::Notify;
     use zg_engine::{
         EngineError,
-        api::index::{IndexOptions, IndexResult},
+        api::index::{IndexOptions, IndexResult, options::WorkspaceChange},
     };
 
     use super::{
@@ -904,6 +915,7 @@ mod tests {
                 root.clone(),
                 IndexOptions {
                     root: Some(root.clone()),
+                    name: Some("stale-workspace-name".into()),
                     changes: vec![zg_engine::api::index::options::WorkspaceChange::Upsert(
                         PathBuf::from("src/lib.rs"),
                     )],
@@ -917,6 +929,7 @@ mod tests {
                 root.clone(),
                 IndexOptions {
                     root: Some(root.clone()),
+                    name: Some("another-stale-name".into()),
                     changes: vec![zg_engine::api::index::options::WorkspaceChange::Delete(
                         PathBuf::from("src/lib.rs"),
                     )],
@@ -939,12 +952,95 @@ mod tests {
         assert_eq!(completed.job.state, JobState::Succeeded);
         let calls = executor.calls.lock().expect("calls should be readable");
         assert_eq!(calls.len(), 2);
+        assert!(calls[1].name.is_none());
         assert_eq!(
             calls[1].changes,
             [zg_engine::api::index::options::WorkspaceChange::Delete(
                 PathBuf::from("src/lib.rs")
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_names_reach_the_executor_after_queued_or_running_manual_jobs() {
+        for (queued, narrow) in [(false, false), (false, true), (true, false), (true, true)] {
+            let executor = Arc::new(RecordingExecutor {
+                calls: Mutex::new(Vec::new()),
+                started: Notify::new(),
+                releases: tokio::sync::Semaphore::new(0),
+            });
+            let scheduler = IndexJobScheduler::new(
+                executor.clone(),
+                SchedulerConfig {
+                    concurrency: 1,
+                    queue_capacity: 8,
+                },
+            );
+            if queued {
+                scheduler
+                    .submit(
+                        PathBuf::from("/blocker"),
+                        IndexOptions::default(),
+                        JobReason::Manual,
+                    )
+                    .expect("occupy the worker");
+                executor.started.notified().await;
+            }
+            let root = PathBuf::from("/workspace");
+            let first = scheduler
+                .submit(root.clone(), IndexOptions::default(), JobReason::Manual)
+                .expect("initial manual index");
+            if !queued {
+                executor.started.notified().await;
+            }
+            let renamed = scheduler
+                .submit(
+                    root.clone(),
+                    IndexOptions {
+                        root: Some(root.clone()),
+                        name: Some("renamed-workspace".into()),
+                        changes: if narrow {
+                            vec![WorkspaceChange::Upsert("file.rs".into())]
+                        } else {
+                            Vec::new()
+                        },
+                        ..IndexOptions::default()
+                    },
+                    JobReason::Manual,
+                )
+                .expect("explicit rename");
+            assert_eq!(renamed.job.id == first.job.id, queued);
+            let refresh = scheduler
+                .submit(root, IndexOptions::default(), JobReason::Watch)
+                .expect("full background refresh merges with the pending rename");
+            assert_eq!(refresh.job.id, renamed.job.id);
+
+            executor.releases.add_permits(1);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                executor.started.notified(),
+            )
+            .await
+            .expect("explicit rename must reach the executor");
+            executor.releases.add_permits(1);
+            let completed = scheduler
+                .wait(renamed.job.id)
+                .await
+                .expect("rename completes");
+            assert_eq!(completed.job.state, JobState::Succeeded);
+            assert_eq!(
+                executor
+                    .calls
+                    .lock()
+                    .expect("recorded requests")
+                    .last()
+                    .expect("rename was executed")
+                    .name
+                    .as_deref(),
+                Some("renamed-workspace")
+            );
+            scheduler.shutdown().await;
+        }
     }
 
     #[tokio::test]

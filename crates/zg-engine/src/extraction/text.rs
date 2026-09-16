@@ -1,12 +1,12 @@
 use crate::{
     EngineError,
-    domain::{Content, Entity, EntityContent, SourceRange},
+    domain::{Content, EntityContent, SourceRange},
     utils::{byte_offset_at_utf16_ceil, line_byte_offsets, utf16_len},
 };
 
 use super::{
-    ChunkOptions, EntityFragment, TextRange, TextSource, chunking::find_line_cut, make_entity_id,
-    validate_source_file,
+    ChunkOptions, ExtractedEntity, ExtractedFragment, TextRange, TextSource,
+    chunking::find_line_cut, validate_formats,
 };
 
 const DEFAULT_TEXT_CHUNK_CHARS: usize = 3_600;
@@ -15,8 +15,8 @@ const DEFAULT_TEXT_CHUNK_OVERLAP_CHARS: usize = 540;
 pub(super) fn extract(
     source: &TextSource,
     options: ChunkOptions,
-) -> Result<Vec<EntityFragment>, EngineError> {
-    validate_source_file(&source.file)?;
+) -> Result<Vec<ExtractedFragment>, EngineError> {
+    validate_formats(&source.formats)?;
     let (max_chars, overlap_chars) = resolve_options(options)?;
     Ok(extract_plain_text_fragments(
         source,
@@ -29,14 +29,13 @@ pub(super) fn extract_plain_text_fragments(
     source: &TextSource,
     max_chars: usize,
     overlap_chars: usize,
-) -> Vec<EntityFragment> {
+) -> Vec<ExtractedFragment> {
     chunk_text(&source.text, max_chars, overlap_chars)
         .into_iter()
         .enumerate()
         .map(|(index, chunk)| {
-            EntityFragment::Standalone(Entity {
-                id: make_entity_id(&source.file.id, index),
-                file_id: source.file.id.clone(),
+            ExtractedFragment::Standalone(ExtractedEntity {
+                index,
                 range: SourceRange::Text(chunk.range),
                 content: EntityContent::Source(vec![Content::Text(chunk.text)]),
                 metadata: None,
@@ -212,7 +211,7 @@ mod tests {
         )
         .expect("text extraction");
         assert!(chunks.len() >= 2);
-        assert_eq!(chunks[0].document_id().len(), 64);
+        assert_eq!(chunks[0].index(), 0);
         assert_eq!(
             *chunks[0].range(),
             SourceRange::Text(TextRange::from_coordinates(0, 10, 1, 1, 0, 10).expect("first line"))

@@ -189,12 +189,12 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
             .workspace_index
             .as_ref()
             .expect("rebuilt workspace")
-            .id,
+            .name,
         before_rebuild
             .workspace_index
             .as_ref()
             .expect("original workspace")
-            .id,
+            .name,
     );
     assert_ne!(after_rebuild.index_path, before_rebuild.index_path);
     assert!(after_rebuild.index_path.is_dir());
@@ -250,7 +250,14 @@ async fn public_engine_resumes_failed_initial_build_without_publishing_it_early(
     fs::write(root.join("broken.txt"), [255_u8, 254, 255])?;
     fs::write(root.join("stable.txt"), "Stable orchard baseline.\n")?;
     let engine = ZvecGrep::new();
-    assert!(engine.index(index_options(root)).await.is_err());
+    let error = engine
+        .index(index_options(root))
+        .await
+        .expect_err("invalid source keeps the build pending");
+    assert!(
+        error.message().contains("failed files: broken.txt"),
+        "{error}"
+    );
     let info = engine.info(info_options(root)).await?;
     assert!(!info.indexed);
     assert!(
@@ -346,14 +353,16 @@ async fn failed_native_rebuild_preserves_active_results_until_its_stage_is_resum
     let original_path = engine.info(info_options(root)).await?.index_path;
     let original_manifest = fs::read(home.join("manifest.json"))?;
     fs::write(root.join("note.txt"), [255_u8, 254, 255])?;
+    let error = engine
+        .index(IndexOptions {
+            rebuild: true,
+            ..index_options(root)
+        })
+        .await
+        .expect_err("invalid source keeps the rebuild pending");
     assert!(
-        engine
-            .index(IndexOptions {
-                rebuild: true,
-                ..index_options(root)
-            })
-            .await
-            .is_err()
+        error.message().contains("failed files: note.txt"),
+        "{error}"
     );
     assert_eq!(fs::read(home.join("manifest.json"))?, original_manifest);
     let pending: Value = serde_json::from_slice(&fs::read(home.join("build.json"))?)?;
@@ -456,7 +465,7 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
     fs::write(
         &pending_path,
         serde_json::to_vec(&json!({
-            "version": 1,
+            "version": 2,
             "files": [{ "kind": "reindex", "source": serde_json::to_string(&pending_source)? }],
         }))?,
     )?;

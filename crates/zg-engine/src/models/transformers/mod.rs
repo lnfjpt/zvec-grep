@@ -27,9 +27,9 @@ use tokenizers::{
 use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::{api::index::options::Device, models::artifacts::publish_downloaded_file};
-
 use super::{
+    Device,
+    artifacts::publish_downloaded_file,
     catalog::TransformersConfig,
     compute::ModelComputeRuntime,
     download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},

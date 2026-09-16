@@ -5,7 +5,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use uuid::Uuid;
 use zg_host_native::NativeScanner;
 
 use crate::{
@@ -18,15 +17,13 @@ use crate::{
         },
         info::{
             InfoOptions, InfoResult,
-            result::{
-                InfoSource, WorkspaceIndexEmbedding, WorkspaceIndexInfo, WorkspaceIndexPolicy,
-            },
+            result::{InfoSource, WorkspaceIndexInfo, WorkspaceIndexPolicy},
         },
     },
+    domain::{EmbeddingSchema, IndexPolicy, Workspace, WorkspaceIndex, WorkspaceName},
     models::{
-        CreateEmbeddingModelOptions, EmbeddingMetric, ModelError, ModelRuntimeLease,
-        ModelRuntimeManager, ModelRuntimeRequest, ResolveEmbeddingReferenceOptions,
-        resolve_embedding_reference,
+        CreateEmbeddingModelOptions, ModelError, ModelRuntimeLease, ModelRuntimeManager,
+        ModelRuntimeRequest, ResolveEmbeddingReferenceOptions, resolve_embedding_reference,
     },
     pipelines::search::context::{NormalizedContextRequest, context_from_index},
     storage::spi::{
@@ -47,6 +44,7 @@ use crate::{
             EmbeddingRuntimeConfig, WorkspaceManifest, read_workspace_manifest,
             write_workspace_manifest,
         },
+        registry::WorkspaceRegistry,
     },
 };
 
@@ -58,6 +56,9 @@ const DEFAULT_LOCAL_EMBEDDING: &str = "local/potion-code-16m-v2";
 pub(crate) struct WorkspaceIndexService {
     scanner: NativeScanner,
     storage_factory: Arc<dyn WorkspaceIndexStorageFactory>,
+    registry: Option<WorkspaceRegistry>,
+    #[cfg(test)]
+    _registry_directory: Option<Arc<tempfile::TempDir>>,
 }
 
 impl WorkspaceIndexService {
@@ -65,6 +66,9 @@ impl WorkspaceIndexService {
         Self {
             scanner: NativeScanner::default(),
             storage_factory: Arc::new(crate::storage::ZvecStorageFactory::new()),
+            registry: None,
+            #[cfg(test)]
+            _registry_directory: None,
         }
     }
 
@@ -72,10 +76,67 @@ impl WorkspaceIndexService {
     pub(crate) fn with_storage_factory(
         storage_factory: Arc<dyn WorkspaceIndexStorageFactory>,
     ) -> Self {
+        let directory = Arc::new(tempfile::tempdir().expect("test workspace registry"));
         Self {
             scanner: NativeScanner::default(),
             storage_factory,
+            registry: Some(
+                WorkspaceRegistry::at(directory.path().join("workspaces.json"))
+                    .expect("registry path"),
+            ),
+            _registry_directory: Some(directory),
         }
+    }
+
+    fn registry(&self) -> Result<WorkspaceRegistry, EngineError> {
+        self.registry
+            .clone()
+            .map_or_else(WorkspaceRegistry::global, Ok)
+    }
+
+    /// A registry rename is authoritative; replay it into metadata after a crash.
+    fn reconcile_name(&self, manifest: &mut WorkspaceManifest) -> Result<(), EngineError> {
+        let registry = self.registry()?;
+        if let Some(name) = registry.name_for_root(&manifest.workspace.root)? {
+            manifest.workspace.name = name;
+        } else if let Some((name, _)) = moved_registration(&registry, manifest)? {
+            manifest.workspace.name = name;
+        } else if let Some(previous) = registry.root_for_name(&manifest.workspace.name)? {
+            return Err(EngineError::invalid_argument(format!(
+                "workspace name '{}' is already registered at {}; use index --name to choose another name",
+                manifest.workspace.name,
+                previous.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn register_name(
+        &self,
+        root: &Path,
+        existing: Option<&WorkspaceManifest>,
+        requested: Option<&str>,
+    ) -> Result<WorkspaceName, EngineError> {
+        let registry = self.registry()?;
+        let requested = requested.map(WorkspaceName::new).transpose()?;
+        if let Some(current) = registry.name_for_root(root)? {
+            let name = requested.unwrap_or_else(|| current.clone());
+            registry.rename(&current, &name, root)?;
+            return Ok(name);
+        }
+        if let Some(existing) = existing
+            && let Some((previous_name, previous_root)) = moved_registration(&registry, existing)?
+        {
+            registry.relocate(&previous_name, &previous_root, root)?;
+            let name = requested.unwrap_or_else(|| previous_name.clone());
+            registry.rename(&previous_name, &name, root)?;
+            return Ok(name);
+        }
+        let name = requested
+            .or_else(|| existing.map(|manifest| manifest.workspace.name.clone()))
+            .map_or_else(|| WorkspaceName::new(workspace_name(root)), Ok)?;
+        registry.register(&name, root)?;
+        Ok(name)
     }
 
     pub(crate) async fn index(
@@ -107,13 +168,27 @@ impl WorkspaceIndexService {
                 "index"
             },
         )?;
-        let (pending, recovered_publication) = recover_build(&location.home, factory.as_ref())?;
+        let (mut pending, recovered_publication) = recover_build(&location.home, factory.as_ref())?;
         if pending.is_some() && !options.rebuild && !options.changes.is_empty() {
             return Err(EngineError::resource_busy(
                 "workspace rebuild is pending; run index to resume it before processing watcher changes",
             ));
         }
-        let existing = read_workspace_manifest(&location.home)?;
+        let mut existing = read_workspace_manifest(&location.home)?;
+        let name = self.register_name(
+            &location.root,
+            existing
+                .as_ref()
+                .or_else(|| pending.as_ref().map(|build| &build.target)),
+            options.name.as_deref(),
+        )?;
+        options.name = Some(name.to_string());
+        if let Some(active) = &mut existing {
+            active.workspace.name = name.clone();
+        }
+        if let Some(build) = &mut pending {
+            build.target.workspace.name = name;
+        }
         let mut rebuilding = options.rebuild
             || pending.is_some()
             || existing
@@ -169,10 +244,11 @@ impl WorkspaceIndexService {
             .storage_factory
             .open(WorkspaceIndexStorageOptions::ReadWrite {
                 storage_path: manifest.storage_home(),
+                workspace_path: manifest.path.clone(),
                 embedding: storage_embedding_schema(&model),
             })?;
         let result = index_workspace(&IndexingContext {
-            workspace_index: &manifest.index_info(),
+            workspace_index: &manifest.workspace,
             storage: storage.as_ref(),
             scanner: &self.scanner,
             embedding_model: &model,
@@ -210,8 +286,7 @@ impl WorkspaceIndexService {
                 self.storage_factory.as_ref(),
             )?;
         } else {
-            manifest.updated_time = now;
-            manifest.generation = Some(indexed.generation);
+            manifest.record_revision(indexed.generation, now);
             write_workspace_manifest(&manifest.path, &manifest)?;
         }
         Ok(indexed)
@@ -255,10 +330,11 @@ impl WorkspaceIndexService {
                 .await?;
         }
         let _lock = acquire_home_lock(&location.home, LockMode::Read, "context")?;
-        let manifest = read_workspace_manifest(&location.home)?.ok_or_else(|| {
+        let mut manifest = read_workspace_manifest(&location.home)?.ok_or_else(|| {
             workspace_index_unavailable(&location.root, "workspace manifest disappeared")
         })?;
-        if manifest.index_policy == WorkspaceIndexPolicy::Disabled {
+        self.reconcile_name(&mut manifest)?;
+        if manifest.workspace.index_policy == IndexPolicy::Disabled {
             return Err(EngineError::unsupported(format!(
                 "workspace indexing is disabled at {}",
                 location.root.display()
@@ -290,10 +366,12 @@ impl WorkspaceIndexService {
         }
         let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: manifest.storage_home(),
+            workspace_path: manifest.path.clone(),
         })?;
         let result = context_from_index(
             &location.root,
-            &manifest.index_info(),
+            &manifest.workspace,
+            &manifest.path,
             storage.as_ref(),
             model
                 .as_ref()
@@ -325,20 +403,17 @@ impl WorkspaceIndexService {
         let Some(manifest) = read_workspace_manifest(&location.home)? else {
             return Ok(false);
         };
-        if !is_indexed(&manifest) || manifest.index_policy == WorkspaceIndexPolicy::Disabled {
+        if !is_indexed(&manifest) || manifest.workspace.index_policy == IndexPolicy::Disabled {
             return Ok(false);
         }
         assert_index_version(manifest.index_version)?;
         let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: manifest.storage_home(),
+            workspace_path: manifest.path.clone(),
         })?;
-        let status = get_workspace_index_status(
-            &manifest.index_info(),
-            storage.as_ref(),
-            &self.scanner,
-            None,
-        )
-        .await;
+        let status =
+            get_workspace_index_status(&manifest.workspace, storage.as_ref(), &self.scanner, None)
+                .await;
         let close = storage.close();
         let status = status?;
         close?;
@@ -359,9 +434,10 @@ impl WorkspaceIndexService {
             ));
         };
         let _lock = acquire_home_lock(&location.home, LockMode::Read, "info")?;
-        let Some(manifest) = read_workspace_manifest(&location.home)? else {
+        let Some(mut manifest) = read_workspace_manifest(&location.home)? else {
             return Ok(unindexed_info(location, WorkspaceIndexPolicy::Undecided));
         };
+        self.reconcile_name(&mut manifest)?;
         let metadata_indexed = is_indexed(&manifest);
         let storage_exists = self.storage_factory.exists(&manifest.storage_home())?;
         let indexed = metadata_indexed && storage_exists;
@@ -370,9 +446,10 @@ impl WorkspaceIndexService {
             let factory = &self.storage_factory;
             let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
                 storage_path: manifest.storage_home(),
+                workspace_path: manifest.path.clone(),
             })?;
             let status = get_workspace_index_status(
-                &manifest.index_info(),
+                &manifest.workspace,
                 storage.as_ref(),
                 &self.scanner,
                 None,
@@ -389,7 +466,7 @@ impl WorkspaceIndexService {
         Ok(InfoResult {
             root: location.root,
             indexed,
-            index_policy: manifest.index_policy,
+            index_policy: manifest.workspace.index_policy.into(),
             home: location.home,
             index_path: manifest.storage_home().join("storage"),
             source: if indexed {
@@ -397,7 +474,7 @@ impl WorkspaceIndexService {
             } else {
                 InfoSource::Unindexed
             },
-            workspace_index: Some(manifest.index_info()),
+            workspace_index: Some(workspace_info(&manifest)),
             status,
             suggestion: workspace_suggestion(&manifest, indexed),
         })
@@ -405,16 +482,49 @@ impl WorkspaceIndexService {
 
     pub(crate) fn drop_index(&self, options: &InfoOptions) -> Result<bool, EngineError> {
         let location = workspace_index_location_from_option(options.root.as_deref())?;
+        let registry = self.registry()?;
+        let name = registry.name_for_root(&location.root)?;
         let factory = &self.storage_factory;
-        if !workspace_has_index_data(&location, factory.as_ref())? {
+        if name.is_none() && !workspace_has_index_data(&location, factory.as_ref())? {
             return Ok(false);
+        }
+        if !location.root.try_exists().map_err(|error| {
+            EngineError::from_io(
+                format!("inspect workspace root {}", location.root.display()),
+                &error,
+            )
+        })? {
+            return registry.unregister_missing(&location.root);
         }
         let _lock = acquire_home_lock(&location.home, LockMode::Write, "index.drop")?;
-        if !workspace_has_index_data(&location, factory.as_ref())? {
-            return Ok(false);
+        let registration = if let Some(name) = registry.name_for_root(&location.root)? {
+            Some((name, location.root.clone()))
+        } else {
+            // Corrupt metadata must not prevent explicit cleanup. Valid metadata
+            // also lets a moved workspace release its previous registry location.
+            let manifest = read_workspace_manifest(&location.home)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    crate::workspace::build::read_build(&location.home)
+                        .ok()
+                        .flatten()
+                        .map(|build| build.target)
+                });
+            manifest
+                .as_ref()
+                .map(|manifest| moved_registration(&registry, manifest))
+                .transpose()?
+                .flatten()
+        };
+        let has_data = workspace_has_index_data(&location, factory.as_ref())?;
+        if has_data {
+            reset_workspace_index(&location, factory.as_ref())?;
         }
-        reset_workspace_index(&location, factory.as_ref())?;
-        Ok(true)
+        if let Some((name, registered_root)) = &registration {
+            registry.unregister(name, registered_root)?;
+        }
+        Ok(has_data || registration.is_some())
     }
 }
 
@@ -424,6 +534,7 @@ fn workspace_has_index_data(
 ) -> Result<bool, EngineError> {
     Ok(location.manifest_path.exists()
         || has_build(&location.home)
+        || crate::storage::workspace_identities_exist(&location.home)?
         || factory.exists(&location.home)?
         || has_generation_storage(&location.home)?)
 }
@@ -437,24 +548,31 @@ fn index_manifest(
 ) -> Result<WorkspaceManifest, EngineError> {
     let identity = active.or(settings);
     let now = epoch_millis();
-    let info = WorkspaceIndexInfo {
-        id: identity.map_or_else(|| Uuid::new_v4().to_string(), |value| value.id.clone()),
-        name: identity.map_or_else(
-            || workspace_name(&location.root),
-            |value| value.name.clone(),
-        ),
-        path: location.home.clone(),
+    let workspace = Workspace {
+        name: options
+            .name
+            .as_deref()
+            .map(WorkspaceName::new)
+            .transpose()?
+            .or_else(|| identity.map(|value| value.workspace.name.clone()))
+            .map_or_else(|| WorkspaceName::new(workspace_name(&location.root)), Ok)?,
         root: location.root.clone(),
-        discovery: resolve_discovery(settings, options),
-        policy: WorkspaceIndexPolicy::Enabled,
-        embedding: Some(embedding_schema(model)),
-        index_version: Some(CURRENT_INDEX_VERSION),
-        generation: active.and_then(|value| value.generation),
-        created_epoch_ms: identity.map_or(now, |value| value.created_time),
+        file_selection: resolve_discovery(settings, options),
+        index_policy: IndexPolicy::Enabled,
+        index: Some(WorkspaceIndex {
+            embedding: embedding_schema(model),
+            revision: active.and_then(WorkspaceManifest::revision).unwrap_or(0),
+        }),
+        created_epoch_ms: identity.map_or(now, |value| value.workspace.created_epoch_ms),
         updated_epoch_ms: now,
     };
     let runtime = embedding_runtime(settings, options, model)?;
-    let mut manifest = WorkspaceManifest::new(info, runtime)?;
+    let mut manifest = WorkspaceManifest::new(
+        workspace,
+        location.home.clone(),
+        Some(CURRENT_INDEX_VERSION),
+        runtime,
+    )?;
     manifest.storage_generation = active.and_then(|value| value.storage_generation.clone());
     Ok(manifest)
 }
@@ -607,7 +725,7 @@ fn acquire_search_model(
     options: &ContextOptions,
     root: &Path,
 ) -> Result<ModelRuntimeLease, EngineError> {
-    let schema = manifest.embedding.as_ref().ok_or_else(|| {
+    let schema = manifest.embedding().ok_or_else(|| {
         workspace_index_unavailable(&manifest.path, "embedding schema is missing")
     })?;
     let reference = format!("{}/{}", schema.provider, schema.model);
@@ -689,7 +807,7 @@ pub(crate) fn embedding_reference(
     resolve_embedding_reference(ResolveEmbeddingReferenceOptions {
         explicit: requested.map(|embedding| embedding.reference.clone()),
         existing: existing
-            .and_then(|manifest| manifest.embedding.as_ref())
+            .and_then(|manifest| manifest.embedding())
             .map(|embedding| format!("{}/{}", embedding.provider, embedding.model)),
         global_default: crate::config::string(&crate::config::read()?, &["defaults", "embedding"]),
         fallback: Some(DEFAULT_LOCAL_EMBEDDING.to_owned()),
@@ -717,20 +835,10 @@ fn assert_embedding_compatible(
     let Some(existing) = existing.filter(|manifest| is_indexed(manifest)) else {
         return Ok(());
     };
-    let Some(schema) = &existing.embedding else {
+    let Some(schema) = existing.embedding() else {
         return Ok(());
     };
-    let current = model.info();
-    if schema.provider == current.provider
-        && schema.model == current.name
-        && schema.dimension == current.dimension
-        && schema.metric == metric_name(current.metric)
-    {
-        return Ok(());
-    }
-    Err(EngineError::invalid_argument(
-        "existing index uses a different embedding model; rebuild the index",
-    ))
+    schema.ensure_compatible(&embedding_schema(model))
 }
 
 pub(crate) fn resolve_discovery(
@@ -741,7 +849,7 @@ pub(crate) fn resolve_discovery(
         DiscoveryOptions::default()
     } else {
         existing.map_or_else(DiscoveryOptions::default, |manifest| {
-            manifest.index_info().discovery
+            manifest.workspace.file_selection.clone()
         })
     };
     apply_discovery_overrides(&mut discovery, &options.discovery);
@@ -829,13 +937,13 @@ fn embedding_runtime(
     }
 }
 
-fn embedding_schema(model: &ModelRuntimeLease) -> WorkspaceIndexEmbedding {
+fn embedding_schema(model: &ModelRuntimeLease) -> EmbeddingSchema {
     let info = model.info();
-    WorkspaceIndexEmbedding {
+    EmbeddingSchema {
         provider: info.provider.clone(),
         model: info.name.clone(),
         dimension: info.dimension,
-        metric: metric_name(info.metric).to_owned(),
+        metric: info.metric,
     }
 }
 
@@ -846,14 +954,6 @@ fn storage_embedding_schema(model: &ModelRuntimeLease) -> WorkspaceIndexEmbeddin
         model: info.name.clone(),
         dimension: info.dimension,
         metric: info.metric,
-    }
-}
-
-const fn metric_name(metric: EmbeddingMetric) -> &'static str {
-    match metric {
-        EmbeddingMetric::Cosine => "cosine",
-        EmbeddingMetric::DotProduct => "dot",
-        EmbeddingMetric::Euclidean => "euclidean",
     }
 }
 
@@ -869,9 +969,7 @@ fn assert_index_version(version: Option<u32>) -> Result<(), EngineError> {
 }
 
 fn is_indexed(manifest: &WorkspaceManifest) -> bool {
-    manifest.index_policy == WorkspaceIndexPolicy::Enabled
-        && manifest.embedding.is_some()
-        && manifest.index_version.is_some()
+    manifest.workspace.indexed() && manifest.index_version.is_some()
 }
 
 fn validate_workspace_root(root: &Path) -> Result<(), EngineError> {
@@ -926,7 +1024,7 @@ fn unindexed_info(location: WorkspaceIndexLocation, policy: WorkspaceIndexPolicy
 }
 
 fn workspace_suggestion(manifest: &WorkspaceManifest, indexed: bool) -> Option<String> {
-    if manifest.index_policy == WorkspaceIndexPolicy::Disabled {
+    if manifest.workspace.index_policy == IndexPolicy::Disabled {
         Some("indexing is disabled for this workspace".to_owned())
     } else if !indexed {
         Some("workspace manifest exists but index storage is missing".to_owned())
@@ -946,6 +1044,38 @@ fn epoch_millis() -> u64 {
         .map_or(0, |duration| {
             duration.as_millis().try_into().unwrap_or(u64::MAX)
         })
+}
+
+fn workspace_info(manifest: &WorkspaceManifest) -> WorkspaceIndexInfo {
+    WorkspaceIndexInfo::from_workspace(&manifest.workspace, &manifest.path, manifest.index_version)
+}
+
+/// Find the old registration of a physically moved workspace. The recorded root
+/// also recovers a registry rename committed before the local manifest update.
+fn moved_registration(
+    registry: &WorkspaceRegistry,
+    manifest: &WorkspaceManifest,
+) -> Result<Option<(WorkspaceName, PathBuf)>, EngineError> {
+    let absent = |root: &Path| {
+        root.try_exists().map(|exists| !exists).map_err(|error| {
+            EngineError::from_io(
+                format!("inspect original workspace {}", root.display()),
+                &error,
+            )
+        })
+    };
+    if manifest.recorded_root != manifest.workspace.root
+        && absent(&manifest.recorded_root)?
+        && let Some(name) = registry.name_for_root(&manifest.recorded_root)?
+    {
+        return Ok(Some((name, manifest.recorded_root.clone())));
+    }
+    if let Some(root) = registry.root_for_name(&manifest.workspace.name)?
+        && absent(&root)?
+    {
+        return Ok(Some((manifest.workspace.name.clone(), root)));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -968,7 +1098,7 @@ mod tests {
             },
             info::InfoOptions,
         },
-        domain::FileRecord,
+        domain::{FileRecord, FileSelection, IndexPolicy, Workspace, WorkspaceName},
         storage::spi::{
             IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit, StoredEntity,
             WorkspaceIndexStorage, WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
@@ -1029,6 +1159,17 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn resolve_file_ids(
+            &self,
+            paths: &[std::path::PathBuf],
+        ) -> StorageResult<Vec<crate::domain::FileId>> {
+            assert!(
+                paths.is_empty(),
+                "this storage fixture only models empty workspaces"
+            );
+            Ok(Vec::new())
+        }
+
         fn get_entity(
             &self,
             _entity_id: &crate::domain::EntityId,
@@ -1066,7 +1207,7 @@ mod tests {
             Ok(())
         }
 
-        fn delete_file(&self, _file_id: &crate::domain::FileId) -> StorageResult<()> {
+        fn delete_file(&self, _file_id: crate::domain::FileId) -> StorageResult<()> {
             Ok(())
         }
 
@@ -1127,24 +1268,22 @@ mod tests {
     fn discovery_overrides_preserve_saved_settings_until_reset() {
         let directory = tempdir().expect("workspace");
         let manifest = crate::workspace::manifest::WorkspaceManifest::new(
-            crate::api::info::result::WorkspaceIndexInfo {
-                id: "workspace".into(),
-                name: "workspace".into(),
-                path: directory.path().join(".zvec-grep"),
+            Workspace {
+                name: WorkspaceName::new("workspace").expect("workspace name"),
                 root: directory.path().to_path_buf(),
-                discovery: DiscoveryOptions {
+                file_selection: FileSelection {
                     include_paths: vec!["src".into()],
                     globs: vec!["*.rs".into()],
                     hidden: true,
-                    ..DiscoveryOptions::default()
+                    ..FileSelection::default()
                 },
-                policy: crate::api::info::result::WorkspaceIndexPolicy::Enabled,
-                embedding: None,
-                index_version: None,
-                generation: None,
+                index_policy: IndexPolicy::Enabled,
+                index: None,
                 created_epoch_ms: 0,
                 updated_epoch_ms: 0,
             },
+            directory.path().join(".zvec-grep"),
+            None,
             crate::workspace::manifest::EmbeddingRuntimeConfig::default(),
         )
         .expect("manifest");
@@ -1230,7 +1369,7 @@ mod tests {
             .await
             .expect("moved workspace info");
         let workspace = info.workspace_index.expect("workspace index");
-        assert_eq!(workspace.id, before.id);
+        assert_eq!(workspace.name, before.workspace.name.as_str());
         assert_eq!(
             workspace.root,
             std::fs::canonicalize(&moved).expect("moved root")
@@ -1251,9 +1390,20 @@ mod tests {
         let after = super::read_workspace_manifest(&moved.join(".zvec-grep"))
             .expect("manifest read")
             .expect("manifest");
-        assert_eq!(after.id, before.id);
-        assert_eq!(after.discovery, before.discovery);
-        assert_eq!(after.root, moved);
+        assert_eq!(after.workspace.name, before.workspace.name);
+        assert_eq!(
+            after.workspace.file_selection,
+            before.workspace.file_selection
+        );
+        assert_eq!(after.workspace.root, moved);
+        assert_eq!(
+            service
+                .registry()
+                .expect("registry")
+                .root_for_name(&before.workspace.name)
+                .expect("registered move"),
+            Some(std::fs::canonicalize(&moved).expect("moved root"))
+        );
         models.close();
     }
 
@@ -1262,7 +1412,7 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
 
         assert!(
-            !WorkspaceIndexService::new()
+            !WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()))
                 .drop_index(&InfoOptions {
                     root: Some(directory.path().to_path_buf()),
                     include_status: false,
@@ -1295,6 +1445,34 @@ mod tests {
             !service
                 .drop_index(&options)
                 .expect("empty container is not an index")
+        );
+    }
+
+    #[test]
+    fn dropping_an_orphaned_identity_catalog_cleans_its_paths_without_a_manifest() {
+        let directory = tempdir().expect("workspace");
+        let home = directory.path().join(".zvec-grep");
+        std::fs::create_dir(&home).expect("workspace home");
+        // Explicit drop must also clean damaged catalogs without decoding them.
+        std::fs::write(home.join("identity.json"), b"broken identity catalog")
+            .expect("orphaned catalog");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let options = InfoOptions {
+            root: Some(directory.path().to_path_buf()),
+            include_status: false,
+        };
+        assert!(
+            service
+                .drop_index(&options)
+                .expect("drop orphaned identities")
+        );
+        assert!(!home.join("identity.json").exists());
+        assert!(home.join("identity.lock").is_file());
+        assert!(
+            !service
+                .drop_index(&options)
+                .expect("lock alone is not index data")
         );
     }
 
@@ -1372,8 +1550,11 @@ mod tests {
             published.storage_generation,
             pending.target.storage_generation
         );
-        assert_eq!(published.id, active.id);
-        assert_eq!(published.created_time, active.created_time);
+        assert_eq!(published.workspace.name, active.workspace.name);
+        assert_eq!(
+            published.workspace.created_epoch_ms,
+            active.workspace.created_epoch_ms
+        );
         assert_eq!(result.generation, 2);
         assert!(!super::has_build(&home));
         assert!(!active.storage_home().exists());
@@ -1449,6 +1630,552 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_drop_releases_a_deleted_source_directory_without_recreating_it() {
+        let directory = tempdir().expect("workspace roots");
+        let deleted = directory.path().join("deleted");
+        let replacement = directory.path().join("replacement");
+        std::fs::create_dir(&deleted).expect("original root");
+        std::fs::create_dir(&replacement).expect("replacement root");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    name: Some("shared".into()),
+                    ..empty_index_options(&deleted)
+                },
+            )
+            .await
+            .expect("original workspace owns name");
+        std::fs::remove_dir_all(&deleted).expect("source directory deleted externally");
+        let options = InfoOptions {
+            root: Some(deleted.clone()),
+            include_status: false,
+        };
+        assert!(
+            service
+                .drop_index(&options)
+                .expect("drop deleted workspace")
+        );
+        assert!(!deleted.exists());
+        assert!(!service.drop_index(&options).expect("idempotent cleanup"));
+        let name = WorkspaceName::new("shared").expect("workspace name");
+        let registry = service.registry().expect("registry");
+        assert_eq!(registry.root_for_name(&name).expect("released name"), None);
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    name: Some(name.to_string()),
+                    ..empty_index_options(&replacement)
+                },
+            )
+            .await
+            .expect("replacement workspace can reuse name");
+        assert_eq!(
+            registry.root_for_name(&name).expect("replacement owner"),
+            Some(std::fs::canonicalize(&replacement).expect("replacement root"))
+        );
+        models.close();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_moved_workspace_releases_its_old_registration_before_reindexing() {
+        let directory = tempdir().expect("workspace roots");
+        let original = directory.path().join("original");
+        let moved = directory.path().join("moved");
+        let replacement = directory.path().join("replacement");
+        std::fs::create_dir(&original).expect("original root");
+        std::fs::create_dir(&replacement).expect("replacement root");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    name: Some("shared".into()),
+                    ..empty_index_options(&original)
+                },
+            )
+            .await
+            .expect("original workspace owns name");
+        std::fs::rename(&original, &moved).expect("move without reopening index");
+        assert!(
+            service
+                .drop_index(&InfoOptions {
+                    root: Some(moved.clone()),
+                    include_status: false,
+                })
+                .expect("drop moved workspace")
+        );
+        let name = WorkspaceName::new("shared").expect("workspace name");
+        let registry = service.registry().expect("registry");
+        assert_eq!(registry.root_for_name(&name).expect("released name"), None);
+        assert!(!moved.join(".zvec-grep/manifest.json").exists());
+
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    name: Some("shared".into()),
+                    ..empty_index_options(&replacement)
+                },
+            )
+            .await
+            .expect("another root can reuse the dropped name");
+        assert_eq!(
+            registry.root_for_name(&name).expect("new owner"),
+            Some(std::fs::canonicalize(&replacement).expect("replacement root"))
+        );
+        models.close();
+    }
+
+    #[tokio::test]
+    async fn copied_pending_first_build_cannot_steal_the_original_name() {
+        let directory = tempdir().expect("workspace roots");
+        let original = directory.path().join("original");
+        let copy = directory.path().join("copy");
+        std::fs::create_dir(&original).expect("original root");
+        std::fs::create_dir_all(copy.join(".zvec-grep")).expect("copy home");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        let signal = tokio_util::sync::CancellationToken::new();
+        signal.cancel();
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    name: Some("shared".into()),
+                    signal: Some(signal),
+                    ..empty_index_options(&original)
+                },
+            )
+            .await
+            .expect_err("interrupted initial build");
+        let original_build = original.join(".zvec-grep/build.json");
+        let original_bytes = std::fs::read(&original_build).expect("original pending build");
+        assert!(!original.join(".zvec-grep/manifest.json").exists());
+        std::fs::copy(&original_build, copy.join(".zvec-grep/build.json"))
+            .expect("copy pending metadata");
+        let error = service
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(copy.clone()),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect_err("copy cannot claim the original reservation");
+        assert!(error.message().contains("already registered"));
+        let registry = service.registry().expect("registry");
+        assert_eq!(
+            registry
+                .root_for_name(&WorkspaceName::new("shared").expect("name"))
+                .expect("original owner"),
+            Some(std::fs::canonicalize(&original).expect("original root"))
+        );
+        assert_eq!(
+            std::fs::read(original_build).expect("original build unchanged"),
+            original_bytes
+        );
+        assert_eq!(
+            registry.name_for_root(&copy).expect("copy registration"),
+            None
+        );
+        assert!(!copy.join(".zvec-grep/manifest.json").exists());
+        models.close();
+    }
+
+    #[tokio::test]
+    async fn duplicate_names_are_rejected_before_model_acquisition() {
+        let directory = tempdir().expect("workspace roots");
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir(&first).expect("first workspace");
+        std::fs::create_dir(&second).expect("second workspace");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let first_models = ModelRuntimeManager::new();
+        service
+            .index(
+                &first_models,
+                IndexOptions {
+                    name: Some("shared".into()),
+                    ..empty_index_options(&first)
+                },
+            )
+            .await
+            .expect("first workspace owns name");
+
+        let second_models = ModelRuntimeManager::new();
+        let error = service
+            .clone()
+            .index(
+                &second_models,
+                IndexOptions {
+                    name: Some("shared".into()),
+                    ..empty_index_options(&second)
+                },
+            )
+            .await
+            .expect_err("second workspace cannot claim name");
+        assert!(error.message().contains("shared"));
+        assert!(error.message().contains("already registered"));
+        assert_eq!(second_models.snapshot().cached_runtimes, 0);
+        assert!(!second.join(".zvec-grep/manifest.json").exists());
+        assert!(!second.join(".zvec-grep/build.json").exists());
+        assert_eq!(
+            service
+                .registry()
+                .expect("registry")
+                .root_for_name(&WorkspaceName::new("shared").expect("name"))
+                .expect("owner"),
+            Some(std::fs::canonicalize(&first).expect("first root"))
+        );
+        first_models.close();
+        second_models.close();
+    }
+
+    #[tokio::test]
+    async fn explicit_rename_preserves_storage_and_file_identity_catalog() {
+        let directory = tempdir().expect("workspace");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    name: Some("before".into()),
+                    ..empty_index_options(directory.path())
+                },
+            )
+            .await
+            .expect("initial index");
+        let home = directory.path().join(".zvec-grep");
+        let before = super::read_workspace_manifest(&home)
+            .expect("manifest")
+            .expect("active workspace");
+        // Identities of previously deleted source files remain reserved across
+        // ordinary updates. Renaming must preserve their allocation history.
+        let identities = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "last_file_id": 7, "last_directory_id": 1,
+            "files": [{"path": {"encoding": "utf8", "value": "src/deleted.rs"}, "id": 7}],
+            "directories": [{"path": {"encoding": "utf8", "value": "src"}, "id": 1}]
+        }))
+        .expect("identity catalog");
+        std::fs::write(home.join("identity.json"), &identities).expect("existing file identities");
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    name: Some("after".into()),
+                    root: Some(directory.path().to_path_buf()),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect("rename workspace");
+        let after = super::read_workspace_manifest(&home)
+            .expect("manifest")
+            .expect("renamed workspace");
+        assert_eq!(after.workspace.name.as_str(), "after");
+        assert_eq!(after.storage_generation, before.storage_generation);
+        assert_eq!(
+            after.workspace.created_epoch_ms,
+            before.workspace.created_epoch_ms
+        );
+        assert_eq!(
+            std::fs::read(home.join("identity.json")).expect("retained file IDs"),
+            identities
+        );
+        let info = service
+            .info(InfoOptions {
+                root: Some(directory.path().to_path_buf()),
+                include_status: false,
+            })
+            .await
+            .expect("renamed info");
+        assert_eq!(info.workspace_index.expect("workspace").name, "after");
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(directory.path().to_path_buf()),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect("update keeps new name");
+        let updated = super::read_workspace_manifest(&home)
+            .expect("manifest")
+            .expect("updated workspace");
+        assert_eq!(updated.workspace.name, after.workspace.name);
+        assert_eq!(updated.storage_generation, before.storage_generation);
+        assert_eq!(
+            std::fs::read(home.join("identity.json")).expect("retained file IDs"),
+            identities
+        );
+        assert_eq!(
+            service
+                .registry()
+                .expect("registry")
+                .root_for_name(&WorkspaceName::new("before").expect("old name"))
+                .expect("released name"),
+            None
+        );
+        models.close();
+    }
+
+    #[tokio::test]
+    async fn registry_rename_is_replayed_after_manifest_update_is_interrupted() {
+        let directory = tempdir().expect("workspace");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    name: Some("before".into()),
+                    ..empty_index_options(directory.path())
+                },
+            )
+            .await
+            .expect("initial index");
+        let home = directory.path().join(".zvec-grep");
+        let before = super::read_workspace_manifest(&home)
+            .expect("manifest")
+            .expect("active workspace");
+        service
+            .registry()
+            .expect("registry")
+            .rename(
+                &before.workspace.name,
+                &WorkspaceName::new("replayed").expect("new name"),
+                directory.path(),
+            )
+            .expect("commit registry rename before crash");
+        let info = service
+            .info(InfoOptions {
+                root: Some(directory.path().to_path_buf()),
+                include_status: false,
+            })
+            .await
+            .expect("info reconciles name");
+        assert_eq!(info.workspace_index.expect("workspace").name, "replayed");
+        assert_eq!(
+            super::read_workspace_manifest(&home).expect("read-only info retained manifest"),
+            Some(before.clone())
+        );
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(directory.path().to_path_buf()),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect("index replays rename");
+        let after = super::read_workspace_manifest(&home)
+            .expect("manifest")
+            .expect("reconciled workspace");
+        assert_eq!(after.workspace.name.as_str(), "replayed");
+        assert_eq!(after.storage_generation, before.storage_generation);
+        models.close();
+    }
+
+    #[tokio::test]
+    async fn moved_workspace_recovers_a_rename_committed_only_to_the_registry() {
+        let directory = tempdir().expect("workspace roots");
+        let original = directory.path().join("original");
+        let moved = directory.path().join("moved");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        let before = move_after_interrupted_rename(&service, &models, &original, &moved).await;
+        let info = service
+            .info(InfoOptions {
+                root: Some(moved.clone()),
+                include_status: false,
+            })
+            .await
+            .expect("info resolves the authoritative name through the recorded old root");
+        assert_eq!(info.workspace_index.expect("workspace").name, "after");
+        let registry = service.registry().expect("registry");
+        let new_name = WorkspaceName::new("after").expect("new name");
+        assert_eq!(
+            registry.root_for_name(&new_name).expect("read-only info"),
+            Some(before.workspace.root.clone())
+        );
+        let home = moved.join(".zvec-grep");
+        assert_eq!(
+            super::read_workspace_manifest(&home)
+                .expect("manifest")
+                .expect("unchanged persisted name")
+                .workspace
+                .name,
+            before.workspace.name
+        );
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    root: Some(moved.clone()),
+                    ..IndexOptions::default()
+                },
+            )
+            .await
+            .expect("index rebinds the renamed workspace after the move");
+        let after = super::read_workspace_manifest(&home)
+            .expect("manifest")
+            .expect("reconciled workspace");
+        assert_eq!(after.workspace.name, new_name);
+        assert_eq!(after.storage_generation, before.storage_generation);
+        assert_eq!(
+            registry
+                .root_for_name(&new_name)
+                .expect("moved registration"),
+            Some(std::fs::canonicalize(&moved).expect("moved root"))
+        );
+        assert_eq!(
+            registry
+                .root_for_name(&before.workspace.name)
+                .expect("old name remains released"),
+            None
+        );
+        models.close();
+    }
+
+    #[tokio::test]
+    async fn drop_after_interrupted_rename_and_move_releases_the_authoritative_name() {
+        let directory = tempdir().expect("workspace roots");
+        let original = directory.path().join("original");
+        let moved = directory.path().join("moved");
+        let replacement = directory.path().join("replacement");
+        std::fs::create_dir(&replacement).expect("replacement root");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        move_after_interrupted_rename(&service, &models, &original, &moved).await;
+        assert!(
+            service
+                .drop_index(&InfoOptions {
+                    root: Some(moved),
+                    include_status: false,
+                })
+                .expect("drop the moved workspace before rename replay")
+        );
+        let registry = service.registry().expect("registry");
+        let new_name = WorkspaceName::new("after").expect("new name");
+        assert_eq!(
+            registry.root_for_name(&new_name).expect("released name"),
+            None
+        );
+        assert_eq!(
+            registry
+                .name_for_root(&original)
+                .expect("released old root"),
+            None
+        );
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    name: Some(new_name.to_string()),
+                    ..empty_index_options(&replacement)
+                },
+            )
+            .await
+            .expect("another workspace can reuse the authoritative name");
+        assert_eq!(
+            registry.root_for_name(&new_name).expect("new owner"),
+            Some(std::fs::canonicalize(&replacement).expect("replacement root"))
+        );
+        models.close();
+    }
+
+    async fn move_after_interrupted_rename(
+        service: &WorkspaceIndexService,
+        models: &ModelRuntimeManager,
+        original: &Path,
+        moved: &Path,
+    ) -> crate::workspace::manifest::WorkspaceManifest {
+        std::fs::create_dir(original).expect("original root");
+        let original = std::fs::canonicalize(original).expect("canonical original root");
+        service
+            .index(
+                models,
+                IndexOptions {
+                    name: Some("before".into()),
+                    ..empty_index_options(&original)
+                },
+            )
+            .await
+            .expect("initial index");
+        let before = super::read_workspace_manifest(&original.join(".zvec-grep"))
+            .expect("manifest")
+            .expect("active workspace");
+        service
+            .registry()
+            .expect("registry")
+            .rename(
+                &before.workspace.name,
+                &WorkspaceName::new("after").expect("new name"),
+                &original,
+            )
+            .expect("commit rename before manifest update is interrupted");
+        std::fs::rename(original, moved).expect("move without replaying the rename");
+        before
+    }
+
+    #[tokio::test]
+    async fn drop_releases_name_reserved_before_initial_model_failure() {
+        let directory = tempdir().expect("workspace");
+        let service =
+            WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
+        let models = ModelRuntimeManager::new();
+        let mut options = empty_index_options(directory.path());
+        options.name = Some("reserved".into());
+        options.embedding.as_mut().expect("model spec").revision = Some("unsupported".into());
+        let error = service
+            .index(&models, options)
+            .await
+            .expect_err("model acquisition fails");
+        assert_eq!(error.code(), crate::EngineError::UNSUPPORTED);
+        assert_eq!(models.snapshot().cached_runtimes, 0);
+        let home = directory.path().join(".zvec-grep");
+        assert!(!home.join("manifest.json").exists());
+        assert!(!home.join("build.json").exists());
+        let registry = service.registry().expect("registry");
+        let name = WorkspaceName::new("reserved").expect("name");
+        assert_eq!(
+            registry
+                .name_for_root(directory.path())
+                .expect("reservation"),
+            Some(name.clone())
+        );
+        let info = InfoOptions {
+            root: Some(directory.path().to_path_buf()),
+            include_status: false,
+        };
+        assert!(
+            service
+                .drop_index(&info)
+                .expect("drop reservation without manifest")
+        );
+        assert_eq!(registry.root_for_name(&name).expect("released name"), None);
+        assert!(!service.drop_index(&info).expect("idempotent drop"));
+        models.close();
+    }
+
+    #[tokio::test]
     async fn initial_build_cancelled_before_publication_resumes_from_a_subdirectory() {
         let directory = tempdir().expect("workspace");
         let nested = directory.path().join("src/nested");
@@ -1487,10 +2214,10 @@ mod tests {
             .expect("manifest")
             .expect("active");
         assert_eq!(active.storage_generation, pending.target.storage_generation);
-        assert_eq!(active.id, pending.target.id);
-        assert_eq!(active.generation, Some(1));
+        assert_eq!(active.workspace.name, pending.target.workspace.name);
+        assert_eq!(active.revision(), Some(1));
         assert_eq!(
-            std::fs::canonicalize(&active.root).expect("active workspace root"),
+            std::fs::canonicalize(&active.workspace.root).expect("active workspace root"),
             std::fs::canonicalize(directory.path()).expect("workspace root")
         );
         assert!(!nested.join(".zvec-grep").exists());
@@ -1505,26 +2232,12 @@ mod tests {
         let factory = Arc::new(MemoryStorageFactory::default());
         let service = WorkspaceIndexService::with_storage_factory(factory.clone());
         let models = ModelRuntimeManager::new();
-
+        let mut options = empty_index_options(directory.path());
+        options.discovery.include_paths = vec!["sources".into()];
+        options.embedding.as_mut().expect("local model").cache_dir =
+            Some(directory.path().join("model-cache"));
         let result = service
-            .index(
-                &models,
-                IndexOptions {
-                    root: Some(directory.path().to_path_buf()),
-                    discovery: DiscoveryOptions {
-                        include_paths: vec!["sources".into()],
-                        ..DiscoveryOptions::default()
-                    },
-                    embedding: Some(EmbeddingModelSpec {
-                        reference: "local/potion-code-16m-v2".to_owned(),
-                        revision: None,
-                        cache_dir: Some(directory.path().join("model-cache")),
-                        endpoint: None,
-                        device: Device::Cpu,
-                    }),
-                    ..IndexOptions::default()
-                },
-            )
+            .index(&models, options)
             .await
             .expect("empty workspace should index");
         assert_eq!(result.files_scanned, 0);
@@ -1594,12 +2307,18 @@ mod tests {
         let rebuilt = super::read_workspace_manifest(&info.home)
             .expect("manifest read")
             .expect("manifest");
-        assert_eq!(rebuilt.root, manifest.root);
-        assert_eq!(rebuilt.discovery, manifest.discovery);
+        assert_eq!(rebuilt.workspace.root, manifest.workspace.root);
+        assert_eq!(
+            rebuilt.workspace.file_selection,
+            manifest.workspace.file_selection
+        );
         assert_eq!(rebuilt.embedding_runtime, manifest.embedding_runtime);
-        assert_eq!(rebuilt.generation, Some(2));
-        assert_eq!(rebuilt.id, manifest.id);
-        assert_eq!(rebuilt.created_time, manifest.created_time);
+        assert_eq!(rebuilt.revision(), Some(2));
+        assert_eq!(rebuilt.workspace.name, manifest.workspace.name);
+        assert_eq!(
+            rebuilt.workspace.created_epoch_ms,
+            manifest.workspace.created_epoch_ms
+        );
         assert_ne!(rebuilt.storage_generation, manifest.storage_generation);
 
         assert!(service.drop_index(&info_options).expect("drop index"));

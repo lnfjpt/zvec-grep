@@ -12,7 +12,7 @@ use zg_engine::api::{
     info::{InfoOptions, InfoResult},
 };
 
-pub const CURRENT_DAEMON_PROTOCOL_VERSION: u32 = 8;
+pub const CURRENT_DAEMON_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DaemonRequest {
@@ -225,6 +225,33 @@ mod tests {
     }
 
     #[test]
+    fn index_name_round_trips_and_remains_optional() {
+        use zg_engine::api::index::IndexOptions;
+
+        let command = DaemonCommand::Index(IndexOptions {
+            name: Some("search-engine".to_owned()),
+            root: Some("/workspace".into()),
+            ..IndexOptions::default()
+        });
+        let mut encoded = serde_json::to_value(&command).expect("index command should serialize");
+        assert_eq!(encoded["request"]["name"], "search-engine");
+        let decoded: DaemonCommand =
+            serde_json::from_value(encoded.clone()).expect("index command should deserialize");
+        assert_eq!(decoded, command);
+
+        encoded["request"]
+            .as_object_mut()
+            .expect("index request object")
+            .remove("name");
+        let DaemonCommand::Index(options) =
+            serde_json::from_value(encoded).expect("index name may be omitted")
+        else {
+            panic!("index command");
+        };
+        assert!(options.name.is_none());
+    }
+
+    #[test]
     fn execute_request_round_trips() {
         let request = DaemonRequest {
             message_id: 7,
@@ -249,9 +276,10 @@ mod tests {
 
     #[test]
     fn indexed_source_bytes_and_entity_counts_round_trip_without_truncation_fields() {
+        use zg_engine::api::index::options::DiscoveryOptions;
         use zg_engine::api::info::{
             InfoResult,
-            result::{InfoSource, WorkspaceIndexPolicy, WorkspaceIndexStatus},
+            result::{InfoSource, WorkspaceIndexInfo, WorkspaceIndexPolicy, WorkspaceIndexStatus},
         };
 
         let count = u64::from(u32::MAX) + 1;
@@ -262,7 +290,18 @@ mod tests {
             home: "/workspace/.zvec-grep".into(),
             index_path: "/workspace/.zvec-grep/storage".into(),
             source: InfoSource::Index,
-            workspace_index: None,
+            workspace_index: Some(WorkspaceIndexInfo {
+                name: "search-engine".to_owned(),
+                path: "/workspace/.zvec-grep".into(),
+                root: "/workspace".into(),
+                discovery: DiscoveryOptions::default(),
+                policy: WorkspaceIndexPolicy::Enabled,
+                embedding: None,
+                index_version: Some(1),
+                generation: Some(1),
+                created_epoch_ms: 1,
+                updated_epoch_ms: 2,
+            }),
             status: Some(WorkspaceIndexStatus {
                 entities_indexed: count,
                 indexed_size_bytes: count + 3,
@@ -272,6 +311,8 @@ mod tests {
         }));
 
         let encoded = serde_json::to_value(&reply).expect("info reply should serialize");
+        assert_eq!(encoded["reply"]["workspace_index"]["name"], "search-engine");
+        assert!(encoded["reply"]["workspace_index"].get("id").is_none());
         let status = &encoded["reply"]["status"];
         assert_eq!(status["entities_indexed"], count);
         assert_eq!(status["indexed_size_bytes"], count + 3);

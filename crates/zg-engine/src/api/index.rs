@@ -16,6 +16,10 @@ pub mod options {
     #[serde(deny_unknown_fields)]
     #[allow(clippy::struct_excessive_bools)]
     pub struct IndexOptions {
+        /// Unique workspace name. Defaults to the root directory name on creation;
+        /// supplying a different name explicitly renames an existing workspace.
+        #[serde(default)]
+        pub name: Option<String>,
         /// Workspace whose index is being updated. `None` uses the working directory.
         pub root: Option<PathBuf>,
         pub rebuild: bool,
@@ -54,22 +58,7 @@ pub mod options {
         pub signal: Option<CancellationToken>,
     }
 
-    #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-    #[allow(clippy::struct_excessive_bools)]
-    pub struct DiscoveryOptions {
-        pub include_paths: Vec<String>,
-        pub exclude_paths: Vec<String>,
-        pub globs: Vec<String>,
-        pub insensitive_globs: Vec<String>,
-        pub file_types: Vec<String>,
-        pub excluded_file_types: Vec<String>,
-        pub hidden: bool,
-        pub no_ignore: bool,
-        pub ignore_files: Vec<PathBuf>,
-        pub max_depth: Option<usize>,
-        pub max_file_size_bytes: Option<u64>,
-        pub follow: bool,
-    }
+    pub use crate::domain::FileSelection as DiscoveryOptions;
 
     /// A normalized filesystem change relative to the workspace root.
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -82,15 +71,7 @@ pub mod options {
         Rescan,
     }
 
-    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum Device {
-        Auto,
-        Cpu,
-        Metal,
-        Vulkan,
-        Cuda,
-    }
+    pub use crate::models::Device;
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub struct EmbeddingModelSpec {

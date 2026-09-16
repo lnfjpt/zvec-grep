@@ -15,30 +15,29 @@ pub(crate) use spi::{ImageSource, Source, SourceKind, TextSource};
 pub(crate) use spi::ChunkOptions;
 
 // Indexing output.
-pub(crate) use spi::IndexingExtractionFragment;
+pub(crate) use spi::{
+    ExtractedEntity, ExtractedFragment, ExtractedWindow, IndexingExtractionFragment,
+};
 
 use crate::{
     EngineError,
-    domain::{Content, EntityFragment, FileRecord, TextRange},
+    domain::{Content, FileFormat, TextRange},
 };
 
 // Shared implementation helpers used by the format-specific extractors.
-use service::{
-    chunk_options_for_metadata, fit_text_to_chars, make_entity_id, symbol_type_name,
-    validate_source_file,
-};
+use service::{chunk_options_for_metadata, fit_text_to_chars, symbol_type_name, validate_formats};
 
 #[cfg(test)]
-use service::{test_content, test_file, test_source};
+use service::{test_content, test_source};
 
-pub(crate) fn source_kind(file: &FileRecord) -> Option<SourceKind> {
-    service::source_kind(file)
+pub(crate) fn source_kind(formats: &[FileFormat]) -> Option<SourceKind> {
+    service::source_kind(formats)
 }
 
 pub(crate) fn extract<'source>(
     source: impl Into<Source<'source>>,
     options: ChunkOptions,
-) -> Result<Vec<EntityFragment>, EngineError> {
+) -> Result<Vec<ExtractedFragment>, EngineError> {
     service::extract(source, options)
 }
 
@@ -50,7 +49,7 @@ pub(crate) fn extract_for_indexing<'source>(
 }
 
 pub(crate) fn vector_content_for_fragment(
-    fragment: &EntityFragment,
+    fragment: &ExtractedFragment,
     embedding_content: Option<&[Content]>,
     max_chars: Option<usize>,
 ) -> Vec<Content> {

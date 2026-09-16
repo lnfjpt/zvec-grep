@@ -1,15 +1,12 @@
 mod adapter;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use tree_sitter::{Language, Node, Parser};
 
 use crate::{
     EngineError,
-    domain::{
-        Content, Entity, EntityContent, EntityFragment, EntityMetadata, FileFormat, FragmentId,
-        SourceRange, SymbolType, WindowFragment,
-    },
+    domain::{Content, EntityContent, EntityMetadata, FileFormat, SourceRange, SymbolType},
     utils::{
         byte_offset_at_utf16_ceil, byte_offset_at_utf16_floor, collapse_whitespace,
         line_byte_offsets, take_utf16, utf16_len,
@@ -18,9 +15,9 @@ use crate::{
 
 use self::adapter::{LanguageAdapter, named_children, resolve_adapter, text};
 use super::{
-    ChunkOptions, IndexingExtractionFragment, TextRange, TextSource, chunk_options_for_metadata,
-    fit_text_to_chars, make_entity_id, symbol_type_name, text::extract_plain_text_fragments,
-    validate_source_file,
+    ChunkOptions, ExtractedEntity, ExtractedFragment, ExtractedWindow, IndexingExtractionFragment,
+    TextRange, TextSource, chunk_options_for_metadata, fit_text_to_chars, symbol_type_name,
+    text::extract_plain_text_fragments, validate_formats,
 };
 
 const DEFAULT_CODE_CHUNK_CHARS: usize = 3_600;
@@ -35,7 +32,6 @@ pub(super) fn extract_for_indexing(
     options: ChunkOptions,
 ) -> Result<Vec<IndexingExtractionFragment>, EngineError> {
     let jsx = source
-        .file
         .relative_path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"));
@@ -47,14 +43,13 @@ fn extract_code(
     options: ChunkOptions,
     jsx: bool,
 ) -> Result<Vec<IndexingExtractionFragment>, EngineError> {
-    if !super::service::is_code_source(&source.file) {
+    if !super::service::is_code_source(&source.formats) {
         return Ok(Vec::new());
     }
-    validate_source_file(&source.file)?;
+    validate_formats(&source.formats)?;
     let (max_chars, overlap_chars) = resolve_options(options)?;
 
     if source
-        .file
         .formats
         .iter()
         .any(|format| COMPONENT_CODE_FORMATS.contains(format))
@@ -67,11 +62,10 @@ fn extract_code(
         };
     }
 
-    let format = if source.file.formats.contains(&FileFormat::Cpp) {
+    let format = if source.formats.contains(&FileFormat::Cpp) {
         Some(FileFormat::Cpp)
     } else {
         source
-            .file
             .formats
             .iter()
             .copied()
@@ -241,37 +235,34 @@ fn append_entity(
 ) {
     let fragments =
         code_entity_to_search_fragments(source, adapter, entity, max_chars, overlap_chars);
-    let major_id = fragments
+    let owner_index = fragments
         .first()
         .filter(|fragment| fragment.starts_group)
-        .map(|_| make_entity_id(&source.file.id, output.len()));
+        .map(|_| output.len());
 
     for fragment in fragments {
-        let id = make_entity_id(&source.file.id, output.len());
+        let index = output.len();
         let entity_fragment = if fragment.starts_group {
             let Content::Text(outline) = fragment.content else {
                 unreachable!("code outline is text");
             };
-            EntityFragment::Representative(Entity {
-                id,
-                file_id: source.file.id.clone(),
+            ExtractedFragment::Representative(ExtractedEntity {
+                index,
                 range: fragment.range,
                 content: EntityContent::Outline(outline),
                 metadata: Some(fragment.metadata),
             })
-        } else if let Some(entity_id) = &major_id {
-            EntityFragment::Window(WindowFragment {
-                id: FragmentId::new(id.as_str()).expect("generated fragment id"),
-                entity_id: entity_id.clone(),
-                file_id: source.file.id.clone(),
+        } else if let Some(entity_index) = owner_index {
+            ExtractedFragment::Window(ExtractedWindow {
+                index,
+                entity_index,
                 range: fragment.range,
                 contents: vec![fragment.content],
                 metadata: Some(fragment.metadata),
             })
         } else {
-            EntityFragment::Standalone(Entity {
-                id,
-                file_id: source.file.id.clone(),
+            ExtractedFragment::Standalone(ExtractedEntity {
+                index,
                 range: fragment.range,
                 content: EntityContent::Source(vec![fragment.content]),
                 metadata: Some(fragment.metadata),
@@ -873,7 +864,7 @@ fn extract_script_blocks(
     let mut fragments = Vec::new();
     for block in find_script_blocks(&source.text) {
         let mut block_source = source.clone();
-        block_source.file.formats = vec![block.format];
+        block_source.formats = vec![block.format];
         block.text.clone_into(&mut block_source.text);
         let block_fragments = extract_code(
             &block_source,
@@ -983,37 +974,18 @@ fn remap_script_block_fragments(
     line_offsets: &[usize],
     start_byte_offset: usize,
 ) -> Vec<IndexingExtractionFragment> {
-    let id_map = fragments
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            (
-                item.fragment.document_id().to_owned(),
-                make_entity_id(&source.file.id, start_index + index),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-
     fragments
         .into_iter()
         .map(|mut item| {
-            let id = id_map
-                .get(item.fragment.document_id())
-                .expect("fragment ID is registered")
-                .clone();
             let range = match &mut item.fragment {
-                EntityFragment::Standalone(entity) | EntityFragment::Representative(entity) => {
-                    entity.id = id;
-                    entity.file_id = source.file.id.clone();
+                ExtractedFragment::Standalone(entity)
+                | ExtractedFragment::Representative(entity) => {
+                    entity.index += start_index;
                     &mut entity.range
                 }
-                EntityFragment::Window(window) => {
-                    window.id = FragmentId::new(id.as_str()).expect("generated fragment id");
-                    window.entity_id = id_map
-                        .get(window.entity_id.as_str())
-                        .expect("window owner is registered")
-                        .clone();
-                    window.file_id = source.file.id.clone();
+                ExtractedFragment::Window(window) => {
+                    window.index += start_index;
+                    window.entity_index += start_index;
                     &mut window.range
                 }
             };
@@ -1035,17 +1007,19 @@ fn remap_script_block_fragments(
 mod tests {
     use std::collections::HashSet;
 
-    use crate::domain::{
-        Content, EntityFragment, EntityMetadata, FileFormat, SourceRange, SymbolType, TextRange,
-    };
+    use crate::domain::{Content, EntityMetadata, FileFormat, SourceRange, SymbolType, TextRange};
 
     use super::super::test_content;
 
     use super::super::{
-        ChunkOptions, extract, extract_for_indexing, test_source, vector_content_for_fragment,
+        ChunkOptions, ExtractedFragment, extract, extract_for_indexing, test_source,
+        vector_content_for_fragment,
     };
 
-    fn named<'a>(fragments: &'a [super::EntityFragment], name: &str) -> &'a super::EntityFragment {
+    fn named<'a>(
+        fragments: &'a [super::ExtractedFragment],
+        name: &str,
+    ) -> &'a super::ExtractedFragment {
         fragments
             .iter()
             .find(|fragment| matches!(
@@ -1055,7 +1029,7 @@ mod tests {
             .unwrap_or_else(|| panic!("expected fragment for {name}"))
     }
 
-    fn assert_source_backed(source: &super::TextSource, fragment: &super::EntityFragment) {
+    fn assert_source_backed(source: &super::TextSource, fragment: &super::ExtractedFragment) {
         let Content::Text(content) = &test_content(fragment) else {
             panic!("text fragment expected");
         };
@@ -1141,7 +1115,7 @@ mod tests {
         assert_eq!(
             fragments
                 .iter()
-                .map(EntityFragment::document_id)
+                .map(ExtractedFragment::index)
                 .collect::<HashSet<_>>()
                 .len(),
             fragments.len()
@@ -1149,11 +1123,8 @@ mod tests {
         assert!(
             fragments
                 .iter()
-                .all(|fragment| fragment.document_id().len() == 64)
-        );
-        assert_eq!(
-            fragments[0].document_id(),
-            "be01deb2fd2d1004f29eef026b65afd85dedebc81db8eb7691e3d88116663b74"
+                .enumerate()
+                .all(|(index, fragment)| fragment.index() == index)
         );
     }
 
@@ -1338,7 +1309,7 @@ mod tests {
         )
         .expect("large extraction");
         let service = prepared.iter().find(|item| {
-            matches!(item.fragment, EntityFragment::Representative(_))
+            matches!(item.fragment, ExtractedFragment::Representative(_))
                 && matches!(
                     &item.fragment.metadata(),
                     Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == "Service"
@@ -1351,7 +1322,7 @@ mod tests {
         assert!(service_text.contains("function first(value: string)"));
 
         let function = prepared.iter().find(|item| {
-            matches!(item.fragment, EntityFragment::Representative(_))
+            matches!(item.fragment, ExtractedFragment::Representative(_))
                 && matches!(
                     &item.fragment.metadata(),
                     Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == "orchestrate"
@@ -1363,8 +1334,8 @@ mod tests {
         assert!(function_text.contains("calls: load, client.fetch, finalize"));
 
         for item in prepared.iter().filter(|item| {
-            item.fragment.entity_id() == service.fragment.entity_id()
-                && matches!(item.fragment, EntityFragment::Window(_))
+            item.fragment.entity_index() == service.fragment.entity_index()
+                && matches!(item.fragment, ExtractedFragment::Window(_))
         }) {
             assert_source_backed(&source, &item.fragment);
         }
@@ -1502,6 +1473,52 @@ mod tests {
     }
 
     #[test]
+    fn remaps_window_ownership_across_component_script_blocks() {
+        let body = (0..12)
+            .map(|index| format!("  const value{index} = step({index});"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!(
+            "<script>\nexport function first() {{\n{body}\n}}\n</script>\n\
+             <script lang=\"ts\">\nexport function second() {{\n{body}\n}}\n</script>"
+        );
+        for (format, path) in [
+            (FileFormat::Vue, "fixture.vue"),
+            (FileFormat::Svelte, "fixture.svelte"),
+        ] {
+            let source = test_source(format, path, &text);
+            let fragments = extract(
+                &source,
+                ChunkOptions {
+                    max_chunk_chars: Some(100),
+                    chunk_overlap_chars: Some(10),
+                },
+            )
+            .expect("component extraction");
+            let first = named(&fragments, "first");
+            let second = named(&fragments, "second");
+            assert!(matches!(first, ExtractedFragment::Representative(_)));
+            assert!(matches!(second, ExtractedFragment::Representative(_)));
+            assert_ne!(first.index(), second.index());
+            for (index, fragment) in fragments.iter().enumerate() {
+                assert_eq!(fragment.index(), index);
+                if let ExtractedFragment::Window(window) = fragment {
+                    let owner = &fragments[window.entity_index];
+                    assert!(matches!(owner, ExtractedFragment::Representative(_)));
+                    assert_eq!(owner.metadata(), fragment.metadata());
+                    assert_source_backed(&source, fragment);
+                }
+            }
+            for owner in [first, second] {
+                assert!(fragments.iter().any(|fragment| matches!(
+                    fragment,
+                    ExtractedFragment::Window(window) if window.entity_index == owner.index()
+                )));
+            }
+        }
+    }
+
+    #[test]
     fn unicode_windows_are_source_backed_and_character_bounded() {
         let source = test_source(
             FileFormat::TypeScript,
@@ -1526,7 +1543,7 @@ mod tests {
                     matches!(
                         &fragment.metadata(),
                         Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == "emoji"
-                    ) && !matches!(fragment, EntityFragment::Representative(_))
+                    ) && !matches!(fragment, ExtractedFragment::Representative(_))
                 })
                 .collect::<Vec<_>>();
             assert!(windows.len() > 2);

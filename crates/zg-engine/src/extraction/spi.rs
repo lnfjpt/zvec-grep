@@ -1,16 +1,18 @@
 //! Prepared inputs and indexing options for extraction.
 
-use crate::domain::{Content, EntityFragment, FileFormat, FileRecord, ImageContent};
+use crate::domain::{
+    Content, EntityContent, EntityMetadata, FileFormat, ImageContent, SourcePath, SourceRange,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TextSource {
-    pub file: FileRecord,
+    pub relative_path: SourcePath,
+    pub formats: Vec<FileFormat>,
     pub text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ImageSource {
-    pub file: FileRecord,
     pub content: ImageContent,
 }
 
@@ -46,7 +48,79 @@ pub(crate) struct ChunkOptions {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexingExtractionFragment {
-    pub fragment: EntityFragment,
+    pub fragment: ExtractedFragment,
     /// Optional compacted content used only for embedding.
     pub embedding_source: Option<Vec<Content>>,
+}
+
+/// Source fragments whose indices and ownership are local to one extraction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExtractedFragment {
+    Standalone(ExtractedEntity),
+    Representative(ExtractedEntity),
+    Window(ExtractedWindow),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExtractedEntity {
+    pub index: usize,
+    pub range: SourceRange,
+    pub content: EntityContent,
+    pub metadata: Option<EntityMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExtractedWindow {
+    pub index: usize,
+    pub entity_index: usize,
+    pub range: SourceRange,
+    pub contents: Vec<Content>,
+    pub metadata: Option<EntityMetadata>,
+}
+
+impl ExtractedFragment {
+    pub(crate) fn index(&self) -> usize {
+        match self {
+            Self::Standalone(entity) | Self::Representative(entity) => entity.index,
+            Self::Window(window) => window.index,
+        }
+    }
+
+    pub(crate) fn entity_index(&self) -> usize {
+        match self {
+            Self::Standalone(entity) | Self::Representative(entity) => entity.index,
+            Self::Window(window) => window.entity_index,
+        }
+    }
+
+    pub(crate) fn range(&self) -> &SourceRange {
+        match self {
+            Self::Standalone(entity) | Self::Representative(entity) => &entity.range,
+            Self::Window(window) => &window.range,
+        }
+    }
+
+    pub(crate) fn metadata(&self) -> Option<&EntityMetadata> {
+        match self {
+            Self::Standalone(entity) | Self::Representative(entity) => entity.metadata.as_ref(),
+            Self::Window(window) => window.metadata.as_ref(),
+        }
+    }
+
+    pub(crate) fn contents(&self) -> &[Content] {
+        match self {
+            Self::Standalone(entity) | Self::Representative(entity) => match &entity.content {
+                EntityContent::Source(contents) => contents,
+                EntityContent::Outline(_) => &[],
+            },
+            Self::Window(window) => &window.contents,
+        }
+    }
+
+    pub(crate) fn as_entity(&self) -> Option<&ExtractedEntity> {
+        match self {
+            Self::Standalone(entity) | Self::Representative(entity) => Some(entity),
+            Self::Window(_) => None,
+        }
+    }
 }

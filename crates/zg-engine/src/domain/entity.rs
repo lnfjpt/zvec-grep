@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{EngineError, EngineResult};
 
 use super::{Content, FileId, SourceRange};
@@ -133,8 +135,9 @@ impl EntityFragment {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum SymbolType {
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolType {
     Module,
     Class,
     Interface,
@@ -164,14 +167,14 @@ pub(crate) enum EntityMetadata {
 
 /// Checks identities, ownership, and ranges for the fragments of one source file.
 pub(crate) fn validate_fragments<'a>(
-    file_id: &FileId,
+    file_id: FileId,
     fragments: impl IntoIterator<Item = &'a EntityFragment> + Clone,
 ) -> EngineResult<()> {
     let mut document_ids = HashSet::new();
     let mut representatives = HashMap::new();
 
     for fragment in fragments.clone() {
-        if fragment.file_id() != file_id {
+        if *fragment.file_id() != file_id {
             return Err(EngineError::invalid_argument(format!(
                 "fragment {} belongs to a different source file",
                 fragment.document_id()
@@ -232,7 +235,7 @@ mod tests {
     use crate::domain::{ByteRange, TextRange};
 
     fn file_id() -> FileId {
-        FileId::new("source").expect("file id")
+        FileId::new(1)
     }
 
     fn range(start: usize, end: usize) -> SourceRange {
@@ -263,7 +266,7 @@ mod tests {
     }
 
     fn assert_invalid(fragments: &[EntityFragment], message: &str) {
-        let error = validate_fragments(&file_id(), fragments).expect_err("invalid fragments");
+        let error = validate_fragments(file_id(), fragments).expect_err("invalid fragments");
         assert_eq!(error.code(), EngineError::INVALID_ARGUMENT);
         assert!(error.message().contains(message), "{error}");
     }
@@ -277,7 +280,7 @@ mod tests {
             EntityFragment::Representative(entity("group")),
         ];
 
-        validate_fragments(&file_id(), &fragments).expect("valid file batch");
+        validate_fragments(file_id(), &fragments).expect("valid file batch");
         assert_eq!(fragments.len(), 4);
         assert_eq!(
             fragments
@@ -336,7 +339,7 @@ mod tests {
     #[test]
     fn rejects_wrong_files_invalid_ranges_and_outside_windows() {
         let mut wrong_file = window("window", "group");
-        wrong_file.file_id = FileId::new("another-source").expect("file id");
+        wrong_file.file_id = FileId::new(2);
         assert_invalid(
             &[
                 EntityFragment::Representative(entity("group")),
@@ -360,7 +363,7 @@ mod tests {
             start_offset: 2,
             end_offset: 1,
         });
-        assert!(validate_fragments(&file_id(), &[EntityFragment::Standalone(invalid)]).is_err());
+        assert!(validate_fragments(file_id(), &[EntityFragment::Standalone(invalid)]).is_err());
     }
 
     #[test]
@@ -378,10 +381,10 @@ mod tests {
                 EntityFragment::Representative(representative),
                 EntityFragment::Window(equal_window),
             ];
-            validate_fragments(&file_id(), &fragments).expect("either content role is valid");
-            validate_fragments(&file_id(), &fragments[..1]).expect("windows are optional");
+            validate_fragments(file_id(), &fragments).expect("either content role is valid");
+            validate_fragments(file_id(), &fragments[..1]).expect("windows are optional");
         }
-        validate_fragments(&file_id(), &[]).expect("empty source produces no fragments");
+        validate_fragments(file_id(), &[]).expect("empty source produces no fragments");
         let mut empty = entity("empty");
         empty.content = EntityContent::Source(Vec::new());
         assert_invalid(&[EntityFragment::Standalone(empty)], "has no content");

@@ -25,9 +25,9 @@ use llama_cpp_2::{
 use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::{api::index::options::Device, models::artifacts::publish_downloaded_file};
-
 use super::{
+    Device,
+    artifacts::publish_downloaded_file,
     catalog::LlamaCppConfig,
     compute::ModelComputeRuntime,
     download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},

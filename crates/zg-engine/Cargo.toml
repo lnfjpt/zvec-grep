@@ -19,7 +19,6 @@ vulkan = ["llama-cpp-2/vulkan", "ort/webgpu"]
 async-trait.workspace = true
 base64 = "0.23.1"
 futures-util = "0.3.34"
-flate2 = "1.1.10"
 globset.workspace = true
 grep.workspace = true
 half = "2.7.1"
@@ -52,7 +51,7 @@ tree-sitter-typescript.workspace = true
 uuid.workspace = true
 zg-engine-macros = { path = "macros" }
 zg-host-native = { path = "../zg-host-native" }
-zvec-rust = "=0.7.0"
+zvec-rust.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }

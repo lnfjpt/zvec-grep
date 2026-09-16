@@ -166,6 +166,10 @@ smoke test with:
 npm run test:package
 ```
 
+The build stages zvec 0.7.1's shared library and `data/jieba_dict` resources
+beside the executable. Both local and release packages include these SDK assets;
+the engine no longer extracts its own dictionary cache.
+
 Pass `--no-build` after `--` to reuse an existing `target/release/zg`, or pass
 `--prefix <path>` to install or smoke-test under a custom npm prefix:
 
@@ -205,6 +209,10 @@ node scripts/npm-release.mjs pack-platform \
   --lib-dir /path/to/runtime-libs \
   --no-build
 ```
+
+The runtime library directory must include zvec's shared library and its
+`data/jieba_dict` directory. Without `--lib-dir`, these assets are read from
+the binary's directory.
 
 All native platform packages must be published and smoke-tested before the meta
 package. The release script intentionally does not run `npm publish` or move a

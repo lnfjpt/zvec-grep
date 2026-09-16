@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     future::Future,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -27,15 +27,16 @@ use crate::{
             },
             result::{IndexResult, SkippedFile, SkippedFileReason, TimingEntry},
         },
-        info::result::{WorkspaceIndexInfo, WorkspaceIndexPolicy, WorkspaceIndexStatus},
+        info::result::WorkspaceIndexStatus,
     },
     domain::{
-        EntityFragment, FileCategory, FileFormat, FileId, FileIndexStatus, FileRecord,
-        FileSnapshot, ImageContent, validate_fragments,
+        Entity, EntityFragment, EntityId, FileCategory, FileFormat, FileId, FileIndexStatus,
+        FileRecord, FileSnapshot, FragmentId, ImageContent, IndexPolicy, SourcePath,
+        WindowFragment, Workspace, validate_fragments,
     },
     extraction::{
-        ImageSource, IndexingExtractionFragment, SourceKind, TextSource, extract_for_indexing,
-        source_kind, vector_content_for_fragment,
+        ExtractedFragment, ImageSource, IndexingExtractionFragment, SourceKind, TextSource,
+        extract_for_indexing, source_kind, vector_content_for_fragment,
     },
     models::{
         EmbeddingInput, EmbeddingInputKind, EmbeddingModelInfo, EmbeddingOptions, EmbeddingPurpose,
@@ -45,7 +46,7 @@ use crate::{
     utils::{collapse_whitespace, decode_text, sha256_hex},
 };
 
-use super::input_budget::index_chunk_options;
+use super::{input_budget::index_chunk_options, model_progress};
 
 const MAX_SKIPPED_FILE_SAMPLES: usize = 20;
 const COMMIT_BATCH_FILES: usize = 64;
@@ -82,12 +83,13 @@ impl IndexEmbeddingRuntime for ModelRuntimeLease {
         options: EmbeddingOptions,
         progress: Option<IndexProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError> {
-        self.embed(contents, options, progress).await
+        self.embed(contents, options, progress.map(model_progress::for_index))
+            .await
     }
 }
 
 pub(crate) struct IndexingContext<'context> {
-    pub workspace_index: &'context WorkspaceIndexInfo,
+    pub workspace_index: &'context Workspace,
     pub storage: &'context dyn WorkspaceIndexStorage,
     pub scanner: &'context dyn WorkspaceScannerPort,
     pub embedding_model: &'context dyn IndexEmbeddingRuntime,
@@ -197,7 +199,7 @@ pub(crate) async fn index_workspace(
 }
 
 pub(crate) async fn get_workspace_index_status(
-    workspace_index: &WorkspaceIndexInfo,
+    workspace_index: &Workspace,
     storage: &dyn WorkspaceIndexStorage,
     scanner: &dyn WorkspaceScannerPort,
     signal: Option<CancellationToken>,
@@ -300,16 +302,34 @@ enum CandidateKind {
 
 struct IndexCandidate {
     kind: CandidateKind,
-    file: FileRecord,
-    discovered: DiscoveredFile,
+    scanned: ScannedFile,
     existing: Option<FileRecord>,
-    detection_error: Option<EngineError>,
 }
 
 struct ScannedFile {
-    file: FileRecord,
+    id: Option<FileId>,
+    relative_path: SourcePath,
+    formats: Vec<FileFormat>,
     discovered: DiscoveredFile,
     detection_error: Option<EngineError>,
+}
+
+impl ScannedFile {
+    fn to_record(&self) -> Result<FileRecord, EngineError> {
+        Ok(FileRecord {
+            id: self
+                .id
+                .ok_or_else(|| EngineError::internal("file must be registered before indexing"))?,
+            relative_path: self.relative_path.clone(),
+            formats: self.formats.clone(),
+            snapshot: FileSnapshot {
+                size_bytes: self.discovered.size_bytes,
+                modified_epoch_ms: self.discovered.modified_epoch_ms,
+                content_hash: None,
+            },
+            index_status: FileIndexStatus::NotIndexed,
+        })
+    }
 }
 
 async fn run_index_pass(
@@ -362,7 +382,8 @@ async fn run_index_pass(
     .await?;
     skipped.extend(classification_skips);
     skipped.truncate(MAX_SKIPPED_FILE_SAMPLES);
-    let scanned = scope.filter_scanned(&context.workspace_index.root, scanned);
+    let mut scanned = scope.filter_scanned(&context.workspace_index.root, scanned);
+    resolve_scanned_identities(context.storage, &mut scanned)?;
     timings.record("index_scan", scan_started.elapsed(), scanned.len());
 
     let diff_started = Instant::now();
@@ -388,7 +409,7 @@ async fn run_index_pass(
     let delete_started = Instant::now();
     for file in &diff.deleted {
         throw_if_cancelled(context.signal.as_ref())?;
-        context.storage.delete_file(&file.id).map_err(|error| {
+        context.storage.delete_file(file.id).map_err(|error| {
             EngineError::storage_failure(format!(
                 "delete stale file {}: {error}",
                 file.relative_path.display()
@@ -410,30 +431,55 @@ async fn run_index_pass(
     })
 }
 
+fn resolve_scanned_identities(
+    storage: &dyn WorkspaceIndexStorage,
+    scanned: &mut [ScannedFile],
+) -> Result<(), EngineError> {
+    // Classification is also used by read-only status checks. Durable identities
+    // are allocated only for files this indexing pass will actually process.
+    let paths = scanned
+        .iter()
+        .map(|scan| scan.relative_path.to_path_buf())
+        .collect::<Vec<_>>();
+    let ids = storage.resolve_file_ids(&paths)?;
+    if ids.len() != scanned.len() {
+        return Err(EngineError::storage_failure(
+            "file catalog returned an incorrect number of identities",
+        ));
+    }
+    for (scan, id) in scanned.iter_mut().zip(ids) {
+        if scan.id.is_some_and(|existing| existing != id) {
+            return Err(EngineError::storage_failure(
+                "file catalog identity differs from the stored file",
+            ));
+        }
+        scan.id = Some(id);
+    }
+    Ok(())
+}
+
 fn compute_diff(scanned: Vec<ScannedFile>, existing_files: &[FileRecord]) -> DiffPlan {
-    let existing_by_id = existing_files
+    let mut existing_by_path = existing_files
         .iter()
         .cloned()
-        .map(|file| (file.id.clone(), file))
+        .map(|file| (file.relative_path.clone(), file))
         .collect::<HashMap<_, _>>();
-    let mut seen = HashSet::new();
     let mut plan = DiffPlan {
         files_scanned: scanned.len(),
         ..DiffPlan::default()
     };
 
     for scanned in scanned {
-        seen.insert(scanned.file.id.clone());
-        let existing = existing_by_id.get(&scanned.file.id).cloned();
+        let existing = existing_by_path.remove(&scanned.relative_path);
         let kind = match &existing {
             None => CandidateKind::Added,
             Some(existing) if !existing.index_status.is_indexed() => CandidateKind::Pending,
             Some(existing)
                 if scanned.detection_error.is_none()
                     && existing.snapshot.modified_epoch_ms.is_some()
-                    && existing.snapshot.size_bytes == scanned.file.snapshot.size_bytes
+                    && existing.snapshot.size_bytes == scanned.discovered.size_bytes
                     && existing.snapshot.modified_epoch_ms
-                        == scanned.file.snapshot.modified_epoch_ms
+                        == scanned.discovered.modified_epoch_ms
                     && existing.snapshot.content_hash.is_some() =>
             {
                 plan.unchanged += 1;
@@ -444,16 +490,11 @@ fn compute_diff(scanned: Vec<ScannedFile>, existing_files: &[FileRecord]) -> Dif
         plan.increment(kind);
         plan.candidates.push(IndexCandidate {
             kind,
-            file: scanned.file,
-            discovered: scanned.discovered,
-            detection_error: scanned.detection_error,
+            scanned,
             existing,
         });
     }
-    plan.deleted = existing_by_id
-        .into_values()
-        .filter(|file| !seen.contains(&file.id))
-        .collect();
+    plan.deleted = existing_by_path.into_values().collect();
     plan.deleted
         .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     plan
@@ -481,13 +522,14 @@ async fn resolve_status_modifications(
 ) -> Result<(), EngineError> {
     let mut same_content = 0;
     for candidate in &diff.candidates {
-        if candidate.kind != CandidateKind::Modified || candidate.detection_error.is_some() {
+        if candidate.kind != CandidateKind::Modified || candidate.scanned.detection_error.is_some()
+        {
             continue;
         }
-        let source = read_source(scanner, control, &candidate.discovered).await?;
+        let source = read_source(scanner, control, &candidate.scanned.discovered).await?;
         let hash = sha256_hex(&source.bytes);
         if candidate.existing.as_ref().is_some_and(|existing| {
-            existing.snapshot.size_bytes == candidate.file.snapshot.size_bytes
+            existing.snapshot.size_bytes == candidate.scanned.discovered.size_bytes
                 && existing.snapshot.content_hash.as_deref() == Some(hash.as_str())
         }) {
             same_content += 1;
@@ -557,12 +599,12 @@ async fn index_candidates(
             progress_base,
             Some(format!(
                 "reading {}",
-                candidate.file.relative_path.display()
+                candidate.scanned.relative_path.display()
             )),
             None,
         );
         let prepare_started = Instant::now();
-        let prepared = if let Some(error) = candidate.detection_error.take() {
+        let prepared = if let Some(error) = candidate.scanned.detection_error.take() {
             Err(error)
         } else {
             prepare_candidate(context, control, &candidate).await
@@ -575,14 +617,18 @@ async fn index_candidates(
             }
             Ok(PreparedCandidate::File(prepared)) => *prepared,
             Err(error) => {
-                let reason = mark_file_failed(context.storage, &candidate.file, "prepare", &error)?;
-                record_file_failed(&mut stats, &candidate.file, &reason);
+                let file = candidate.scanned.to_record()?;
+                let reason = mark_file_failed(context.storage, &file, "prepare", &error)?;
+                record_file_failed(&mut stats, &file, &reason);
                 report_indexing(
                     context,
                     &stats,
                     diff,
                     progress_base,
-                    Some(format!("failed {}", candidate.file.relative_path.display())),
+                    Some(format!(
+                        "failed {}",
+                        candidate.scanned.relative_path.display()
+                    )),
                     None,
                 );
                 continue;
@@ -805,9 +851,9 @@ async fn prepare_candidate(
     control: &TaskControl,
     candidate: &IndexCandidate,
 ) -> Result<PreparedCandidate, EngineError> {
-    let source = read_source(context.scanner, control, &candidate.discovered).await?;
+    let source = read_source(context.scanner, control, &candidate.scanned.discovered).await?;
 
-    let mut file = candidate.file.clone();
+    let mut file = candidate.scanned.to_record()?;
     file.snapshot.size_bytes = u64::try_from(source.bytes.len())
         .map_err(|_| EngineError::invalid_argument("source byte length exceeds u64"))?;
     file.snapshot.content_hash = Some(sha256_hex(&source.bytes));
@@ -820,7 +866,7 @@ async fn prepare_candidate(
         return Ok(PreparedCandidate::Unchanged);
     }
 
-    let image_format = match source_kind(&file) {
+    let image_format = match source_kind(&file.formats) {
         Some(SourceKind::Image(format)) => Some(format),
         Some(SourceKind::Text) => None,
         None => {
@@ -846,21 +892,21 @@ async fn prepare_candidate(
     );
     let extracted = if let Some(format) = image_format {
         let image = ImageSource {
-            file: file.clone(),
             content: ImageContent::new(source.bytes, format)?,
         };
         extract_for_indexing(&image, chunk_options)?
     } else {
         let text = TextSource {
-            file: file.clone(),
+            relative_path: file.relative_path.clone(),
+            formats: file.formats.clone(),
             text: source_text
                 .expect("text decoded for non-image source")
                 .into_owned(),
         };
         extract_for_indexing(&text, chunk_options)?
     };
-    validate_fragments(&file.id, extracted.iter().map(|item| &item.fragment))?;
-    let fragments = prepare_fragments(extracted, chunk_options.max_chunk_chars);
+    let fragments = prepare_fragments(file.id, extracted, chunk_options.max_chunk_chars);
+    validate_fragments(file.id, fragments.iter().map(|item| &item.fragment))?;
     Ok(PreparedCandidate::File(Box::new(PreparedFile {
         file,
         fragments,
@@ -868,6 +914,7 @@ async fn prepare_candidate(
 }
 
 fn prepare_fragments(
+    file_id: FileId,
     extracted: Vec<IndexingExtractionFragment>,
     max_chars: Option<usize>,
 ) -> Vec<PreparedFragment> {
@@ -879,9 +926,38 @@ fn prepare_fragments(
                 item.embedding_source.as_deref(),
                 max_chars,
             )),
-            fragment: item.fragment,
+            fragment: bind_fragment(file_id, item.fragment),
         })
         .collect()
+}
+
+fn bind_fragment(file_id: FileId, fragment: ExtractedFragment) -> EntityFragment {
+    let index = fragment.index();
+    let entity_id = |index| {
+        EntityId::new(sha256_hex(format!("{file_id}\0{index}").as_bytes()))
+            .expect("SHA-256 produces a nonempty entity ID")
+    };
+    let bind_entity = |entity: crate::extraction::ExtractedEntity| Entity {
+        id: entity_id(index),
+        file_id,
+        range: entity.range,
+        content: entity.content,
+        metadata: entity.metadata,
+    };
+    match fragment {
+        ExtractedFragment::Standalone(entity) => EntityFragment::Standalone(bind_entity(entity)),
+        ExtractedFragment::Representative(entity) => {
+            EntityFragment::Representative(bind_entity(entity))
+        }
+        ExtractedFragment::Window(window) => EntityFragment::Window(WindowFragment {
+            id: FragmentId::new(entity_id(index).as_str()).expect("nonempty fragment ID"),
+            entity_id: entity_id(window.entity_index),
+            file_id,
+            range: window.range,
+            contents: window.contents,
+            metadata: window.metadata,
+        }),
+    }
 }
 
 fn count_public_entities(fragments: &[PreparedFragment]) -> usize {
@@ -911,7 +987,7 @@ fn mark_file_failed(
 
 fn record_file_failed(stats: &mut IndexStats, file: &FileRecord, reason: &str) {
     stats.files_failed += 1;
-    stats.failed_files.push(file.relative_path.clone());
+    stats.failed_files.push(file.relative_path.to_path_buf());
     stats
         .failed_reasons
         .push(format!("{}: {reason}", file.relative_path.display()));
@@ -1562,17 +1638,8 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
             "indexing requires writable workspace storage",
         ));
     }
-    if context.workspace_index.id.trim().is_empty() {
-        return Err(EngineError::invalid_argument(
-            "indexing requires a workspace index id",
-        ));
-    }
-    if !context.workspace_index.root.is_absolute() {
-        return Err(EngineError::invalid_argument(
-            "indexing requires an absolute workspace root",
-        ));
-    }
-    if context.workspace_index.policy != WorkspaceIndexPolicy::Enabled {
+    context.workspace_index.validate()?;
+    if context.workspace_index.index_policy != IndexPolicy::Enabled {
         return Err(EngineError::invalid_argument(
             "indexing requires an enabled workspace",
         ));
@@ -1582,12 +1649,13 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
             "embedding model max_batch_size must be greater than zero",
         ));
     }
-    if let Some(schema) = &context.workspace_index.embedding {
+    if let Some(index) = &context.workspace_index.index {
+        let schema = &index.embedding;
         let model = context.embedding_model.info();
         if schema.provider != model.provider
             || schema.model != model.name
             || schema.dimension != model.dimension
-            || schema.metric != metric_name(model.metric)
+            || schema.metric != model.metric
         {
             return Err(EngineError::invalid_argument(format!(
                 "workspace embedding schema does not match model {}",
@@ -1602,16 +1670,8 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
     Ok(())
 }
 
-const fn metric_name(metric: crate::models::EmbeddingMetric) -> &'static str {
-    match metric {
-        crate::models::EmbeddingMetric::Cosine => "cosine",
-        crate::models::EmbeddingMetric::DotProduct => "dot",
-        crate::models::EmbeddingMetric::Euclidean => "euclidean",
-    }
-}
-
-fn host_root(workspace: &WorkspaceIndexInfo) -> RootSpec {
-    let discovery = &workspace.discovery;
+fn host_root(workspace: &Workspace) -> RootSpec {
+    let discovery = &workspace.file_selection;
     RootSpec {
         path: workspace.root.clone(),
         recursive: true,
@@ -1633,7 +1693,7 @@ fn host_root(workspace: &WorkspaceIndexInfo) -> RootSpec {
 }
 
 async fn classify_files(
-    workspace: &WorkspaceIndexInfo,
+    workspace: &Workspace,
     files: Vec<DiscoveredFile>,
     stored: &[FileRecord],
     control: &TaskControl,
@@ -1651,7 +1711,7 @@ async fn classify_files(
 }
 
 fn scanned_files(
-    workspace: &WorkspaceIndexInfo,
+    workspace: &Workspace,
     files: Vec<DiscoveredFile>,
     stored: &[FileRecord],
     skipped: &mut Vec<SkippedFile>,
@@ -1670,9 +1730,10 @@ fn scanned_files(
                 "discovered file must belong to the workspace root",
             ));
         }
-        let id = FileId::for_path(&workspace.id, &discovered.relative_path)?;
-        let absolute_path = workspace.root.join(&discovered.relative_path);
-        let detected = match existing.get(&discovered.relative_path) {
+        let relative_path = SourcePath::new(discovered.relative_path.clone())?;
+        let id = existing.get(&relative_path).map(|file| file.id);
+        let absolute_path = workspace.source_path(&relative_path);
+        let detected = match existing.get(&relative_path) {
             Some(file)
                 if file.snapshot.modified_epoch_ms.is_some()
                     && file.snapshot.size_bytes == discovered.size_bytes
@@ -1686,23 +1747,16 @@ fn scanned_files(
             Ok(formats) => (formats, None),
             Err(error) => (
                 existing
-                    .get(&discovered.relative_path)
+                    .get(&relative_path)
                     .map_or_else(|| vec![FileFormat::Unknown], |file| file.formats.clone()),
                 Some(error),
             ),
         };
-        let source = FileRecord {
-            id,
-            relative_path: discovered.relative_path.clone(),
-            formats,
-            snapshot: FileSnapshot {
-                size_bytes: discovered.size_bytes,
-                modified_epoch_ms: discovered.modified_epoch_ms,
-                content_hash: None,
-            },
-            index_status: FileIndexStatus::NotIndexed,
+        let has_category = |category| {
+            formats
+                .iter()
+                .any(|format| format.categories().contains(&category))
         };
-        source.validate()?;
         let supported_category = [
             FileCategory::Code,
             FileCategory::Data,
@@ -1712,18 +1766,18 @@ fn scanned_files(
             FileCategory::Video,
         ]
         .into_iter()
-        .any(|category| source.has_category(category));
-        let explicit_maximum = workspace.discovery.max_file_size_bytes;
-        let maximum = explicit_maximum.unwrap_or_else(|| default_file_size_limit(&source));
+        .any(has_category);
+        let explicit_maximum = workspace.file_selection.max_file_size_bytes;
+        let maximum = explicit_maximum.unwrap_or_else(|| default_file_size_limit(&formats));
         let reason = if !supported_category {
-            Some(if source.has_category(FileCategory::Binary) {
+            Some(if has_category(FileCategory::Binary) {
                 SkippedFileReason::Binary
             } else {
                 SkippedFileReason::Unsupported
             })
-        } else if source_kind(&source).is_none() {
+        } else if source_kind(&formats).is_none() {
             Some(SkippedFileReason::Unsupported)
-        } else if source.snapshot.size_bytes > maximum {
+        } else if discovered.size_bytes > maximum {
             Some(SkippedFileReason::TooLarge)
         } else {
             None
@@ -1733,14 +1787,16 @@ fn scanned_files(
                 skipped.push(SkippedFile {
                     path: absolute_path,
                     reason,
-                    size_bytes: Some(source.snapshot.size_bytes),
+                    size_bytes: Some(discovered.size_bytes),
                     limit_bytes: (reason == SkippedFileReason::TooLarge).then_some(maximum),
                 });
             }
             continue;
         }
         scanned.push(ScannedFile {
-            file: source,
+            id,
+            relative_path,
+            formats,
             discovered,
             detection_error,
         });
@@ -1748,12 +1804,17 @@ fn scanned_files(
     Ok(scanned)
 }
 
-fn default_file_size_limit(file: &FileRecord) -> u64 {
-    if file.has_category(FileCategory::Image) {
+fn default_file_size_limit(formats: &[FileFormat]) -> u64 {
+    let has_category = |category| {
+        formats
+            .iter()
+            .any(|format| format.categories().contains(&category))
+    };
+    if has_category(FileCategory::Image) {
         10 * 1024 * 1024
-    } else if file.has_category(FileCategory::Data) {
+    } else if has_category(FileCategory::Data) {
         16 * 1024 * 1024
-    } else if file.has_category(FileCategory::Code) {
+    } else if has_category(FileCategory::Code) {
         1024 * 1024
     } else {
         256 * 1024 * 1024
@@ -1894,7 +1955,7 @@ impl ChangeScope {
     fn filter_scanned(&self, workspace_root: &Path, files: Vec<ScannedFile>) -> Vec<ScannedFile> {
         files
             .into_iter()
-            .filter(|file| self.contains(&workspace_root.join(&file.file.relative_path)))
+            .filter(|file| self.contains(&workspace_root.join(&file.relative_path)))
             .collect()
     }
 }
@@ -1959,8 +2020,9 @@ fn build_index_result(
     IndexResult {
         generation: context
             .workspace_index
-            .generation
-            .unwrap_or(0)
+            .index
+            .as_ref()
+            .map_or(0, |index| index.revision)
             .saturating_add(1),
         files_scanned: final_pass.files_scanned,
         files_added: passes.iter().map(|pass| pass.diff.added).sum(),
@@ -1999,6 +2061,7 @@ impl TimingCollector {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tempfile::tempdir;
@@ -2006,19 +2069,58 @@ mod tests {
     use zg_host_native::NativeScanner;
 
     use crate::{
-        api::{
-            index::{options::DiscoveryOptions, progress::IndexProgressPhase},
-            info::result::WorkspaceIndexEmbedding,
-        },
+        api::index::progress::IndexProgressPhase,
+        domain::{EmbeddingSchema, FileSelection, WorkspaceIndex, WorkspaceName},
         models::{EmbeddingMetric, EmbeddingModelLimits},
         storage::spi::{StorageResult, StorageSearchFilter, StorageSearchHit, StoredEntity},
     };
 
     use super::*;
 
+    #[test]
+    fn binding_preserves_indexed_ids_and_window_ownership() {
+        let source = TextSource {
+            relative_path: SourcePath::new("README.md").expect("source path"),
+            formats: vec![FileFormat::Markdown],
+            text: format!("preamble\n\n# Heading\n\n{}", "source contents ".repeat(80)),
+        };
+        let options = crate::extraction::ChunkOptions {
+            max_chunk_chars: Some(64),
+            chunk_overlap_chars: Some(0),
+        };
+        let extracted = extract_for_indexing(&source, options).expect("extract markdown");
+        let file_id = FileId::new(42);
+        let prepared = prepare_fragments(file_id, extracted, options.max_chunk_chars);
+        let fragments: Vec<_> = prepared.iter().map(|item| &item.fragment).collect();
+        assert!(matches!(fragments[0], EntityFragment::Standalone(_)));
+        assert!(matches!(fragments[1], EntityFragment::Representative(_)));
+        let EntityFragment::Window(window) = fragments[2] else {
+            panic!("large section needs source windows");
+        };
+        assert_eq!(window.entity_id, *fragments[1].entity_id());
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| *fragment.file_id() == file_id)
+        );
+        assert_eq!(
+            fragments[..3]
+                .iter()
+                .map(|fragment| fragment.document_id())
+                .collect::<Vec<_>>(),
+            [
+                "7d7765453c56748a88b9a707053708e4216ac9faa5d9c54ce2a13221eb4d9016",
+                "14ffda51cf4c36a1313a29aa3ca738c207d7688cbac99ef8d32785ca68d97ffa",
+                "47d2ff6368002ad15a6e842e889121965bdf650908a6c9544394ffbae5cfdcfa",
+            ]
+        );
+        validate_fragments(file_id, fragments).expect("bound fragment ownership");
+    }
+
     #[derive(Default)]
     struct MemoryStorage {
         files: Mutex<Vec<FileRecord>>,
+        identities: Mutex<HashMap<PathBuf, FileId>>,
         finalized: AtomicUsize,
         prepared_batches: Mutex<Vec<Vec<FileId>>>,
     }
@@ -2027,6 +2129,24 @@ mod tests {
     impl WorkspaceIndexStorage for MemoryStorage {
         fn is_read_only(&self) -> bool {
             false
+        }
+
+        fn resolve_file_ids(&self, paths: &[PathBuf]) -> StorageResult<Vec<FileId>> {
+            let mut identities = self
+                .identities
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            paths
+                .iter()
+                .map(|path| {
+                    if let Some(id) = identities.get(path) {
+                        return Ok(*id);
+                    }
+                    let id = FileId::new(identities.len() as u64);
+                    identities.insert(path.clone(), id);
+                    Ok(id)
+                })
+                .collect()
         }
 
         fn list_files(&self) -> StorageResult<Vec<FileRecord>> {
@@ -2107,11 +2227,11 @@ mod tests {
             Ok(())
         }
 
-        fn delete_file(&self, file_id: &FileId) -> StorageResult<()> {
+        fn delete_file(&self, file_id: FileId) -> StorageResult<()> {
             self.files
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .retain(|file| &file.id != file_id);
+                .retain(|file| file.id != file_id);
             Ok(())
         }
 
@@ -2248,28 +2368,137 @@ mod tests {
         }
     }
 
-    fn workspace(root: &Path) -> WorkspaceIndexInfo {
-        WorkspaceIndexInfo {
-            id: "workspace-id".to_owned(),
-            name: "fixture".to_owned(),
-            path: root.join(".zvec-grep"),
+    fn workspace(root: &Path) -> Workspace {
+        Workspace {
+            name: WorkspaceName::new("fixture").expect("workspace name"),
             root: root.to_path_buf(),
-            discovery: DiscoveryOptions {
+            file_selection: FileSelection {
                 no_ignore: true,
-                ..DiscoveryOptions::default()
+                ..FileSelection::default()
             },
-            policy: WorkspaceIndexPolicy::Enabled,
-            embedding: Some(WorkspaceIndexEmbedding {
-                provider: "local".to_owned(),
-                model: "test".to_owned(),
-                dimension: 2,
-                metric: "cosine".to_owned(),
+            index_policy: IndexPolicy::Enabled,
+            index: Some(WorkspaceIndex {
+                embedding: EmbeddingSchema {
+                    provider: "local".to_owned(),
+                    model: "test".to_owned(),
+                    dimension: 2,
+                    metric: EmbeddingMetric::Cosine,
+                },
+                revision: 0,
             }),
-            index_version: Some(1),
-            generation: None,
             created_epoch_ms: 1,
             updated_epoch_ms: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn status_does_not_allocate_and_updates_keep_catalog_identity() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("file.txt");
+        std::fs::write(&path, "alpha").expect("source");
+        let workspace = workspace(directory.path());
+        let scanner = UnknownModifiedScanner(NativeScanner::default());
+        let storage = MemoryStorage::default();
+        let status = get_workspace_index_status(&workspace, &storage, &scanner, None)
+            .await
+            .expect("status");
+        assert_eq!(status.files_added, 1);
+        assert!(storage.identities.lock().expect("catalog").is_empty());
+        let model = ConcurrentModel::new();
+        let context = IndexingContext {
+            workspace_index: &workspace,
+            storage: &storage,
+            scanner: &scanner,
+            embedding_model: &model,
+            embedding_concurrency: None,
+            on_progress: None,
+            signal: None,
+            changes: &[],
+        };
+        index_workspace(&context).await.expect("initial index");
+        let id = storage.list_files().expect("files")[0].id;
+        assert_eq!(
+            storage
+                .identities
+                .lock()
+                .expect("catalog")
+                .get(Path::new("file.txt")),
+            Some(&id)
+        );
+        std::fs::write(&path, "changed content").expect("update");
+        std::fs::write(directory.path().join("new.txt"), "new source").expect("new source");
+        let status = get_workspace_index_status(&workspace, &storage, &scanner, None)
+            .await
+            .expect("updated status");
+        assert_eq!(status.files_added, 1);
+        assert_eq!(status.files_modified, 1);
+        assert_eq!(status.files_deleted, 0);
+        assert_eq!(storage.identities.lock().expect("catalog").len(), 1);
+        let result = index_workspace(&context).await.expect("incremental index");
+        assert_eq!(result.files_added, 1);
+        assert_eq!(result.files_modified, 1);
+        let files = storage.list_files().expect("files");
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.relative_path.as_path() == Path::new("file.txt"))
+                .expect("original file")
+                .id,
+            id
+        );
+        assert_ne!(files[0].id, files[1].id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn classification_keeps_distinct_non_unicode_paths_and_existing_ids() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempdir().expect("temporary directory");
+        let paths = [b"source-\xff.txt".as_slice(), b"source-\xfe.txt".as_slice()]
+            .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
+        assert_eq!(paths[0].to_string_lossy(), paths[1].to_string_lossy());
+        let discovered = paths
+            .iter()
+            .map(|path| DiscoveredFile {
+                root: directory.path().to_path_buf(),
+                relative_path: path.clone(),
+                size_bytes: 4,
+                modified_epoch_ms: None,
+                source_fingerprint: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let workspace = workspace(directory.path());
+        let control = TaskControl::default();
+        let (first, _) = classify_files(&workspace, discovered.clone(), &[], &control)
+            .await
+            .expect("classify");
+        assert!(first.iter().all(|scan| scan.id.is_none()));
+        assert_ne!(first[0].relative_path, first[1].relative_path);
+        assert!(first[0].to_record().is_err());
+        let initial = compute_diff(first, &[]);
+        assert_eq!(initial.added, 2);
+        assert!(initial.deleted.is_empty());
+        let stored = initial
+            .candidates
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let mut scan = candidate.scanned;
+                scan.id = Some(FileId::new(index as u64 + 1));
+                scan.to_record().expect("registered source")
+            })
+            .collect::<Vec<_>>();
+        let (second, _) = classify_files(&workspace, discovered, &stored, &control)
+            .await
+            .expect("reclassify");
+        for (scan, stored) in second.iter().zip(&stored) {
+            assert_eq!(scan.id, Some(stored.id));
+            assert_eq!(scan.relative_path, stored.relative_path);
+        }
+        let diff = compute_diff(second, &stored);
+        assert_eq!(diff.pending, 2);
+        assert_eq!(diff.added, 0);
+        assert!(diff.deleted.is_empty());
     }
 
     #[tokio::test]
@@ -2486,7 +2715,7 @@ mod tests {
         let stored = storage.list_files().expect("stored files");
         let untouched = stored
             .iter()
-            .find(|file| file.relative_path == Path::new("second.txt"))
+            .find(|file| file.relative_path.as_path() == Path::new("second.txt"))
             .expect("second stored file");
         let changed_hash = sha256_hex(b"second changed");
         assert_ne!(
@@ -2559,6 +2788,7 @@ mod tests {
         let files = storage.list_files().expect("files");
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|file| file.formats == [FileFormat::Text]));
+        assert_eq!(storage.identities.lock().expect("catalog").len(), 2);
         assert_eq!(result.skipped.len(), 3);
     }
 
@@ -2579,7 +2809,9 @@ mod tests {
         let (first, _) = classify_files(&workspace, vec![discovered.clone()], &[], &control)
             .await
             .expect("classify");
-        let mut stored = first[0].file.clone();
+        let mut scan = first.into_iter().next().expect("scanned file");
+        scan.id = Some(FileId::new(1));
+        let mut stored = scan.to_record().expect("registered source");
         stored.formats = vec![FileFormat::Rust];
         stored.snapshot.content_hash = Some("previous hash".to_owned());
         stored.index_status = FileIndexStatus::Indexed {
@@ -2594,7 +2826,7 @@ mod tests {
         )
         .await
         .expect("reclassify");
-        assert_eq!(second[0].file.formats, [FileFormat::Text]);
+        assert_eq!(second[0].formats, [FileFormat::Text]);
         assert_eq!(compute_diff(second, &[stored]).modified, 1);
         std::fs::remove_file(path).expect("remove source during scan");
         let (missing, _) = classify_files(&workspace, vec![discovered], &[], &control)

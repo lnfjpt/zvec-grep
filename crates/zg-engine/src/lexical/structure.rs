@@ -2,33 +2,67 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
 };
 
 use crate::{
-    api::context::result::{
-        ContentRange, ContextContainer, ContextItem, ContextItemKind,
-        StructureEnrichmentDiagnostics, StructureEnrichmentSource,
-    },
     domain::{
-        EntityFragment, EntityMetadata, FileCategory, FileFormat, FileId, FileIndexStatus,
-        FileRecord, FileSnapshot, SourceRange,
+        EntityId, EntityMetadata, FileCategory, FileFormat, SourcePath, SourceRange, TextRange,
     },
-    extraction::{ChunkOptions, TextSource, extract},
+    extraction::{ChunkOptions, ExtractedFragment, TextSource, extract},
     utils::{decode_text, sha256_hex_parts},
 };
 
+use serde::{Deserialize, Serialize};
+
+use super::types::LexicalMatch;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StructureEnrichmentDiagnostics {
+    pub source: StructureEnrichmentSource,
+    pub file_limit: usize,
+    pub matched_files: usize,
+    pub parsed_files: usize,
+    pub enriched_files: usize,
+    pub enriched_items: usize,
+    pub skipped_files: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructureEnrichmentSource {
+    StructuralExtraction,
+}
+
 pub(crate) const RG_STRUCTURE_ENRICH_FILE_LIMIT: usize = 100;
-const STRUCTURE_FILE_ID_NAMESPACE: &str = "__rg_structure__";
+const STRUCTURE_NAMESPACE: &str = "__rg_structure__";
 
 pub(crate) struct StructureEnrichmentResult {
-    pub items: Vec<ContextItem>,
+    pub items: Vec<EnrichedLexicalMatch>,
     pub diagnostics: StructureEnrichmentDiagnostics,
 }
 
-pub(crate) fn enrich_lexical_items_with_structure(
+pub(crate) struct EnrichedLexicalMatch {
+    pub matched: LexicalMatch,
+    pub container: Option<LexicalContainer>,
+}
+
+pub(crate) struct LexicalContainer {
+    pub entity_id: EntityId,
+    pub range: SourceRange,
+    pub metadata: Option<EntityMetadata>,
+}
+
+struct StructuralFragment {
+    entity_id: EntityId,
+    document_id: String,
+    range: SourceRange,
+    metadata: Option<EntityMetadata>,
+}
+
+pub(crate) fn enrich_lexical_matches_with_structure(
     root: &Path,
-    items: Vec<ContextItem>,
+    items: Vec<LexicalMatch>,
     max_file_size_bytes: Option<u64>,
 ) -> StructureEnrichmentResult {
     let matched_files = unique_lexical_file_paths(&items);
@@ -51,23 +85,27 @@ pub(crate) fn enrich_lexical_items_with_structure(
             continue;
         }
         item.rank = enriched.len() + 1;
-        if item.kind == ContextItemKind::LexicalMatch
-            && let Some(source) = sources_by_file
-                .get(&item.absolute_path)
-                .and_then(Option::as_ref)
-            && let Some(range) = lexical_match_range(&item)
-            && let Some(container) = smallest_containing_fragment(source, range)
-        {
+        let container = if let Some(source) = sources_by_file
+            .get(&item.absolute_path)
+            .and_then(Option::as_ref)
+            && let Some(container) = smallest_containing_fragment(
+                source,
+                item.excerpt_range.as_ref().unwrap_or(&item.range),
+            ) {
             enriched_items += 1;
             enriched_files.insert(item.absolute_path.clone());
-            item.metadata = container.metadata().map(Into::into).or(item.metadata);
-            item.container = Some(ContextContainer {
-                entity_id: container.entity_id().as_str().to_owned(),
-                range: container.range().into(),
-                metadata: container.metadata().map(Into::into),
-            });
-        }
-        enriched.push(item);
+            Some(LexicalContainer {
+                entity_id: container.entity_id.clone(),
+                range: container.range,
+                metadata: container.metadata.clone(),
+            })
+        } else {
+            None
+        };
+        enriched.push(EnrichedLexicalMatch {
+            matched: item,
+            container,
+        });
     }
 
     let matched_count = matched_files.len();
@@ -86,11 +124,10 @@ pub(crate) fn enrich_lexical_items_with_structure(
     }
 }
 
-fn unique_lexical_file_paths(items: &[ContextItem]) -> Vec<PathBuf> {
+fn unique_lexical_file_paths(items: &[LexicalMatch]) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     items
         .iter()
-        .filter(|item| item.kind == ContextItemKind::LexicalMatch)
         .filter(|item| seen.insert(item.absolute_path.clone()))
         .map(|item| item.absolute_path.clone())
         .collect()
@@ -100,22 +137,18 @@ fn parse_structural_source(
     root: &Path,
     absolute_path: &Path,
     explicit_max_size: Option<u64>,
-) -> Option<Vec<EntityFragment>> {
+) -> Option<Vec<StructuralFragment>> {
     // Direct lexical searches may target a single file or files outside the requested root.
-    // Their extraction sources are ephemeral and use a local base for relative paths.
-    let (source_root, relative_path) = match absolute_path.strip_prefix(root) {
-        Ok(relative) if !relative.as_os_str().is_empty() => (root, relative),
-        _ => (
-            absolute_path.parent()?,
-            Path::new(absolute_path.file_name()?),
-        ),
+    // Use the filename as the relative path when the requested root is not a parent.
+    let relative_path = match absolute_path.strip_prefix(root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative,
+        _ => Path::new(absolute_path.file_name()?),
     };
     let namespace = sha256_hex_parts([
-        STRUCTURE_FILE_ID_NAMESPACE.as_bytes(),
+        STRUCTURE_NAMESPACE.as_bytes(),
         b"\0",
-        source_root.as_os_str().as_encoded_bytes(),
+        absolute_path.as_os_str().as_encoded_bytes(),
     ]);
-    let file_id = FileId::for_path(&namespace, relative_path).ok()?;
     let metadata = fs::metadata(absolute_path).ok()?;
     if !metadata.is_file() || metadata.len() == 0 {
         return None;
@@ -135,27 +168,14 @@ fn parse_structural_source(
     let bytes = fs::read(absolute_path).ok()?;
     let text = decode_text(&bytes, true)?.into_owned();
     let source = TextSource {
-        file: FileRecord {
-            id: file_id,
-            relative_path: relative_path.to_path_buf(),
-            formats,
-            snapshot: FileSnapshot {
-                size_bytes: u64::try_from(bytes.len()).ok()?,
-                modified_epoch_ms: metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .and_then(|duration| duration.as_millis().try_into().ok()),
-                content_hash: None,
-            },
-            index_status: FileIndexStatus::NotIndexed,
-        },
+        relative_path: SourcePath::new(relative_path).ok()?,
+        formats,
         text,
     };
-    let structural = extract(&source, ChunkOptions::default())
-        .ok()?
+    let fragments = extract(&source, ChunkOptions::default()).ok()?;
+    let structural = namespace_lexical_fragments(&fragments, &namespace)
         .into_iter()
-        .filter(|fragment| fragment.metadata().is_some())
+        .filter(|fragment| fragment.metadata.is_some())
         .collect::<Vec<_>>();
     if structural.is_empty() {
         return None;
@@ -163,49 +183,71 @@ fn parse_structural_source(
     Some(structural)
 }
 
-fn lexical_match_range(item: &ContextItem) -> Option<&ContentRange> {
-    let range = item.excerpt_range.as_ref().unwrap_or(&item.range);
-    matches!(range, ContentRange::Text { .. }).then_some(range)
+fn namespace_lexical_fragments(
+    fragments: &[ExtractedFragment],
+    namespace: &str,
+) -> Vec<StructuralFragment> {
+    let mut entities = HashMap::<usize, EntityId>::new();
+    fragments
+        .iter()
+        .enumerate()
+        .map(|(ordinal, fragment)| {
+            let next_entity = (entities.len() as u64).to_le_bytes();
+            let entity_id = entities
+                .entry(fragment.entity_index())
+                .or_insert_with(|| {
+                    EntityId::new(sha256_hex_parts([
+                        namespace.as_bytes(),
+                        b"\0entity\0",
+                        &next_entity,
+                    ]))
+                    .expect("SHA-256 produces a nonempty entity ID")
+                })
+                .clone();
+            let document_id = match fragment {
+                ExtractedFragment::Standalone(_) | ExtractedFragment::Representative(_) => {
+                    entity_id.as_str().to_owned()
+                }
+                ExtractedFragment::Window(_) => sha256_hex_parts([
+                    namespace.as_bytes(),
+                    b"\0window\0",
+                    &(ordinal as u64).to_le_bytes(),
+                ]),
+            };
+            StructuralFragment {
+                entity_id,
+                document_id,
+                range: *fragment.range(),
+                metadata: fragment.metadata().cloned(),
+            }
+        })
+        .collect()
 }
 
 fn smallest_containing_fragment<'fragment>(
-    fragments: &'fragment [EntityFragment],
-    inner: &ContentRange,
-) -> Option<&'fragment EntityFragment> {
-    let ContentRange::Text {
-        start_byte_offset,
-        end_byte_offset,
-        ..
-    } = inner
-    else {
-        return None;
-    };
+    fragments: &'fragment [StructuralFragment],
+    inner: &TextRange,
+) -> Option<&'fragment StructuralFragment> {
     fragments
         .iter()
-        .filter(|fragment| {
-            text_range_contains(fragment.range(), *start_byte_offset..*end_byte_offset)
-        })
+        .filter(
+            |fragment| matches!(&fragment.range, SourceRange::Text(outer) if outer.contains(inner)),
+        )
         .min_by(|left, right| compare_fragment_container(left, right))
 }
 
-fn text_range_contains(outer: &SourceRange, inner: std::ops::Range<usize>) -> bool {
-    matches!(
-        outer,
-        SourceRange::Text(range) if inner.start <= inner.end
-            && range.start_byte_offset() <= inner.start
-            && range.end_byte_offset() >= inner.end
-    )
-}
-
-fn compare_fragment_container(left: &EntityFragment, right: &EntityFragment) -> std::cmp::Ordering {
+fn compare_fragment_container(
+    left: &StructuralFragment,
+    right: &StructuralFragment,
+) -> std::cmp::Ordering {
     fragment_byte_span(left)
         .cmp(&fragment_byte_span(right))
         .then_with(|| fragment_specificity(right).cmp(&fragment_specificity(left)))
-        .then_with(|| left.document_id().cmp(right.document_id()))
+        .then_with(|| left.document_id.cmp(&right.document_id))
 }
 
-fn fragment_byte_span(fragment: &EntityFragment) -> usize {
-    match fragment.range() {
+fn fragment_byte_span(fragment: &StructuralFragment) -> usize {
+    match &fragment.range {
         SourceRange::Text(range) => range
             .end_byte_offset()
             .saturating_sub(range.start_byte_offset()),
@@ -213,8 +255,8 @@ fn fragment_byte_span(fragment: &EntityFragment) -> usize {
     }
 }
 
-fn fragment_specificity(fragment: &EntityFragment) -> u8 {
-    match fragment.metadata() {
+fn fragment_specificity(fragment: &StructuralFragment) -> u8 {
+    match &fragment.metadata {
         Some(EntityMetadata::Code { symbol_name, .. }) => {
             if symbol_name.is_some() {
                 2
@@ -227,8 +269,8 @@ fn fragment_specificity(fragment: &EntityFragment) -> u8 {
     }
 }
 
-fn lexical_item_key(item: &ContextItem) -> String {
-    format!("{}:{:?}", item.absolute_path.display(), item.range)
+fn lexical_item_key(item: &LexicalMatch) -> (PathBuf, String) {
+    (item.absolute_path.clone(), format!("{:?}", item.range))
 }
 
 #[cfg(test)]
@@ -237,13 +279,12 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::api::context::result::{
-        ContextContentRole, ContextItem, ContextItemKind, ContextItemStatus, EntityMetadata,
-        MatchedBy, StructureEnrichmentSource,
-    };
-    use crate::domain::TextRange;
+    use crate::domain::{EntityMetadata, TextRange};
+    use crate::lexical::types::LexicalMatch;
 
-    use super::enrich_lexical_items_with_structure;
+    use super::{
+        EnrichedLexicalMatch, StructureEnrichmentSource, enrich_lexical_matches_with_structure,
+    };
 
     #[test]
     fn enriches_only_code_and_markdown_structures() {
@@ -261,7 +302,7 @@ mod tests {
             fs::write(directory.path().join(relative), content).expect("fixture file");
         }
 
-        let result = enrich_lexical_items_with_structure(
+        let result = enrich_lexical_matches_with_structure(
             directory.path(),
             vec![
                 lexical_item(directory.path(), "unsupported.rb", 1, "puts \"hello\""),
@@ -301,7 +342,7 @@ mod tests {
             directory.path().join("structured.ts"),
             directory.path().join("elsewhere"),
         ] {
-            let result = enrich_lexical_items_with_structure(
+            let result = enrich_lexical_matches_with_structure(
                 &root,
                 vec![lexical_item(
                     directory.path(),
@@ -332,7 +373,7 @@ mod tests {
         let second = tempdir().expect("second source root");
         let ids = [first.path(), second.path()].map(|root| {
             fs::write(root.join("section.md"), "# Section\n\nneedle\n").expect("markdown fixture");
-            let result = enrich_lexical_items_with_structure(
+            let result = enrich_lexical_matches_with_structure(
                 root,
                 vec![lexical_item(root, "section.md", 3, "needle")],
                 None,
@@ -347,6 +388,54 @@ mod tests {
         assert_ne!(ids[0], ids[1]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn keeps_non_unicode_source_paths_distinct_during_enrichment() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempdir().expect("workspace");
+        let text = "# Section\n\nneedle\n";
+        fs::write(directory.path().join("template.md"), text).expect("template");
+        let template = lexical_item(directory.path(), "template.md", 3, "needle");
+        let paths = [b"section-\xff.md".as_slice(), b"section-\xfe.md".as_slice()]
+            .map(|bytes| Path::new(std::ffi::OsStr::from_bytes(bytes)));
+        let items = paths
+            .iter()
+            .map(|path| {
+                let mut item = template.clone();
+                item.relative_path = path.to_path_buf();
+                item.absolute_path = directory.path().join(path);
+                item
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items[0].absolute_path.to_string_lossy(),
+            items[1].absolute_path.to_string_lossy()
+        );
+        let result = enrich_lexical_matches_with_structure(directory.path(), items, None);
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.diagnostics.matched_files, 2);
+        // macOS filesystems can reject non-Unicode names. Exercise the namespace
+        // independently of whether such paths can be created on this host.
+        let source = super::TextSource {
+            relative_path: super::SourcePath::new("template.md").expect("source path"),
+            formats: vec![super::FileFormat::Markdown],
+            text: text.to_owned(),
+        };
+        let fragments =
+            super::extract(&source, super::ChunkOptions::default()).expect("template structure");
+        let identities = paths.map(|path| {
+            let namespace = crate::utils::sha256_hex_parts([
+                super::STRUCTURE_NAMESPACE.as_bytes(),
+                b"\0",
+                directory.path().join(path).as_os_str().as_encoded_bytes(),
+            ]);
+            super::namespace_lexical_fragments(&fragments, &namespace)[0]
+                .entity_id
+                .clone()
+        });
+        assert_ne!(identities[0], identities[1]);
+    }
+
     #[test]
     fn honors_the_explicit_structure_file_size_limit() {
         let directory = tempdir().expect("temporary directory");
@@ -354,7 +443,7 @@ mod tests {
         fs::write(&path, "# Large section\n\nneedle\n").expect("markdown fixture");
         let items = vec![lexical_item(directory.path(), "section.md", 3, "needle")];
 
-        let enriched = enrich_lexical_items_with_structure(directory.path(), items.clone(), None);
+        let enriched = enrich_lexical_matches_with_structure(directory.path(), items.clone(), None);
         assert_eq!(enriched.diagnostics.parsed_files, 1);
         assert!(matches!(
             enriched.items[0]
@@ -364,7 +453,7 @@ mod tests {
             Some(EntityMetadata::Markdown { heading, .. }) if heading.as_deref() == Some("Large section")
         ));
 
-        let skipped = enrich_lexical_items_with_structure(directory.path(), items, Some(8));
+        let skipped = enrich_lexical_matches_with_structure(directory.path(), items, Some(8));
         assert_eq!(skipped.diagnostics.parsed_files, 0);
         assert!(skipped.items[0].container.is_none());
     }
@@ -378,12 +467,11 @@ mod tests {
             let mut item = lexical_item(directory.path(), "same-line.ts", 1, text.trim_end());
             let start = text.find(needle).expect("matched text");
             let end = start + needle.len();
-            item.range = TextRange::from_coordinates(start, end, 1, 1, start, end)
-                .expect("matched range")
-                .into();
+            item.range =
+                TextRange::from_coordinates(start, end, 1, 1, start, end).expect("matched range");
             item
         });
-        let result = enrich_lexical_items_with_structure(directory.path(), items.into(), None);
+        let result = enrich_lexical_matches_with_structure(directory.path(), items.into(), None);
         assert_eq!(result.diagnostics.enriched_items, 2);
         for (item, expected) in result.items.iter().zip(["alpha", "beta"]) {
             assert!(matches!(
@@ -393,7 +481,46 @@ mod tests {
         }
     }
 
-    fn lexical_item(root: &Path, relative: &str, line: usize, content: &str) -> ContextItem {
+    #[test]
+    fn enriches_the_match_inside_expanded_context_and_keeps_source_ranges() {
+        let directory = tempdir().expect("temporary directory");
+        let text = "function alpha() { return \"one\"; } function beta() { return \"two\"; }\n";
+        fs::write(directory.path().join("context.ts"), text).expect("code fixture");
+        let mut item = lexical_item(directory.path(), "context.ts", 1, text.trim_end());
+        let start = text.find("two").expect("matched text");
+        let excerpt = TextRange::from_coordinates(start, start + 3, 1, 1, start, start + 3)
+            .expect("matched range");
+        item.excerpt_range = Some(excerpt);
+        let visible_range = item.range;
+
+        let result =
+            enrich_lexical_matches_with_structure(directory.path(), vec![item.clone(), item], None);
+
+        assert_eq!(result.items.len(), 1);
+        let enriched = &result.items[0];
+        assert_eq!(enriched.matched.rank, 1);
+        assert_eq!(enriched.matched.range, visible_range);
+        assert_eq!(enriched.matched.excerpt_range, Some(excerpt));
+        assert_eq!(enriched.matched.content, text.trim_end());
+        let container = enriched.container.as_ref().expect("matched function");
+        assert!(matches!(
+            container.metadata.as_ref(),
+            Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == "beta"
+        ));
+        assert!(
+            container
+                .range
+                .contains(&crate::domain::SourceRange::Text(excerpt))
+        );
+        assert!(
+            !container
+                .range
+                .contains(&crate::domain::SourceRange::Text(visible_range))
+        );
+        assert_eq!(result.diagnostics.enriched_items, 1);
+    }
+
+    fn lexical_item(root: &Path, relative: &str, line: usize, content: &str) -> LexicalMatch {
         let text = fs::read_to_string(root.join(relative)).expect("fixture source");
         let start = text
             .split_inclusive('\n')
@@ -403,33 +530,23 @@ mod tests {
         let range =
             TextRange::from_coordinates(start, start + content.len(), line, line, 0, content.len())
                 .expect("fixture range");
-        ContextItem {
-            kind: ContextItemKind::LexicalMatch,
+        LexicalMatch {
             rank: 0,
             absolute_path: root.join(relative),
             relative_path: relative.into(),
-            range: range.into(),
+            range,
             excerpt_range: None,
             content: content.to_owned(),
-            content_role: Some(ContextContentRole::Source),
-            outline: None,
-            status: ContextItemStatus::Fresh,
-            score: None,
-            matched_by: MatchedBy::Lexical,
-            metadata: None,
-            entity_id: None,
-            container: None,
-            trace: None,
-            query_groups: Vec::new(),
-            selection_reason: None,
-            coverage_group: None,
         }
     }
 
-    fn item_by_relative_path<'item>(items: &'item [ContextItem], path: &str) -> &'item ContextItem {
+    fn item_by_relative_path<'item>(
+        items: &'item [EnrichedLexicalMatch],
+        path: &str,
+    ) -> &'item EnrichedLexicalMatch {
         items
             .iter()
-            .find(|item| item.relative_path == Path::new(path))
+            .find(|item| item.matched.relative_path == Path::new(path))
             .expect("lexical item")
     }
 }

@@ -5,6 +5,11 @@ pub use result::ContextResult;
 
 /// Options accepted by [`crate::ZvecGrep::context`].
 pub mod options {
+    pub use crate::domain::SymbolType;
+    pub use crate::pipelines::search::types::{
+        SearchRoute as ContextRoute, SearchRouteMode as ContextRouteMode,
+    };
+
     use std::path::PathBuf;
 
     use serde::{Deserialize, Serialize};
@@ -118,19 +123,6 @@ pub mod options {
         Off,
     }
 
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    pub struct ContextRoute {
-        pub mode: ContextRouteMode,
-        pub query: String,
-    }
-
-    #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum ContextRouteMode {
-        Fts,
-        Vector,
-    }
-
     #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
     pub struct RgOptions {
         pub extra_args: Vec<String>,
@@ -141,21 +133,18 @@ pub mod options {
         pub before_context: usize,
         pub after_context: usize,
     }
-
-    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum SymbolType {
-        Module,
-        Class,
-        Interface,
-        Function,
-        Value,
-        Alias,
-    }
 }
 
 /// Values returned by [`crate::ZvecGrep::context`].
 pub mod result {
+    pub use crate::lexical::structure::{
+        StructureEnrichmentDiagnostics, StructureEnrichmentSource,
+    };
+    pub use crate::pipelines::search::types::{
+        MatchedBy, SearchFinalTrace, SearchFusionTrace, SearchHitTrace, SearchRecallTrace,
+        TimingEntry,
+    };
+
     use std::path::PathBuf;
 
     use serde::{Deserialize, Serialize};
@@ -203,7 +192,6 @@ pub mod result {
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub struct ContextWorkspaceIndex {
-        pub id: String,
         pub name: String,
         pub path: PathBuf,
         pub generation: Option<u64>,
@@ -283,16 +271,6 @@ pub mod result {
         PossiblyStale,
     }
 
-    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum MatchedBy {
-        Fts,
-        Vector,
-        #[serde(rename = "fts+vector")]
-        FtsAndVector,
-        Lexical,
-    }
-
     #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
     pub struct ContextDiagnostics {
         pub empty_reason: Option<EmptyReason>,
@@ -323,56 +301,6 @@ pub mod result {
         pub query: String,
     }
 
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    pub struct StructureEnrichmentDiagnostics {
-        pub source: StructureEnrichmentSource,
-        pub file_limit: usize,
-        pub matched_files: usize,
-        pub parsed_files: usize,
-        pub enriched_files: usize,
-        pub enriched_items: usize,
-        pub skipped_files: usize,
-        pub truncated: bool,
-    }
-
-    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum StructureEnrichmentSource {
-        StructuralExtraction,
-    }
-
-    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-    pub struct SearchHitTrace {
-        pub recall: Vec<SearchRecallTrace>,
-        pub fusion: SearchFusionTrace,
-        pub final_selection: SearchFinalTrace,
-    }
-
-    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-    pub struct SearchRecallTrace {
-        pub path: super::options::ContextRouteMode,
-        pub route_id: String,
-        pub query: String,
-        pub found: bool,
-        pub rank: Option<usize>,
-        pub score: Option<f64>,
-        pub forced: bool,
-        pub reason: Option<String>,
-    }
-
-    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-    pub struct SearchFusionTrace {
-        pub rank: usize,
-        pub score: f64,
-        pub forced: bool,
-    }
-
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    pub struct SearchFinalTrace {
-        pub returned_by_limit: bool,
-        pub cutoff_rank: usize,
-    }
-
     #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(rename_all = "snake_case")]
     pub enum EmptyReason {
@@ -390,13 +318,6 @@ pub mod result {
         pub searched_paths: Vec<PathBuf>,
         pub limit: Option<usize>,
         pub truncated: bool,
-    }
-
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    pub struct TimingEntry {
-        pub name: String,
-        pub duration_micros: u64,
-        pub count: Option<u64>,
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -435,32 +356,6 @@ pub mod result {
             level: Option<usize>,
             scope: Option<String>,
         },
-    }
-}
-
-impl From<crate::domain::SymbolType> for options::SymbolType {
-    fn from(value: crate::domain::SymbolType) -> Self {
-        match value {
-            crate::domain::SymbolType::Module => Self::Module,
-            crate::domain::SymbolType::Class => Self::Class,
-            crate::domain::SymbolType::Interface => Self::Interface,
-            crate::domain::SymbolType::Function => Self::Function,
-            crate::domain::SymbolType::Value => Self::Value,
-            crate::domain::SymbolType::Alias => Self::Alias,
-        }
-    }
-}
-
-impl From<options::SymbolType> for crate::domain::SymbolType {
-    fn from(value: options::SymbolType) -> Self {
-        match value {
-            options::SymbolType::Module => Self::Module,
-            options::SymbolType::Class => Self::Class,
-            options::SymbolType::Interface => Self::Interface,
-            options::SymbolType::Function => Self::Function,
-            options::SymbolType::Value => Self::Value,
-            options::SymbolType::Alias => Self::Alias,
-        }
     }
 }
 
@@ -515,7 +410,7 @@ impl From<crate::domain::EntityMetadata> for result::EntityMetadata {
                 documentation,
                 modifiers,
             } => Self::Code {
-                symbol_type: symbol_type.into(),
+                symbol_type,
                 symbol_name,
                 scope,
                 node_type,

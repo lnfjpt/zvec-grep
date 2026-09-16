@@ -13,15 +13,8 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::index::{
-    options::Device,
-    progress::{
-        IndexEmbeddingProgress, IndexEmbeddingStage, IndexProgress, IndexProgressPhase,
-        IndexProgressReporter,
-    },
-};
-
 use super::{
+    Device, ModelProgressReporter,
     compute::ModelComputeRuntime,
     factory::create_embedding_model,
     spi::{
@@ -264,21 +257,21 @@ impl ModelRuntimeLease {
         &self,
         inputs: &[EmbeddingInput],
         mut options: EmbeddingOptions,
-        index_progress: Option<IndexProgressReporter>,
+        progress: Option<ModelProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError> {
         let _permit = self
             .acquire_operation_permit(options.signal.as_ref())
             .await?;
         let _active = ActiveEmbeddingGuard::new(&self.entry.runtime.active_embeddings);
         options.execution_concurrency = self.operation.limit;
-        if let Some(reporter) = index_progress {
+        if let Some(reporter) = progress {
             let model_progress = options.on_progress.take();
             let operation = Arc::clone(&self.operation);
             options.on_progress = Some(Arc::new(move |progress| {
                 if let Some(model_progress) = &model_progress {
                     model_progress(progress.clone());
                 }
-                reporter.report(index_progress_from_model(&operation, progress));
+                reporter.report(progress, operation.limit);
             }));
         }
         self.entry.runtime.model.embed(inputs, options).await
@@ -313,57 +306,6 @@ impl ModelRuntimeLease {
                         .with_cause(error)
                 })
         }
-    }
-}
-
-fn index_progress_from_model(
-    operation: &OperationConcurrency,
-    progress: super::spi::EmbeddingModelProgress,
-) -> IndexProgress {
-    use super::spi::EmbeddingModelProgress;
-
-    let (stage, model, downloaded_bytes, total_bytes, message) = match progress {
-        EmbeddingModelProgress::Preparing { model } => {
-            (IndexEmbeddingStage::Preparing, model, None, None, None)
-        }
-        EmbeddingModelProgress::Downloading {
-            model,
-            downloaded_bytes,
-            total_bytes,
-        } => (
-            IndexEmbeddingStage::Downloading,
-            model,
-            downloaded_bytes,
-            total_bytes,
-            None,
-        ),
-        EmbeddingModelProgress::Warning { model, message } => (
-            IndexEmbeddingStage::Warning,
-            model,
-            None,
-            None,
-            Some(message),
-        ),
-        EmbeddingModelProgress::Ready { model } => {
-            (IndexEmbeddingStage::Ready, model, None, None, None)
-        }
-    };
-    IndexProgress {
-        phase: IndexProgressPhase::Indexing,
-        files_total: None,
-        files_indexed: None,
-        files_failed: None,
-        detail: Some(format!("downloading {model}")),
-        embedding: Some(IndexEmbeddingProgress {
-            concurrency: Some(operation.limit),
-            max_concurrency: Some(operation.limit),
-            retryable_failures: None,
-            stage: Some(stage),
-            model: Some(model),
-            downloaded_bytes,
-            total_bytes,
-            message,
-        }),
     }
 }
 
@@ -724,7 +666,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maps_private_model_progress_to_public_index_progress() {
+    async fn forwards_model_progress_to_both_callbacks_with_effective_concurrency() {
+        use super::super::EmbeddingModelProgress;
+
         let fixture = Arc::new(ProgressFixtureModel::new());
         let manager = ModelRuntimeManager::with_factory(move |_reference, _options| {
             Ok(Arc::clone(&fixture) as Arc<dyn EmbeddingModel>)
@@ -738,8 +682,8 @@ mod tests {
             .expect("fixture runtime should be acquired");
         let model_events = Arc::new(StdMutex::new(Vec::new()));
         let captured_model_events = Arc::clone(&model_events);
-        let index_events = Arc::new(StdMutex::new(Vec::new()));
-        let captured_index_events = Arc::clone(&index_events);
+        let reported_events = Arc::new(StdMutex::new(Vec::new()));
+        let captured_reported_events = Arc::clone(&reported_events);
         let inputs = [EmbeddingInput::text("fixture".to_owned())];
 
         lease
@@ -754,67 +698,49 @@ mod tests {
                     })),
                     ..EmbeddingOptions::default()
                 },
-                Some(IndexProgressReporter::new(move |progress| {
-                    captured_index_events
+                Some(ModelProgressReporter::new(move |progress, concurrency| {
+                    captured_reported_events
                         .lock()
-                        .expect("index event lock should not be poisoned")
-                        .push(progress);
+                        .expect("reported event lock should not be poisoned")
+                        .push((progress, concurrency));
                 })),
             )
             .await
             .expect("fixture embedding should complete");
 
-        assert_eq!(
-            model_events
-                .lock()
-                .expect("model event lock should not be poisoned")
-                .len(),
-            4
-        );
-        let events = index_events
+        let model_events = model_events
             .lock()
-            .expect("index event lock should not be poisoned");
-        assert_eq!(events.len(), 4);
+            .expect("model event lock should not be poisoned");
         assert_eq!(
-            events
-                .iter()
-                .map(|event| {
-                    event
-                        .embedding
-                        .as_ref()
-                        .and_then(|embedding| embedding.stage)
-                })
-                .collect::<Vec<_>>(),
+            *model_events,
             [
-                Some(IndexEmbeddingStage::Preparing),
-                Some(IndexEmbeddingStage::Downloading),
-                Some(IndexEmbeddingStage::Warning),
-                Some(IndexEmbeddingStage::Ready),
+                EmbeddingModelProgress::Preparing {
+                    model: "local/fixture".to_owned(),
+                },
+                EmbeddingModelProgress::Downloading {
+                    model: "local/fixture".to_owned(),
+                    downloaded_bytes: Some(4),
+                    total_bytes: Some(8),
+                },
+                EmbeddingModelProgress::Warning {
+                    model: "local/fixture".to_owned(),
+                    message: "fixture warning".to_owned(),
+                },
+                EmbeddingModelProgress::Ready {
+                    model: "local/fixture".to_owned(),
+                },
             ]
         );
-        for event in events.iter() {
-            assert_eq!(event.phase, IndexProgressPhase::Indexing);
-            assert_eq!(event.detail.as_deref(), Some("downloading local/fixture"));
-            let embedding = event
-                .embedding
-                .as_ref()
-                .expect("model progress should be nested under embedding");
-            assert_eq!(embedding.concurrency, Some(1));
-            assert_eq!(embedding.max_concurrency, Some(1));
-            assert_eq!(embedding.model.as_deref(), Some("local/fixture"));
-        }
-        let downloading = events[1]
-            .embedding
-            .as_ref()
-            .expect("download event should include embedding progress");
-        assert_eq!(downloading.downloaded_bytes, Some(4));
-        assert_eq!(downloading.total_bytes, Some(8));
+        let reported_events = reported_events
+            .lock()
+            .expect("reported event lock should not be poisoned");
         assert_eq!(
-            events[2]
-                .embedding
-                .as_ref()
-                .and_then(|embedding| embedding.message.as_deref()),
-            Some("fixture warning")
+            *reported_events,
+            model_events
+                .iter()
+                .cloned()
+                .map(|event| (event, 1))
+                .collect::<Vec<_>>()
         );
     }
 

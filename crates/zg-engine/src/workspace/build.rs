@@ -43,7 +43,7 @@ enum PreviousStorage {
 impl WorkspaceBuild {
     /// A stage is reusable only for the same base generation and processing settings.
     fn matches(&self, target: &WorkspaceManifest) -> bool {
-        self.target.same_index_settings(target) && self.base_generation == target.generation
+        self.target.same_index_settings(target) && self.base_generation == target.revision()
     }
 
     fn validate(&self) -> Result<(), EngineError> {
@@ -98,10 +98,12 @@ pub(crate) fn recover_build(
         return Ok((None, false));
     };
     let active = read_workspace_manifest(home)?;
-    if active.as_ref().is_some_and(|manifest| {
-        manifest.id == build.target.id
-            && manifest.storage_generation == build.target.storage_generation
-    }) {
+    // The selected storage directory is the commit marker within this locked
+    // workspace home. Its name may have changed after the manifest was published.
+    if active
+        .as_ref()
+        .is_some_and(|manifest| manifest.storage_generation == build.target.storage_generation)
+    {
         cleanup_previous(home, &build, factory)?;
         remove_build(home)?;
         return Ok((None, true));
@@ -120,8 +122,10 @@ pub(crate) fn prepare_build(
             // Even a completed-but-unpublished stage is scanned again on resume:
             // source files may have changed since the previous process stopped.
             pending.phase = BuildPhase::Building;
-            pending.target.generation = target.generation;
-            pending.target.updated_time = target.updated_time;
+            pending.target.record_revision(
+                target.revision().unwrap_or(0),
+                target.workspace.updated_epoch_ms,
+            );
             write_build(&pending)?;
             ensure_stage(&pending)?;
             return Ok(pending);
@@ -140,7 +144,7 @@ pub(crate) fn prepare_build(
     });
     let build = WorkspaceBuild {
         version: BUILD_VERSION,
-        base_generation: target.generation,
+        base_generation: target.revision(),
         target,
         phase: BuildPhase::Building,
         previous,
@@ -159,8 +163,7 @@ pub(crate) fn publish_build(
     updated_time: u64,
     factory: &dyn WorkspaceIndexStorageFactory,
 ) -> Result<(), EngineError> {
-    build.target.generation = Some(generation);
-    build.target.updated_time = updated_time;
+    build.target.record_revision(generation, updated_time);
     build.phase = BuildPhase::Publishing;
     write_build(&build)?;
     write_workspace_manifest(&build.target.path, &build.target)?;
@@ -204,8 +207,10 @@ pub(crate) fn read_build(home: &Path) -> Result<Option<WorkspaceBuild>, EngineEr
         EngineError::storage_failure(format!("invalid workspace build record: {error}"))
     })?;
     build.validate()?;
-    build.target.path = home.to_path_buf();
-    build.target.root = home
+    build.target.path = std::path::absolute(home).map_err(build_io)?;
+    build.target.workspace.root = build
+        .target
+        .path
         .parent()
         .ok_or_else(|| EngineError::storage_failure("workspace home has no parent"))?
         .to_path_buf();
@@ -287,9 +292,9 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        api::{
-            index::options::DiscoveryOptions,
-            info::result::{WorkspaceIndexInfo, WorkspaceIndexPolicy},
+        domain::{
+            EmbeddingMetric, EmbeddingSchema, FileSelection, IndexPolicy, Workspace,
+            WorkspaceIndex, WorkspaceName,
         },
         storage::spi::{StorageResult, WorkspaceIndexStorage, WorkspaceIndexStorageOptions},
         workspace::manifest::EmbeddingRuntimeConfig,
@@ -330,19 +335,25 @@ mod tests {
 
     fn manifest(root: &Path) -> WorkspaceManifest {
         WorkspaceManifest::new(
-            WorkspaceIndexInfo {
-                id: "stable-workspace-id".into(),
-                name: "workspace".into(),
-                path: root.join(".zvec-grep"),
+            Workspace {
+                name: WorkspaceName::new("workspace").expect("workspace name"),
                 root: root.to_path_buf(),
-                discovery: DiscoveryOptions::default(),
-                policy: WorkspaceIndexPolicy::Enabled,
-                embedding: None,
-                index_version: Some(5),
-                generation: Some(7),
+                file_selection: FileSelection::default(),
+                index_policy: IndexPolicy::Enabled,
+                index: Some(WorkspaceIndex {
+                    embedding: EmbeddingSchema {
+                        provider: "local".into(),
+                        model: "example".into(),
+                        dimension: 8,
+                        metric: EmbeddingMetric::Cosine,
+                    },
+                    revision: 7,
+                }),
                 created_epoch_ms: 1,
                 updated_epoch_ms: 2,
             },
+            root.join(".zvec-grep"),
+            Some(5),
             EmbeddingRuntimeConfig::default(),
         )
         .expect("manifest")
@@ -384,7 +395,7 @@ mod tests {
 
     #[test]
     fn changed_build_settings_discard_only_the_incompatible_stage() {
-        for changed_setting in 0..4 {
+        for changed_setting in 0..5 {
             let directory = tempdir().expect("workspace");
             let active = manifest(directory.path());
             write_active(&active);
@@ -393,10 +404,11 @@ mod tests {
                 prepare_build(active.clone(), Some(&active), None, &factory).expect("stage");
             let mut target = active.clone();
             match changed_setting {
-                0 => target.discovery.globs.push("*.rs".into()),
+                0 => target.workspace.file_selection.globs.push("*.rs".into()),
                 1 => target.embedding_runtime.endpoint = Some("https://other.example".into()),
                 2 => target.index_version = Some(6),
-                _ => target.generation = Some(8),
+                3 => target.record_revision(8, 3),
+                _ => target.workspace.name = WorkspaceName::new("renamed").expect("new name"),
             }
             let replaced = prepare_build(target, Some(&active), Some(build.clone()), &factory)
                 .expect("new stage");
@@ -422,7 +434,7 @@ mod tests {
         let mut build =
             prepare_build(active.clone(), Some(&active), None, &factory).expect("stage");
         build.phase = BuildPhase::Publishing;
-        build.target.generation = Some(8);
+        build.target.record_revision(8, 3);
         write_build(&build).expect("prepare publication");
         let (pending, published) = recover_build(&active.path, &factory).expect("recover");
         assert!(!published);
@@ -432,13 +444,13 @@ mod tests {
             resumed.target.storage_generation,
             build.target.storage_generation
         );
-        assert_eq!(resumed.target.generation, Some(7));
+        assert_eq!(resumed.target.revision(), Some(7));
         assert_eq!(resumed.phase, BuildPhase::Building);
         assert!(active.storage_home().join("storage/old").exists());
     }
 
     #[test]
-    fn publication_cleanup_failure_keeps_new_active_and_is_recoverable() {
+    fn publication_cleanup_failure_keeps_new_active_and_recovers_after_rename() {
         let directory = tempdir().expect("workspace");
         let mut active = manifest(directory.path());
         active.storage_generation = Some(Uuid::new_v4().to_string());
@@ -450,18 +462,23 @@ mod tests {
         let error = publish_build(build.clone(), 8, 3, &factory)
             .expect_err("cleanup fails after publication");
         assert!(error.message().contains("cleanup"));
-        let committed = read_workspace_manifest(&active.path)
+        let mut committed = read_workspace_manifest(&active.path)
             .expect("manifest")
             .expect("active");
         assert_eq!(
             committed.storage_generation,
             build.target.storage_generation
         );
-        assert_eq!(committed.generation, Some(8));
-        assert_eq!(committed.id, active.id);
-        assert_eq!(committed.created_time, active.created_time);
+        assert_eq!(committed.revision(), Some(8));
+        assert_eq!(committed.workspace.name, active.workspace.name);
+        assert_eq!(
+            committed.workspace.created_epoch_ms,
+            active.workspace.created_epoch_ms
+        );
         assert!(active.storage_home().exists());
         assert!(has_build(&active.path));
+        committed.workspace.name = WorkspaceName::new("renamed").expect("new workspace name");
+        write_workspace_manifest(&active.path, &committed).expect("rename after publication");
         factory.fail_delete.store(false, Ordering::Relaxed);
         let (pending, published) = recover_build(&active.path, &factory).expect("complete cleanup");
         assert!(pending.is_none());
@@ -469,6 +486,10 @@ mod tests {
         assert!(!active.storage_home().exists());
         assert!(committed.storage_home().join("storage").is_dir());
         assert!(!has_build(&active.path));
+        assert_eq!(
+            read_workspace_manifest(&active.path).expect("active manifest"),
+            Some(committed)
+        );
     }
 
     #[test]
@@ -487,7 +508,7 @@ mod tests {
             .expect("manifest")
             .expect("active");
         assert_eq!(committed.index_version, Some(5));
-        assert_eq!(committed.generation, Some(8));
+        assert_eq!(committed.revision(), Some(8));
         assert!(committed.storage_home().join("storage").is_dir());
         assert!(!active.storage_home().join("storage").exists());
         assert!(!has_build(&active.path));
@@ -511,9 +532,9 @@ mod tests {
             pending.target.storage_generation,
             build.target.storage_generation
         );
-        assert_eq!(pending.target.root, moved);
+        assert_eq!(pending.target.workspace.root, moved);
         assert!(pending.target.storage_home().is_dir());
-        assert_eq!(pending.target.id, active.id);
+        assert_eq!(pending.target.workspace.name, active.workspace.name);
     }
 
     #[test]

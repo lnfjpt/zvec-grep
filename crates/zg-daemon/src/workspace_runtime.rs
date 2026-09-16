@@ -185,6 +185,7 @@ impl WorkspaceRuntimeManager {
         let runtime = self.runtime(canonical_root.clone(), &options);
         let mut template = options.clone();
         template.signal = None;
+        template.name = None;
         *lock(&runtime.index_template) = template;
         let target_revision = runtime.dirty_revision.load(Ordering::Acquire);
         let submitted = self
@@ -381,7 +382,8 @@ impl WorkspaceRuntimeManager {
         let mut runtimes = lock(&self.inner.runtimes);
         Arc::clone(runtimes.entry(canonical_root.clone()).or_insert_with(|| {
             let mut template = options.clone();
-            // Resident state must not retain request cancellation or progress observers.
+            // Naming, cancellation, and progress observers belong to one request.
+            template.name = None;
             template.signal = None;
             template.on_progress = None;
             Arc::new(WorkspaceRuntime {
@@ -679,6 +681,7 @@ async fn watch_loop(
         let mut options = lock(&runtime.index_template).clone();
         // One-operation consent must never authorize later watcher jobs.
         options.allow_remote = false;
+        options.name = None;
         options.signal = None;
         options.on_progress = None;
         options.root = Some(runtime.canonical_root.clone());
@@ -1114,6 +1117,7 @@ mod tests {
             .submit_index(
                 IndexOptions {
                     root: Some(workspace.path().to_path_buf()),
+                    name: Some("explicit-workspace-name".into()),
                     ..IndexOptions::default()
                 },
                 true,
@@ -1123,6 +1127,8 @@ mod tests {
         assert_eq!(indexed.job.canonical_root, canonical_root);
         assert_eq!(manager.snapshot().active_runtimes, 1);
         assert!(manager.runtime_snapshot(&canonical_root).watcher_active);
+        let runtime = manager.runtime(canonical_root.clone(), &IndexOptions::default());
+        assert!(super::lock(&runtime.index_template).name.is_none());
         assert_eq!(
             watchers
                 .watches
@@ -1156,6 +1162,8 @@ mod tests {
         .expect("watch index should run");
         {
             let calls = executor.calls.lock().expect("calls should be readable");
+            assert_eq!(calls[0].name.as_deref(), Some("explicit-workspace-name"));
+            assert!(calls[1].name.is_none());
             assert_eq!(
                 calls[1].changes,
                 [IndexChange::Upsert(PathBuf::from("src/lib.rs"))]

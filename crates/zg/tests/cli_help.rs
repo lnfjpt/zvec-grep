@@ -61,6 +61,13 @@ fn every_documented_help_topic_is_available() {
 }
 
 #[test]
+fn index_help_describes_the_optional_workspace_name() {
+    let help = stdout(&["index", "--help"]);
+    assert!(help.contains("--name <NAME>"));
+    assert!(help.contains("defaults to root directory name"));
+}
+
+#[test]
 fn version_aliases_match_typescript_contract() {
     let expected = "0.0.1\n";
     assert_eq!(stdout(&["version"]), expected);

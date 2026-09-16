@@ -19,8 +19,6 @@ mod model2vec;
 mod qwen;
 mod transformers;
 
-use crate::api::index::progress::IndexProgressReporter;
-
 // Model catalog and reference resolution.
 pub(crate) use catalog::{EmbeddingCatalogEntry, get_embedding_model_catalog_entry};
 pub(crate) use resolution::{ResolveEmbeddingReferenceOptions, resolve_embedding_reference};
@@ -33,6 +31,8 @@ pub(crate) type ModelRuntimeSnapshot = runtime::ModelRuntimeSnapshot;
 
 // Model configuration and capabilities. Backend traits, factories, and
 // validation helpers remain private to `models`.
+pub use spi::Device;
+pub(crate) use spi::{EmbeddingModelProgress, ModelProgressReporter};
 pub(crate) type CreateEmbeddingModelOptions = spi::CreateEmbeddingModelOptions;
 pub(crate) type EmbeddingMetric = spi::EmbeddingMetric;
 pub(crate) type EmbeddingModelInfo = spi::EmbeddingModelInfo;
@@ -89,9 +89,9 @@ impl runtime::ModelRuntimeLease {
         &self,
         inputs: &[EmbeddingInput],
         options: EmbeddingOptions,
-        index_progress: Option<IndexProgressReporter>,
+        progress: Option<ModelProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError> {
-        self.embed_impl(inputs, options, index_progress).await
+        self.embed_impl(inputs, options, progress).await
     }
 }
 

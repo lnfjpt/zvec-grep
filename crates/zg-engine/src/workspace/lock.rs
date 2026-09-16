@@ -58,6 +58,46 @@ pub(crate) fn acquire_read_write_lock(
     mode: LockMode,
     operation: &str,
 ) -> Result<FileLock, EngineError> {
+    let file = open_lock_file(lock_path, operation)?;
+    let result = match mode {
+        LockMode::Read => file.try_lock_shared(),
+        LockMode::Write => file.try_lock(),
+    };
+    result.map_err(|error| match error {
+        TryLockError::WouldBlock => EngineError::resource_busy(format!(
+            "index unavailable: lock={} operation={operation}",
+            lock_path.display(),
+        )),
+        TryLockError::Error(error) => EngineError::from_io(
+            format!(
+                "acquire workspace lock {} operation={operation}",
+                lock_path.display()
+            ),
+            &error,
+        ),
+    })?;
+    Ok(FileLock { _file: file })
+}
+
+/// Serialize short metadata updates shared by otherwise independent workspaces.
+pub(crate) fn acquire_exclusive_lock(
+    lock_path: &Path,
+    operation: &str,
+) -> Result<FileLock, EngineError> {
+    let file = open_lock_file(lock_path, operation)?;
+    file.lock().map_err(|error| {
+        EngineError::from_io(
+            format!(
+                "acquire workspace lock {} operation={operation}",
+                lock_path.display()
+            ),
+            &error,
+        )
+    })?;
+    Ok(FileLock { _file: file })
+}
+
+fn open_lock_file(lock_path: &Path, operation: &str) -> Result<File, EngineError> {
     let parent = lock_path.parent().unwrap_or_else(|| Path::new("."));
     let mut builder = DirBuilder::new();
     builder.recursive(true);
@@ -84,7 +124,7 @@ pub(crate) fn acquire_read_write_lock(
 
         options.mode(0o600);
     }
-    let file = options.open(lock_path).map_err(|error| {
+    options.open(lock_path).map_err(|error| {
         EngineError::from_io(
             format!(
                 "open workspace lock {} operation={operation}",
@@ -92,25 +132,7 @@ pub(crate) fn acquire_read_write_lock(
             ),
             &error,
         )
-    })?;
-    let result = match mode {
-        LockMode::Read => file.try_lock_shared(),
-        LockMode::Write => file.try_lock(),
-    };
-    result.map_err(|error| match error {
-        TryLockError::WouldBlock => EngineError::resource_busy(format!(
-            "index unavailable: lock={} operation={operation}",
-            lock_path.display(),
-        )),
-        TryLockError::Error(error) => EngineError::from_io(
-            format!(
-                "acquire workspace lock {} operation={operation}",
-                lock_path.display()
-            ),
-            &error,
-        ),
-    })?;
-    Ok(FileLock { _file: file })
+    })
 }
 
 #[cfg(test)]

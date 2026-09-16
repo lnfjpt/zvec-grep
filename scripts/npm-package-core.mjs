@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -107,4 +107,26 @@ export function npmEnvironment(cacheDir) {
 export async function sha256File(path) {
   const contents = await readFile(path);
   return createHash("sha256").update(contents).digest("hex");
+}
+
+// Preserve the SDK layout relative to the loaded library, including on Windows
+// where the DLL must live beside the executable.
+export async function stageZvecRuntime(sourceDir, binDir, platform) {
+  const library = {
+    darwin: "libzvec_c_api.dylib",
+    linux: "libzvec_c_api.so",
+    win32: "zvec_c_api.dll",
+  }[platform];
+  if (!library) throw new Error(`unsupported zvec runtime platform: ${platform}`);
+  const files = [library, "data/jieba_dict/jieba.dict.utf8", "data/jieba_dict/hmm_model.utf8"];
+  for (const file of files) {
+    const source = join(sourceDir, file);
+    if (!(await stat(source)).isFile()) throw new Error(`missing zvec runtime file: ${source}`);
+  }
+  for (const file of files) {
+    const destination = join(binDir, file);
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(join(sourceDir, file), destination);
+  }
+  return files.map((file) => `bin/${file}`);
 }

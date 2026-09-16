@@ -11,7 +11,7 @@ use crate::{
 use super::codec;
 
 pub(super) const NAME: &str = "pending.json";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[cfg(test)]
 thread_local! {
@@ -39,7 +39,7 @@ impl PendingChange {
     }
 }
 
-pub(super) type PendingChanges = BTreeMap<String, PendingChange>;
+pub(super) type PendingChanges = BTreeMap<FileId, PendingChange>;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,7 +52,7 @@ struct PendingRecord {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ChangeRecord {
     Reindex { source: String },
-    Delete { file_id: String },
+    Delete { file_id: u64 },
 }
 
 pub(super) fn write(storage_path: &Path, changes: &PendingChanges) -> EngineResult<()> {
@@ -64,7 +64,7 @@ pub(super) fn write(storage_path: &Path, changes: &PendingChanges) -> EngineResu
     let files = changes
         .iter()
         .map(|(key, change)| {
-            if key != change.file_id().as_str() {
+            if key != change.file_id() {
                 return Err(invalid("pending key differs from its source file ID"));
             }
             match change {
@@ -72,7 +72,7 @@ pub(super) fn write(storage_path: &Path, changes: &PendingChanges) -> EngineResu
                     source: codec::encode_file(source)?,
                 }),
                 PendingChange::Delete(file_id) => Ok(ChangeRecord::Delete {
-                    file_id: file_id.as_str().to_owned(),
+                    file_id: file_id.get(),
                 }),
             }
         })
@@ -137,9 +137,9 @@ fn decode(bytes: &[u8]) -> EngineResult<PendingChanges> {
             ChangeRecord::Reindex { source } => {
                 PendingChange::Reindex(codec::decode_file(&source)?)
             }
-            ChangeRecord::Delete { file_id } => PendingChange::Delete(FileId::new(file_id)?),
+            ChangeRecord::Delete { file_id } => PendingChange::Delete(FileId::new(file_id)),
         };
-        let key = change.file_id().as_str().to_owned();
+        let key = *change.file_id();
         if changes.insert(key, change).is_some() {
             return Err(invalid("pending batch contains duplicate source file IDs"));
         }
@@ -153,8 +153,6 @@ fn invalid(message: impl Into<String>) -> EngineError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use serde_json::{Value, json};
 
     use super::*;
@@ -163,8 +161,8 @@ mod tests {
     fn source() -> FileRecord {
         FileRecord {
             index_status: crate::domain::FileIndexStatus::NotIndexed,
-            id: FileId::new("source").expect("file ID"),
-            relative_path: PathBuf::from("nested/source.rs"),
+            id: FileId::new(0),
+            relative_path: crate::domain::SourcePath::new("nested/source.rs").expect("source path"),
             formats: vec![FileFormat::Rust],
             snapshot: FileSnapshot {
                 size_bytes: 42,
@@ -201,16 +199,10 @@ mod tests {
     fn persists_only_source_metadata_and_deletion_intents() {
         let directory = tempfile::tempdir().expect("pending directory");
         let source = source();
-        let deletion = FileId::new("deleted").expect("deleted file ID");
+        let deletion = FileId::new(u64::MAX);
         let changes = PendingChanges::from([
-            (
-                source.id.as_str().to_owned(),
-                PendingChange::Reindex(source),
-            ),
-            (
-                deletion.as_str().to_owned(),
-                PendingChange::Delete(deletion),
-            ),
+            (source.id, PendingChange::Reindex(source)),
+            (deletion, PendingChange::Delete(deletion)),
         ]);
 
         write(directory.path(), &changes).expect("write pending batch");
@@ -234,19 +226,19 @@ mod tests {
         let mut invalid_source: Value = serde_json::from_str(&encoded).expect("source record");
         invalid_source["value"]["relative_path"]["value"] = json!("../outside.rs");
         let mut invalid_id: Value = serde_json::from_str(&encoded).expect("source record");
-        invalid_id["value"]["id"] = json!(" ");
+        invalid_id["value"]["id"] = json!(-1);
         let reindex = json!({"kind": "reindex", "source": encoded});
         for record in [
-            json!({"version": 1, "files": []}),
-            json!({"version": 2, "files": [reindex.clone()]}),
-            json!({"version": 1, "files": [reindex.clone()], "unexpected": true}),
-            json!({"version": 1, "files": [reindex.clone(), reindex.clone()]}),
-            json!({"version": 1, "files": [reindex.clone(), {"kind": "delete", "file_id": "source"}]}),
-            json!({"version": 1, "files": [reindex.clone(), {"kind": "delete", "file_id": " "}]}),
-            json!({"version": 1, "files": [reindex.clone(), {"kind": "reindex", "source": "broken"}]}),
-            json!({"version": 1, "files": [{"kind": "reindex", "source": invalid_source.to_string()}]}),
-            json!({"version": 1, "files": [{"kind": "reindex", "source": invalid_id.to_string()}]}),
-            json!({"version": 1, "files": [{"kind": "delete", "file_id": "deleted", "entries": []}]}),
+            json!({"version": VERSION, "files": []}),
+            json!({"version": VERSION + 1, "files": [reindex.clone()]}),
+            json!({"version": VERSION, "files": [reindex.clone()], "unexpected": true}),
+            json!({"version": VERSION, "files": [reindex.clone(), reindex.clone()]}),
+            json!({"version": VERSION, "files": [reindex.clone(), {"kind": "delete", "file_id": 0}]}),
+            json!({"version": VERSION, "files": [reindex.clone(), {"kind": "delete", "file_id": -1}]}),
+            json!({"version": VERSION, "files": [reindex.clone(), {"kind": "reindex", "source": "broken"}]}),
+            json!({"version": VERSION, "files": [{"kind": "reindex", "source": invalid_source.to_string()}]}),
+            json!({"version": VERSION, "files": [{"kind": "reindex", "source": invalid_id.to_string()}]}),
+            json!({"version": VERSION, "files": [{"kind": "delete", "file_id": 2, "entries": []}]}),
         ] {
             assert!(decode_value(&record).is_err(), "accepted {record}");
         }
@@ -259,20 +251,14 @@ mod tests {
     fn rejected_writes_preserve_the_existing_pending_batch() {
         let directory = tempfile::tempdir().expect("pending directory");
         let source = source();
-        let changes = PendingChanges::from([(
-            source.id.as_str().to_owned(),
-            PendingChange::Reindex(source.clone()),
-        )]);
+        let changes = PendingChanges::from([(source.id, PendingChange::Reindex(source.clone()))]);
         write(directory.path(), &changes).expect("write initial pending batch");
         let mut invalid_source = source.clone();
-        invalid_source.relative_path = PathBuf::from("../outside.rs");
+        invalid_source.formats.clear();
         for invalid in [
             PendingChanges::new(),
-            PendingChanges::from([("different-id".to_owned(), PendingChange::Reindex(source))]),
-            PendingChanges::from([(
-                invalid_source.id.as_str().to_owned(),
-                PendingChange::Reindex(invalid_source),
-            )]),
+            PendingChanges::from([(FileId::new(2), PendingChange::Reindex(source))]),
+            PendingChanges::from([(invalid_source.id, PendingChange::Reindex(invalid_source))]),
         ] {
             assert!(write(directory.path(), &invalid).is_err());
             assert_eq!(

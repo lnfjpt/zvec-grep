@@ -58,9 +58,11 @@ pub fn info_options(root: &Path) -> InfoOptions {
 pub fn configure_remote_model(root: &Path, address: SocketAddr) -> std::io::Result<()> {
     let home = root.join(".zvec-grep");
     fs::create_dir_all(&home)?;
-    // Seed credentials in a configuration fixture without changing process-wide environment.
+    // Seed credentials without changing process-wide environment. Each fixture
+    // keeps one globally unique name, including when its root is later moved.
+    let name = format!("fixture-{}", uuid::Uuid::new_v4());
     let manifest = json!({
-        "manifestVersion": 1, "id": "fixture-workspace", "name": "fixture", "path": home,
+        "manifestVersion": 1, "id": "fixture-workspace", "name": name, "path": home,
         "rootPaths": [{ "absolutePath": root, "recursive": true }],
         "indexPolicy": "enabled", "embedding": { "provider": "qwen", "model": "text-embedding-v4", "dimension": 1024, "metric": "cosine" },
         "indexVersion": null, "createdTime": 1, "updatedTime": 1,

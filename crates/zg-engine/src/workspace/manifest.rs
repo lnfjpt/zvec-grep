@@ -1,21 +1,20 @@
+use crate::{
+    EngineError,
+    domain::{
+        EmbeddingMetric, EmbeddingSchema, FileSelection, IndexPolicy, Workspace, WorkspaceIndex,
+        WorkspaceName,
+    },
+    models::Device,
+    utils::{atomic_write, sync_directory},
+};
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
-
-use crate::{
-    EngineError,
-    api::{
-        index::options::{Device, DiscoveryOptions},
-        info::result::{WorkspaceIndexEmbedding, WorkspaceIndexInfo, WorkspaceIndexPolicy},
-    },
-    utils::{atomic_write, sync_directory},
-};
-
 pub(crate) const WORKSPACE_MANIFEST_FILE: &str = "manifest.json";
-pub(crate) const CURRENT_MANIFEST_VERSION: u32 = 3;
+pub(crate) const CURRENT_MANIFEST_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,52 +29,47 @@ pub(crate) struct EmbeddingRuntimeConfig {
     pub cache_dir: Option<PathBuf>,
 }
 
+/// Disk metadata owns layout/versioning; domain workspace owns its logical state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", try_from = "ManifestInput")]
+#[serde(try_from = "ManifestData", into = "ManifestData")]
 pub(crate) struct WorkspaceManifest {
     pub manifest_version: u32,
-    pub id: String,
-    pub name: String,
+    pub workspace: Workspace,
+    /// Root recorded on disk before resolving a moved workspace.
+    pub recorded_root: PathBuf,
     pub path: PathBuf,
-    pub root: PathBuf,
-    pub discovery: ManifestDiscovery,
-    pub index_policy: WorkspaceIndexPolicy,
-    pub embedding: Option<WorkspaceIndexEmbedding>,
     pub index_version: Option<u32>,
-    /// Relative generation directory selected by this atomic manifest.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_generation: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u64>,
-    pub created_time: u64,
-    pub updated_time: u64,
     pub embedding_runtime: EmbeddingRuntimeConfig,
 }
 
-// Read legacy rootPaths without requiring the new fields, so an older index can
-// still supply its embedding and discovery settings to an explicit rebuild.
-#[derive(Deserialize)]
+// Retain the existing flat disk representation, while retiring its UUID identity.
+// Unknown legacy `id` fields are ignored; the next write stores only the name.
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ManifestInput {
+struct ManifestData {
     manifest_version: u32,
-    id: String,
     name: String,
     path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     root: Option<PathBuf>,
     #[serde(default)]
     discovery: ManifestDiscovery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     root_paths: Option<Vec<LegacyRootPath>>,
-    index_policy: WorkspaceIndexPolicy,
-    embedding: Option<WorkspaceIndexEmbedding>,
+    index_policy: IndexPolicy,
+    embedding: Option<StoredEmbeddingSchema>,
     index_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     storage_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     generation: Option<u64>,
     created_time: u64,
     updated_time: u64,
     embedding_runtime: EmbeddingRuntimeConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyRootPath {
     absolute_path: PathBuf,
@@ -84,10 +78,51 @@ struct LegacyRootPath {
     discovery: ManifestDiscovery,
 }
 
-impl TryFrom<ManifestInput> for WorkspaceManifest {
-    type Error = String;
+#[derive(Deserialize, Serialize)]
+struct StoredEmbeddingSchema {
+    provider: String,
+    model: String,
+    dimension: usize,
+    metric: String,
+}
 
-    fn try_from(input: ManifestInput) -> Result<Self, Self::Error> {
+impl TryFrom<StoredEmbeddingSchema> for EmbeddingSchema {
+    type Error = String;
+    fn try_from(value: StoredEmbeddingSchema) -> Result<Self, Self::Error> {
+        let metric = match value.metric.as_str() {
+            "cosine" => EmbeddingMetric::Cosine,
+            "dot" => EmbeddingMetric::DotProduct,
+            "euclidean" => EmbeddingMetric::Euclidean,
+            _ => return Err("embedding metric is invalid".into()),
+        };
+        Ok(Self {
+            provider: value.provider,
+            model: value.model,
+            dimension: value.dimension,
+            metric,
+        })
+    }
+}
+
+impl From<EmbeddingSchema> for StoredEmbeddingSchema {
+    fn from(value: EmbeddingSchema) -> Self {
+        Self {
+            provider: value.provider,
+            model: value.model,
+            dimension: value.dimension,
+            metric: match value.metric {
+                EmbeddingMetric::Cosine => "cosine",
+                EmbeddingMetric::DotProduct => "dot",
+                EmbeddingMetric::Euclidean => "euclidean",
+            }
+            .into(),
+        }
+    }
+}
+
+impl TryFrom<ManifestData> for WorkspaceManifest {
+    type Error = String;
+    fn try_from(input: ManifestData) -> Result<Self, Self::Error> {
         let (root, discovery) = match (input.root, input.root_paths) {
             (Some(root), None) => (root, input.discovery),
             (None, Some(mut roots)) => {
@@ -106,22 +141,134 @@ impl TryFrom<ManifestInput> for WorkspaceManifest {
             (Some(_), Some(_)) => return Err("specify root or legacy rootPaths, not both".into()),
             (None, None) => return Err("workspace root is missing".into()),
         };
-        Ok(Self {
+        let index = input
+            .embedding
+            .map(|embedding| -> Result<_, String> {
+                Ok(WorkspaceIndex {
+                    embedding: embedding.try_into()?,
+                    // Zero records an unknown legacy revision or an unpublished first build.
+                    // It is never exposed as a known API generation.
+                    revision: input.generation.unwrap_or(0),
+                })
+            })
+            .transpose()?;
+        let manifest = Self {
             manifest_version: input.manifest_version,
-            id: input.id,
-            name: input.name,
+            recorded_root: root.clone(),
+            workspace: Workspace {
+                name: WorkspaceName::new(input.name).map_err(|error| error.to_string())?,
+                root,
+                file_selection: discovery.into(),
+                index_policy: input.index_policy,
+                index,
+                created_epoch_ms: input.created_time,
+                updated_epoch_ms: input.updated_time,
+            },
             path: input.path,
-            root,
-            discovery,
-            index_policy: input.index_policy,
-            embedding: input.embedding,
             index_version: input.index_version,
             storage_generation: input.storage_generation,
-            generation: input.generation,
-            created_time: input.created_time,
-            updated_time: input.updated_time,
             embedding_runtime: input.embedding_runtime,
-        })
+        };
+        manifest.validate().map_err(|error| error.to_string())?;
+        Ok(manifest)
+    }
+}
+
+impl From<WorkspaceManifest> for ManifestData {
+    fn from(manifest: WorkspaceManifest) -> Self {
+        let generation = manifest.revision();
+        let workspace = manifest.workspace;
+        Self {
+            manifest_version: manifest.manifest_version,
+            name: workspace.name.to_string(),
+            path: manifest.path,
+            root: Some(workspace.root),
+            discovery: workspace.file_selection.into(),
+            root_paths: None,
+            index_policy: workspace.index_policy,
+            embedding: workspace.index.map(|index| index.embedding.into()),
+            index_version: manifest.index_version,
+            storage_generation: manifest.storage_generation,
+            generation,
+            created_time: workspace.created_epoch_ms,
+            updated_time: workspace.updated_epoch_ms,
+            embedding_runtime: manifest.embedding_runtime,
+        }
+    }
+}
+
+impl WorkspaceManifest {
+    pub(crate) fn new(
+        workspace: Workspace,
+        home: PathBuf,
+        index_version: Option<u32>,
+        embedding_runtime: EmbeddingRuntimeConfig,
+    ) -> Result<Self, EngineError> {
+        let manifest = Self {
+            manifest_version: CURRENT_MANIFEST_VERSION,
+            path: home,
+            recorded_root: workspace.root.clone(),
+            workspace,
+            index_version,
+            storage_generation: None,
+            embedding_runtime,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub(crate) fn storage_home(&self) -> PathBuf {
+        self.storage_generation.as_ref().map_or_else(
+            || self.path.clone(),
+            |generation| self.path.join("generations").join(generation),
+        )
+    }
+
+    pub(crate) fn embedding(&self) -> Option<&EmbeddingSchema> {
+        self.workspace.index.as_ref().map(|index| &index.embedding)
+    }
+
+    pub(crate) fn revision(&self) -> Option<u64> {
+        self.workspace
+            .index
+            .as_ref()
+            .and_then(|index| (index.revision != 0).then_some(index.revision))
+    }
+
+    pub(crate) fn record_revision(&mut self, revision: u64, updated_epoch_ms: u64) {
+        if let Some(index) = &mut self.workspace.index {
+            index.revision = revision;
+        }
+        self.workspace.updated_epoch_ms = updated_epoch_ms;
+        self.manifest_version = CURRENT_MANIFEST_VERSION;
+    }
+
+    pub(crate) fn same_index_settings(&self, other: &Self) -> bool {
+        self.workspace.name == other.workspace.name
+            && self.index_version == other.index_version
+            && self.embedding() == other.embedding()
+            && self.embedding_runtime == other.embedding_runtime
+            && self.workspace.file_selection == other.workspace.file_selection
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        if !matches!(self.manifest_version, 1 | 2 | 3 | CURRENT_MANIFEST_VERSION) {
+            return Err(invalid_manifest(format!(
+                "unsupported manifestVersion {}",
+                self.manifest_version
+            )));
+        }
+        if let Some(generation) = &self.storage_generation
+            && uuid::Uuid::parse_str(generation).is_err()
+        {
+            return Err(invalid_manifest("storageGeneration must be a UUID"));
+        }
+        if !self.path.is_absolute() {
+            return Err(invalid_manifest("path must be an absolute workspace home"));
+        }
+        self.workspace
+            .validate()
+            .map_err(|error| invalid_manifest(error.message()))
     }
 }
 
@@ -154,97 +301,8 @@ pub(crate) struct ManifestDiscovery {
     pub follow: bool,
 }
 
-impl WorkspaceManifest {
-    pub(crate) fn new(
-        info: WorkspaceIndexInfo,
-        embedding_runtime: EmbeddingRuntimeConfig,
-    ) -> Result<Self, EngineError> {
-        let manifest = Self {
-            manifest_version: CURRENT_MANIFEST_VERSION,
-            id: info.id,
-            name: info.name,
-            path: info.path,
-            root: info.root,
-            discovery: info.discovery.into(),
-            index_policy: info.policy,
-            embedding: info.embedding,
-            index_version: info.index_version,
-            storage_generation: None,
-            generation: info.generation,
-            created_time: info.created_epoch_ms,
-            updated_time: info.updated_epoch_ms,
-            embedding_runtime,
-        };
-        manifest.validate()?;
-        Ok(manifest)
-    }
-
-    pub(crate) fn storage_home(&self) -> PathBuf {
-        self.storage_generation.as_ref().map_or_else(
-            || self.path.clone(),
-            |generation| self.path.join("generations").join(generation),
-        )
-    }
-
-    pub(crate) fn same_index_settings(&self, other: &Self) -> bool {
-        self.id == other.id
-            && self.index_version == other.index_version
-            && self.embedding == other.embedding
-            && self.embedding_runtime == other.embedding_runtime
-            && self.discovery == other.discovery
-    }
-
-    pub(crate) fn index_info(&self) -> WorkspaceIndexInfo {
-        WorkspaceIndexInfo {
-            id: self.id.clone(),
-            name: self.name.clone(),
-            path: self.path.clone(),
-            root: self.root.clone(),
-            discovery: self.discovery.clone().into(),
-            policy: self.index_policy,
-            embedding: self.embedding.clone(),
-            index_version: self.index_version,
-            generation: self.generation,
-            created_epoch_ms: self.created_time,
-            updated_epoch_ms: self.updated_time,
-        }
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), EngineError> {
-        if !matches!(self.manifest_version, 1 | 2 | CURRENT_MANIFEST_VERSION) {
-            return Err(invalid_manifest(format!(
-                "unsupported manifestVersion {}",
-                self.manifest_version
-            )));
-        }
-        if let Some(generation) = &self.storage_generation
-            && uuid::Uuid::parse_str(generation).is_err()
-        {
-            return Err(invalid_manifest("storageGeneration must be a UUID"));
-        }
-        if self.id.is_empty() || self.name.is_empty() || self.path.as_os_str().is_empty() {
-            return Err(invalid_manifest("id, name, and path must be non-empty"));
-        }
-        if !self.root.is_absolute() {
-            return Err(invalid_manifest("root must be an absolute workspace path"));
-        }
-        if self.index_policy == WorkspaceIndexPolicy::Undecided {
-            return Err(invalid_manifest("indexPolicy must be enabled or disabled"));
-        }
-        if let Some(embedding) = &self.embedding
-            && (embedding.provider.is_empty()
-                || embedding.model.is_empty()
-                || embedding.dimension == 0
-                || !matches!(embedding.metric.as_str(), "cosine" | "dot" | "euclidean"))
-        {
-            return Err(invalid_manifest("embedding schema is invalid"));
-        }
-        Ok(())
-    }
-}
-
-impl From<DiscoveryOptions> for ManifestDiscovery {
-    fn from(discovery: DiscoveryOptions) -> Self {
+impl From<FileSelection> for ManifestDiscovery {
+    fn from(discovery: FileSelection) -> Self {
         Self {
             include: discovery.include_paths,
             exclude: discovery.exclude_paths,
@@ -262,7 +320,7 @@ impl From<DiscoveryOptions> for ManifestDiscovery {
     }
 }
 
-impl From<ManifestDiscovery> for DiscoveryOptions {
+impl From<ManifestDiscovery> for FileSelection {
     fn from(discovery: ManifestDiscovery) -> Self {
         Self {
             include_paths: discovery.include,
@@ -301,7 +359,7 @@ pub(crate) fn read_workspace_manifest(
     // Persisted absolute paths may refer to where the workspace lived before a move.
     manifest.path = std::path::absolute(home)
         .map_err(|error| manifest_io("resolve directory for", home, &error))?;
-    manifest.root = manifest
+    manifest.workspace.root = manifest
         .path
         .parent()
         .ok_or_else(|| invalid_manifest("workspace home has no parent directory"))?
@@ -379,28 +437,29 @@ mod tests {
 
     fn fixture_manifest(home: &Path) -> WorkspaceManifest {
         WorkspaceManifest::new(
-            WorkspaceIndexInfo {
-                id: "workspace-id".to_owned(),
-                name: "fixture".to_owned(),
-                path: home.to_path_buf(),
+            Workspace {
+                name: WorkspaceName::new("fixture").expect("name"),
                 root: home.parent().expect("workspace root").to_path_buf(),
-                discovery: DiscoveryOptions {
-                    globs: vec!["*.rs".to_owned()],
+                file_selection: FileSelection {
+                    globs: vec!["*.rs".into()],
                     hidden: true,
-                    ..DiscoveryOptions::default()
+                    ..FileSelection::default()
                 },
-                policy: WorkspaceIndexPolicy::Enabled,
-                embedding: Some(WorkspaceIndexEmbedding {
-                    provider: "local".to_owned(),
-                    model: "minilm".to_owned(),
-                    dimension: 384,
-                    metric: "cosine".to_owned(),
+                index_policy: IndexPolicy::Enabled,
+                index: Some(WorkspaceIndex {
+                    embedding: EmbeddingSchema {
+                        provider: "local".into(),
+                        model: "minilm".into(),
+                        dimension: 384,
+                        metric: EmbeddingMetric::Cosine,
+                    },
+                    revision: 7,
                 }),
-                index_version: Some(1),
-                generation: Some(7),
                 created_epoch_ms: 10,
                 updated_epoch_ms: 20,
             },
+            home.to_path_buf(),
+            Some(1),
             EmbeddingRuntimeConfig {
                 device: Some(Device::Cpu),
                 cache_dir: Some(home.join("models")),
@@ -408,6 +467,30 @@ mod tests {
             },
         )
         .expect("fixture manifest")
+    }
+
+    #[test]
+    fn preserves_the_resolved_workspace_home() {
+        let directory = tempdir().expect("workspace");
+        let home = directory.path().join("custom-index");
+        let mut manifest = fixture_manifest(&home);
+
+        assert_eq!(manifest.path, home);
+        assert_eq!(manifest.storage_home(), home);
+        assert_eq!(manifest.workspace.root, directory.path());
+        let generation = uuid::Uuid::new_v4().to_string();
+        manifest.storage_generation = Some(generation.clone());
+        assert_eq!(
+            manifest.storage_home(),
+            home.join("generations").join(generation)
+        );
+
+        write_workspace_manifest(&home, &manifest).expect("persist at resolved home");
+        assert_eq!(
+            read_workspace_manifest(&home).expect("read resolved home"),
+            Some(manifest)
+        );
+        assert!(!directory.path().join(".zvec-grep").exists());
     }
 
     #[test]
@@ -421,6 +504,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&text).expect("manifest json");
 
         assert_eq!(json["manifestVersion"], CURRENT_MANIFEST_VERSION);
+        assert!(json.get("id").is_none());
         assert!(json.get("rootPaths").is_none());
         assert_eq!(json["root"], directory.path().to_string_lossy().as_ref());
         assert_eq!(json["discovery"]["globs"][0], "*.rs");
@@ -430,7 +514,7 @@ mod tests {
             json["embeddingRuntime"]["cacheDir"],
             home.join("models").to_string_lossy().as_ref()
         );
-        assert_eq!(manifest.index_info().generation, Some(7));
+        assert_eq!(manifest.revision(), Some(7));
         assert_eq!(
             read_workspace_manifest(&home).expect("read manifest"),
             Some(manifest)
@@ -445,7 +529,7 @@ mod tests {
             .expect("runtime object")
             .remove("cacheDir");
         let legacy: WorkspaceManifest = serde_json::from_value(legacy).expect("legacy manifest");
-        assert_eq!(legacy.generation, None);
+        assert_eq!(legacy.revision(), None);
         assert_eq!(legacy.embedding_runtime.cache_dir, None);
     }
 
@@ -490,7 +574,7 @@ mod tests {
         shallow["rootPaths"][0]["recursive"] = false.into();
         let shallow: WorkspaceManifest =
             serde_json::from_value(shallow).expect("nonrecursive legacy workspace");
-        assert_eq!(shallow.discovery.max_depth, Some(1));
+        assert_eq!(shallow.workspace.file_selection.max_depth, Some(1));
 
         json["rootPaths"] = serde_json::json!([discovery.clone(), discovery]);
         fs::write(
@@ -514,7 +598,7 @@ mod tests {
         let relocated = read_workspace_manifest(&moved.join(".zvec-grep"))
             .expect("relocated manifest read")
             .expect("manifest");
-        manifest.root = moved.clone();
+        manifest.workspace.root = moved.clone();
         manifest.path = moved.join(".zvec-grep");
         assert_eq!(relocated, manifest);
     }
@@ -583,7 +667,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
             .expect("custom manifest permissions");
 
-        manifest.generation = Some(8);
+        manifest.record_revision(8, 30);
         write_workspace_manifest(&home, &manifest).expect("replace manifest");
 
         assert_eq!(

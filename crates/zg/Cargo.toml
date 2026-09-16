@@ -17,6 +17,10 @@ zg-cli = { path = "../zg-cli" }
 zg-daemon = { path = "../zg-daemon" }
 zg-daemon-protocol = { path = "../zg-daemon-protocol" }
 zg-engine = { path = "../zg-engine" }
+zvec-rust.workspace = true
+
+[build-dependencies]
+zvec-rust-build.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

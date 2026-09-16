@@ -53,7 +53,6 @@ pub mod result {
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub struct WorkspaceIndexInfo {
-        pub id: String,
         pub name: String,
         pub path: PathBuf,
         /// The single base directory for every source file in this workspace.
@@ -89,5 +88,57 @@ pub mod result {
         pub files_modified: usize,
         pub files_deleted: usize,
         pub files_unchanged: usize,
+    }
+}
+
+impl From<crate::domain::IndexPolicy> for result::WorkspaceIndexPolicy {
+    fn from(value: crate::domain::IndexPolicy) -> Self {
+        match value {
+            crate::domain::IndexPolicy::Enabled => Self::Enabled,
+            crate::domain::IndexPolicy::Disabled => Self::Disabled,
+        }
+    }
+}
+
+impl result::WorkspaceIndexInfo {
+    pub(crate) fn from_workspace(
+        workspace: &crate::domain::Workspace,
+        home: &std::path::Path,
+        index_version: Option<u32>,
+    ) -> Self {
+        Self {
+            name: workspace.name.to_string(),
+            path: home.to_path_buf(),
+            root: workspace.root.clone(),
+            discovery: workspace.file_selection.clone(),
+            policy: workspace.index_policy.into(),
+            embedding: workspace
+                .index
+                .as_ref()
+                .map(|index| (&index.embedding).into()),
+            index_version,
+            generation: workspace
+                .index
+                .as_ref()
+                .and_then(|index| (index.revision != 0).then_some(index.revision)),
+            created_epoch_ms: workspace.created_epoch_ms,
+            updated_epoch_ms: workspace.updated_epoch_ms,
+        }
+    }
+}
+
+impl From<&crate::domain::EmbeddingSchema> for result::WorkspaceIndexEmbedding {
+    fn from(value: &crate::domain::EmbeddingSchema) -> Self {
+        Self {
+            provider: value.provider.clone(),
+            model: value.model.clone(),
+            dimension: value.dimension,
+            metric: match value.metric {
+                crate::domain::EmbeddingMetric::Cosine => "cosine",
+                crate::domain::EmbeddingMetric::DotProduct => "dot",
+                crate::domain::EmbeddingMetric::Euclidean => "euclidean",
+            }
+            .to_owned(),
+        }
     }
 }

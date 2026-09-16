@@ -12,11 +12,12 @@ use crate::{
     domain::{
         ByteRange, Content, Entity, EntityContent, EntityFragment, EntityId, EntityMetadata,
         FileFormat, FileId, FileIndexStatus, FileRecord, FileSnapshot, FragmentId, ImageContent,
-        SourceRange, SymbolType, TableCell, TableCellRole, TableContent, TextRange, WindowFragment,
+        SourcePath, SourceRange, SymbolType, TableCell, TableCellRole, TableContent, TextRange,
+        WindowFragment,
     },
 };
 
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 // Nested tables add several JSON containers; keep records below serde's recursion limit.
 const MAX_TABLE_DEPTH: usize = 16;
 
@@ -80,7 +81,7 @@ struct Record<T> {
 
 #[derive(Serialize, Deserialize)]
 struct FilePayload<'a> {
-    id: Cow<'a, str>,
+    id: u64,
     relative_path: PathRecord,
     formats: Vec<u16>,
     snapshot: SnapshotRecord<'a>,
@@ -147,7 +148,7 @@ impl<'a> FilePayload<'a> {
     fn from_file(file: &'a FileRecord) -> EngineResult<Self> {
         Ok(Self {
             index_status: (&file.index_status).into(),
-            id: file.id.as_str().into(),
+            id: file.id.get(),
             relative_path: PathRecord::from_path(&file.relative_path)?,
             formats: file.formats.iter().map(|format| *format as u16).collect(),
             snapshot: SnapshotRecord {
@@ -161,8 +162,8 @@ impl<'a> FilePayload<'a> {
     fn into_file(self) -> EngineResult<FileRecord> {
         let file = FileRecord {
             index_status: self.index_status.into(),
-            id: FileId::new(self.id.into_owned())?,
-            relative_path: self.relative_path.into_path()?,
+            id: FileId::new(self.id),
+            relative_path: SourcePath::new(self.relative_path.into_path()?)?,
             formats: self
                 .formats
                 .into_iter()
@@ -181,14 +182,14 @@ impl<'a> FilePayload<'a> {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "encoding", content = "value", rename_all = "snake_case")]
-enum PathRecord {
+pub(crate) enum PathRecord {
     Utf8(String),
     UnixBytes(Vec<u8>),
     WindowsWide(Vec<u16>),
 }
 
 impl PathRecord {
-    fn from_path(path: &Path) -> EngineResult<Self> {
+    pub(crate) fn from_path(path: &Path) -> EngineResult<Self> {
         validate_path(path)?;
         if let Some(value) = path.to_str() {
             return Ok(Self::Utf8(value.to_owned()));
@@ -209,7 +210,7 @@ impl PathRecord {
         ))
     }
 
-    fn into_path(self) -> EngineResult<PathBuf> {
+    pub(crate) fn into_path(self) -> EngineResult<PathBuf> {
         match self {
             Self::Utf8(value) => Ok(PathBuf::from(value)),
             Self::UnixBytes(bytes) => {
@@ -262,7 +263,7 @@ enum FragmentRecord<'a> {
 #[derive(Serialize, Deserialize)]
 struct EntityRecord<'a> {
     id: Cow<'a, str>,
-    file_id: Cow<'a, str>,
+    file_id: u64,
     range: RangeRecord,
     content: EntityContentRecord<'a>,
     metadata: Option<MetadataRecord<'a>>,
@@ -279,7 +280,7 @@ enum EntityContentRecord<'a> {
 struct WindowRecord<'a> {
     id: Cow<'a, str>,
     entity_id: Cow<'a, str>,
-    file_id: Cow<'a, str>,
+    file_id: u64,
     range: RangeRecord,
     contents: Vec<ContentRecord<'a>>,
     metadata: Option<MetadataRecord<'a>>,
@@ -293,7 +294,7 @@ impl<'a> From<&'a EntityFragment> for FragmentRecord<'a> {
             EntityFragment::Window(window) => Self::Window(WindowRecord {
                 id: window.id.as_str().into(),
                 entity_id: window.entity_id.as_str().into(),
-                file_id: window.file_id.as_str().into(),
+                file_id: window.file_id.get(),
                 range: window.range.into(),
                 contents: encode_contents(&window.contents),
                 metadata: window.metadata.as_ref().map(Into::into),
@@ -310,7 +311,7 @@ impl FragmentRecord<'_> {
             Self::Window(window) => EntityFragment::Window(WindowFragment {
                 id: FragmentId::new(window.id.into_owned())?,
                 entity_id: EntityId::new(window.entity_id.into_owned())?,
-                file_id: FileId::new(window.file_id.into_owned())?,
+                file_id: FileId::new(window.file_id),
                 range: window.range.try_into()?,
                 contents: decode_contents(window.contents)?,
                 metadata: window.metadata.map(Into::into),
@@ -323,7 +324,7 @@ impl<'a> From<&'a Entity> for EntityRecord<'a> {
     fn from(entity: &'a Entity) -> Self {
         Self {
             id: entity.id.as_str().into(),
-            file_id: entity.file_id.as_str().into(),
+            file_id: entity.file_id.get(),
             range: entity.range.into(),
             content: match &entity.content {
                 EntityContent::Source(contents) => {
@@ -342,7 +343,7 @@ impl EntityRecord<'_> {
     fn into_entity(self) -> EngineResult<Entity> {
         Ok(Entity {
             id: EntityId::new(self.id.into_owned())?,
-            file_id: FileId::new(self.file_id.into_owned())?,
+            file_id: FileId::new(self.file_id),
             range: self.range.try_into()?,
             content: match self.content {
                 EntityContentRecord::Source(contents) => {
@@ -780,8 +781,8 @@ mod tests {
     fn file() -> FileRecord {
         FileRecord {
             index_status: FileIndexStatus::NotIndexed,
-            id: FileId::new("source").expect("file ID"),
-            relative_path: PathBuf::from("nested/tsconfig.json"),
+            id: FileId::new(1),
+            relative_path: SourcePath::new("nested/tsconfig.json").expect("source path"),
             formats: vec![FileFormat::Json, FileFormat::TypeScript],
             snapshot: FileSnapshot {
                 size_bytes: 123,
@@ -863,11 +864,11 @@ mod tests {
         let mut source = file();
         let encoded = encode_file(&source).expect("encode source");
         let record: Value = serde_json::from_str(&encoded).expect("JSON record");
-        assert_eq!(record["version"], 5);
+        assert_eq!(record["version"], VERSION);
         assert_eq!(
             record["value"],
             json!({
-                "id": "source",
+                "id": 1,
                 "index_status": {"kind": "not_indexed"},
                 "relative_path": {"encoding": "utf8", "value": "nested/tsconfig.json"},
                 "formats": [FileFormat::Json as u16, FileFormat::TypeScript as u16],
@@ -883,16 +884,55 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
-            source.relative_path = std::ffi::OsString::from_vec(b"file-\xff.rs".to_vec()).into();
+            source.relative_path =
+                SourcePath::new(std::ffi::OsString::from_vec(b"file-\xff.rs".to_vec()))
+                    .expect("source path");
         }
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStringExt;
-            source.relative_path =
-                std::ffi::OsString::from_wide(&[0x0066, 0xd800, 0x002e, 0x0072, 0x0073]).into();
+            source.relative_path = SourcePath::new(std::ffi::OsString::from_wide(&[
+                0x0066, 0xd800, 0x002e, 0x0072, 0x0073,
+            ]))
+            .expect("source path");
         }
         let encoded = encode_file(&source).expect("encode native path");
         assert_eq!(decode_file(&encoded).expect("decode native path"), source);
+    }
+
+    #[test]
+    fn source_identities_round_trip_the_full_u64_range() {
+        for id in [0, u64::MAX] {
+            let mut source = file();
+            source.id = FileId::new(id);
+            assert_eq!(
+                decode_file(&encode_file(&source).expect("encode source")).expect("decode source"),
+                source
+            );
+            let mut fragment = fragment();
+            if let EntityFragment::Standalone(entity) = &mut fragment {
+                entity.file_id = source.id;
+            }
+            assert_eq!(
+                decode_fragment(&encode_fragment(&fragment).expect("encode fragment"))
+                    .expect("decode fragment"),
+                fragment
+            );
+        }
+    }
+
+    #[test]
+    fn stored_file_identities_reject_values_outside_u64() {
+        let mut record: Value =
+            serde_json::from_str(&encode_file(&file()).expect("source")).expect("JSON");
+        let mut fragment: Value =
+            serde_json::from_str(&encode_fragment(&fragment()).expect("fragment")).expect("JSON");
+        for invalid in [json!(-1), json!(1e20)] {
+            record["value"]["id"] = invalid.clone();
+            assert!(decode_file(&record.to_string()).is_err());
+            fragment["value"]["value"]["file_id"] = invalid;
+            assert_corrupt_fragment(&fragment);
+        }
     }
 
     #[test]
@@ -921,7 +961,6 @@ mod tests {
         let mut record: Value =
             serde_json::from_str(&encode_file(&file).expect("valid file")).expect("file JSON");
         for invalid in [
-            json!({"kind": "failed", "error": " "}),
             json!({"kind": "indexed", "indexed_epoch_ms": 1, "entity_count": 0, "error": "failure"}),
             json!({"kind": "indexed", "indexed_epoch_ms": null, "entity_count": 0}),
             json!({"kind": "indexed", "indexed_epoch_ms": 1, "entity_count": -1}),
@@ -957,7 +996,7 @@ mod tests {
             encoded["value"]["value"]["content"]["value"][1]["value"]["data"],
             "AAH/"
         );
-        assert_eq!(encoded["version"], 5);
+        assert_eq!(encoded["version"], VERSION);
         let ranges = [
             (SourceRange::File, json!({"kind": "file"})),
             (
@@ -1036,8 +1075,30 @@ mod tests {
         for fragment in [&representative, &window] {
             round_trip(fragment);
         }
-        crate::domain::validate_fragments(&file().id, [&representative, &window])
+        crate::domain::validate_fragments(file().id, [&representative, &window])
             .expect("valid group");
+    }
+
+    #[test]
+    fn rejects_invalid_source_paths_during_decoding() {
+        let original: Value =
+            serde_json::from_str(&encode_file(&file()).expect("encode file")).expect("file JSON");
+        for path in [
+            "../escape",
+            "src//file.rs",
+            "src/./file.rs",
+            "",
+            "bad\0path",
+        ] {
+            let mut record = original.clone();
+            record["value"]["relative_path"] = json!({"encoding": "utf8", "value": path});
+            assert_eq!(
+                decode_file(&record.to_string())
+                    .expect_err("invalid source path")
+                    .code(),
+                EngineError::STORAGE_FAILURE
+            );
+        }
     }
 
     #[test]
@@ -1051,14 +1112,6 @@ mod tests {
             (
                 "formats",
                 json!([FileFormat::Rust as u16, FileFormat::Rust as u16]),
-            ),
-            (
-                "relative_path",
-                json!({"encoding":"utf8", "value":"../escape"}),
-            ),
-            (
-                "relative_path",
-                json!({"encoding":"utf8", "value":"bad\u{0}path"}),
             ),
         ] {
             let mut record = file_record.clone();
@@ -1074,7 +1127,7 @@ mod tests {
             serde_json::from_str(&encode_fragment(&fragment()).expect("encode fragment"))
                 .expect("fragment JSON");
         for (kind, record) in [("source file", file_record), ("fragment", original.clone())] {
-            for version in [1, 2, 3, 4] {
+            for version in [1, 2, 3, 4, 5] {
                 let mut record = record.clone();
                 record["version"] = json!(version);
                 if kind == "fragment" {

@@ -4,7 +4,19 @@
 
 One `ZvecGrep` instance can serve multiple workspaces and reuse embedding models across requests. Each workspace stores its manifest and persistent Zvec index under `.zvec-grep`.
 
-Each workspace has one root directory. File records store paths relative to that root; scanning a subdirectory does not change the path base. File IDs depend on the workspace identity and relative path, so moving a workspace together with its `.zvec-grep` directory preserves file identity. Rebuilding also preserves the workspace identity. Unicode file identities use UTF-8 path components separated by `/`; non-Unicode paths use explicit lossless platform encodings. This does not promise that native index files or arbitrary filenames can be moved between operating systems. Reads resolve absolute paths against the workspace's current location.
+Each workspace has one root directory. File records store paths relative to that root; scanning a subdirectory does not change the path base. Workspace-local zvec collections under `.zvec-grep/catalog` allocate numeric file and directory IDs. `file_identities` and `directories` retain path identities; `metadata` stores their allocation counters. A durable batch journal makes allocation recoverable before IDs are returned. Legacy `identity.json` catalogs are imported once and removed after publication. These IDs are independent of the workspace name and absolute root. Moving a workspace together with `.zvec-grep`, renaming the workspace, and rebuilding its index preserve those IDs. Unicode query paths use UTF-8 components separated by `/`; identity keys and stored source paths retain a lossless native encoding, including non-Unicode names. This does not promise that native index files or arbitrary filenames can be moved between operating systems. Reads resolve absolute paths against the workspace's current location.
+
+## Workspace names
+
+A workspace's name is its sole identity in the per-user registry. Names are globally unique within that registry and case-sensitive: `backend` and `Backend` are different names. New workspaces default to the root directory's basename. If that name is already registered, choose another with `IndexOptions::name`, `zg index --name NAME`, or the MCP index tool's `name` field.
+
+Setting a different name on an existing workspace explicitly renames it. Renaming preserves file IDs and active storage; it does not require a rebuild. The registry is authoritative, so read-only `info` and `context` return its name even if a previous operation stopped before updating the manifest. Reads do not create registry files or register workspaces.
+
+The registry lives at `~/.zvec-grep/workspaces.json`. `ZVEC_GREP_WORKSPACE_REGISTRY` selects another registry using an absolute file path. An index operation reserves the name before building. Failed or interrupted first builds retain that reservation; `drop_index` or `zg index --drop` removes it along with workspace index state, allowing the name to be reused.
+
+After moving a workspace, its next index operation updates the registered root when the original workspace no longer exists. Copying a live workspace requires a different name for the copy. File identity is scoped to each workspace, so a copy may retain its local file catalog while using its own workspace name.
+
+See [workspace ownership and persistence](src/workspace/README.md) for manifest migration and recovery details.
 
 ## Usage
 
@@ -35,33 +47,33 @@ async fn search_workspace() -> EngineResult<()> {
 }
 ```
 
-The default embedding model runs locally and downloads its assets on first use. `IndexOptions::embedding` selects another model, device, endpoint, or cache directory. Index updates reuse unchanged files and remove deleted files. Existing indexes remain available after the engine closes.
+The default embedding model runs locally and downloads its assets on first use. `IndexOptions::embedding` selects a model, device, endpoint, or cache directory. Index updates reuse unchanged files and remove deleted files. Existing indexes remain available after the engine closes.
 
 ## Public API
 
-- `ZvecGrep::index` builds or updates a workspace index.
+- `ZvecGrep::index` builds or updates a workspace index and applies an explicitly requested workspace name.
 - `ZvecGrep::context` retrieves content through indexed search or embedded grep. Indexed search can refresh changed files before querying.
 - `ZvecGrep::info` reports workspace configuration and optional file status.
-- `ZvecGrep::drop_index` removes the index and manifest while preserving source files.
+- `ZvecGrep::drop_index` removes the index, manifest, file identity catalog, and workspace name reservation while preserving source files.
 - `ZvecGrep::close` releases model resources and rejects subsequent operations.
 
-Request and result types live in `api::{index, context, info}`. `EngineError::code()` supports programmatic error handling; `EngineError::report()` includes diagnostic context and source locations for logging. Other modules are private implementation details.
+Request and result types live in `api::{index, context, info}`. Shared types have one owner and are re-exported through their existing API paths: `DiscoveryOptions` names the domain's `FileSelection`, `SymbolType` belongs to domain entities, `Device` belongs to models, and search routes and evidence belong to the search pipeline. The application boundary builds API result views from internal state; workspace persistence and model runtimes do not depend on API result types. `EngineError::code()` supports programmatic error handling; `EngineError::report()` includes diagnostic context and source locations for logging. Other modules are private implementation details.
 
 ## Storage
 
 The index keeps files, entities, fragments, and vectors in separate collections. Zvec's WAL handles native document recovery. Before each mutation, the engine persists a pending record containing only source metadata or a deletion intent. It flushes all collections and clears the records after 64 operations, an estimated 16 MiB of source and vector data, finalization, or a healthy writer close.
 
-The shared `FileRecord` contains identity, relative path, detected formats, a `FileSnapshot`, and a `FileIndexStatus`. Snapshots contain source size in bytes, optional modification time in unsigned Unix epoch milliseconds, and an optional content hash. Successfully indexed records require the hash of the exact bytes used during extraction. Modification time is a fast comparison hint; when it is unavailable, updates compare content hashes. Source reads check one file handle before and after reading, including its identity against the current path, to detect observable concurrent changes.
+The shared `FileRecord` contains identity, relative path, detected formats, a `FileSnapshot`, and a `FileIndexStatus`. Each physical index generation stores its own file records. `DirectoryRecord` contains only an ID and relative path and lives in the workspace catalog. Historical directory identities do not imply that the directory currently has indexed files. The generation file table stores derived filename and ancestor-directory indexes and a lossless path projection; path-only filtering enumerates that projection without decoding every file snapshot. Snapshots contain source size in bytes, optional modification time in unsigned Unix epoch milliseconds, and an optional content hash. Successfully indexed records require the hash of the exact bytes used during extraction. Modification time is a fast comparison hint; when it is unavailable, updates compare content hashes. Source reads check one file handle before and after reading, including its identity against the current path, to detect observable concurrent changes.
 
 File status is `NotIndexed`, `Indexed { indexed_epoch_ms, entity_count }`, or `Failed { error }`. A successful extraction may yield zero entities. Failed files retain no searchable artifacts; interrupted writes recover as `NotIndexed`. Entity counts are fixed-width `u64`. Token counts and embedding truncation counts are not persisted. Embedding backends may still truncate inputs that exceed their limits after fragment splitting. Workspace status reports `indexed_size_bytes`, the sum of successfully indexed source snapshots, separately from index storage size.
 
 Reopening an interrupted batch removes its partial index data and marks affected files for reindexing before serving reads. The next indexing pass rereads those files and recomputes their embeddings, even if the source has not changed; completed checkpoints remain available. The versioned storage codec preserves numeric format IDs and encodes image bytes as base64.
 
-Index version 5 uses the unified file record and requires a rebuild of earlier indexes (`IndexOptions::rebuild` or `zg index --rebuild`). Old single-root manifests can still supply identity, embedding, and discovery settings for the rebuild.
+Index version 5 uses the unified file record and requires a rebuild of earlier indexes (`IndexOptions::rebuild` or `zg index --rebuild`). Old single-root manifests can still supply names, embedding, and discovery settings for the rebuild. Manifest version 4 retains the flat JSON representation, ignores a legacy workspace UUID `id`, and writes only the workspace name. Manifest migration does not change physical index version 5.
 
 Initial builds and rebuilds run in a generation directory under `.zvec-grep/generations`. A durable `build.json` identifies the target version and processing settings. Repeating `index` resumes a compatible interrupted build, reuses its completed checkpoints, and reconciles the full configured workspace. Failed or cancelled rebuilds leave the previous active index intact. After successful finalization and close, one atomic manifest update selects the new generation, then old storage is cleaned up. Interrupted publication and cleanup are recovered on the next index operation. There is no separate extraction version or per-file index version. Queries use the active generation; automatic refresh and watcher updates do not resume an unfinished rebuild.
 
-The full-text dictionary is bundled as compressed data, checked for integrity, and expanded locally without a download. It lives in the shared `~/.zvec-grep/cache/jieba-v1` cache so moving a workspace on the same machine preserves full-text search. `ZVEC_GREP_DICTIONARY_CACHE` can override the cache with an absolute UTF-8 path; changing that path requires rebuilding existing indexes. Files without a supported extractor are skipped; format recognition alone does not imply parsing support.
+Full-text search uses the Jieba dictionaries shipped and discovered by zvec-rust 0.7.1. Native distributions must include the SDK’s `data/jieba_dict` directory alongside its shared library. Storage schemas before version 8 require an index rebuild to remove their persisted dictionary paths. Files without a supported extractor are skipped; format recognition alone does not imply parsing support.
 
 ## Native runtime
 
@@ -75,11 +87,11 @@ Apply the target platform's signing requirements to distributed binaries and lib
 
 ## Modules
 
-- `domain` defines file records and states, formats, ranges, atomic content, and entities.
-- `extraction` turns supported text, code, Markdown, and image sources into entities and embedding inputs. Recognizing a format does not imply that a decoder or model supports it.
+- `domain` defines workspace names and logical index metadata, file selection, file records and states, formats, ranges, atomic content, and entities.
+- `extraction` turns supported text, code, Markdown, and image sources into content fragments and metadata. Callers attach file and entity identities. Recognizing a format does not imply that a decoder or model supports it.
 - `models` owns embedding backends and reusable model runtimes.
 - `storage` persists files, entities, fragments, and vectors with Zvec.
-- `workspace` manages manifests, index locations, and workspace locks.
+- `workspace` manages the per-user name registry, manifest encoding, physical index generations, index locations, and workspace locks.
 - `pipelines::indexing` coordinates discovery, extraction, embedding, and incremental updates.
 - `pipelines::search` plans indexed queries, combines results, and assembles context.
 - `lexical` provides embedded grep retrieval.

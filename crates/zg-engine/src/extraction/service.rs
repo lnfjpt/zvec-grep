@@ -1,27 +1,24 @@
 //! Extraction routing and shared implementation helpers.
 
 #[cfg(test)]
-use std::path::PathBuf;
-
-#[cfg(test)]
 use super::TextSource;
 use super::{
-    ChunkOptions, EntityFragment, FileRecord, IndexingExtractionFragment, Source, SourceKind, code,
-    image, markdown, text,
+    ChunkOptions, ExtractedFragment, IndexingExtractionFragment, Source, SourceKind, code, image,
+    markdown, text,
 };
 use crate::{
     EngineError,
     domain::{
-        Content, EntityContent, EntityId, EntityMetadata, FileCategory, FileFormat, SourceRange,
-        SymbolType, TableCellRole,
+        Content, EntityContent, EntityMetadata, FileCategory, FileFormat, SourceRange, SymbolType,
+        TableCellRole,
     },
-    utils::{collapse_whitespace, sha256_hex, take_utf16, utf16_len},
+    utils::{collapse_whitespace, take_utf16, utf16_len},
 };
 
 pub(super) fn extract<'source>(
     source: impl Into<Source<'source>>,
     options: ChunkOptions,
-) -> Result<Vec<EntityFragment>, EngineError> {
+) -> Result<Vec<ExtractedFragment>, EngineError> {
     Ok(extract_for_indexing(source, options)?
         .into_iter()
         .map(|item| item.fragment)
@@ -38,13 +35,13 @@ pub(super) fn extract_for_indexing<'source>(
         Source::Image(_) => None,
     };
     let fragments = match source {
-        Source::Text(source) if is_code_source(&source.file) => {
+        Source::Text(source) if is_code_source(&source.formats) => {
             code::extract_for_indexing(source, options)?
         }
         source => {
             let fragments = match source {
-                Source::Image(source) => image::extract(source),
-                Source::Text(source) if source.file.formats.contains(&FileFormat::Markdown) => {
+                Source::Image(source) => Ok(image::extract(source)),
+                Source::Text(source) if source.formats.contains(&FileFormat::Markdown) => {
                     markdown::extract(source, options)
                 }
                 Source::Text(source) => text::extract(source, options),
@@ -68,17 +65,16 @@ pub(super) fn extract_for_indexing<'source>(
     Ok(fragments)
 }
 
-pub(super) fn source_kind(file: &FileRecord) -> Option<SourceKind> {
-    if let Some(format) = file
-        .formats
+pub(super) fn source_kind(formats: &[FileFormat]) -> Option<SourceKind> {
+    if let Some(format) = formats
         .iter()
         .find(|format| format.categories().contains(&FileCategory::Image))
     {
         return Some(SourceKind::Image(*format));
     }
-    if file.has_category(FileCategory::Code)
-        || file.has_category(FileCategory::Data)
-        || file.formats.iter().any(|format| {
+    if has_category(formats, FileCategory::Code)
+        || has_category(formats, FileCategory::Data)
+        || formats.iter().any(|format| {
             matches!(
                 format,
                 FileFormat::AsciiDoc
@@ -100,12 +96,18 @@ pub(super) fn source_kind(file: &FileRecord) -> Option<SourceKind> {
     }
 }
 
-pub(super) fn is_code_source(file: &FileRecord) -> bool {
-    !file.has_category(FileCategory::Data) && file.has_category(FileCategory::Code)
+pub(super) fn is_code_source(formats: &[FileFormat]) -> bool {
+    !has_category(formats, FileCategory::Data) && has_category(formats, FileCategory::Code)
+}
+
+fn has_category(formats: &[FileFormat], category: FileCategory) -> bool {
+    formats
+        .iter()
+        .any(|format| format.categories().contains(&category))
 }
 
 pub(super) fn vector_content_for_fragment(
-    fragment: &EntityFragment,
+    fragment: &ExtractedFragment,
     embedding_content: Option<&[Content]>,
     max_chars: Option<usize>,
 ) -> Vec<Content> {
@@ -160,14 +162,19 @@ fn project_content(content: Content, output: &mut Vec<Content>) {
     }
 }
 
-pub(super) fn validate_source_file(file: &FileRecord) -> Result<(), EngineError> {
-    file.validate()
-}
-
-pub(super) fn make_entity_id(file_id: &crate::domain::FileId, index: usize) -> EntityId {
-    let file_id = file_id.as_str();
-    let id = sha256_hex(format!("{file_id}\0{index}").as_bytes());
-    EntityId::new(id).expect("SHA-256 digest is a non-empty ID")
+pub(super) fn validate_formats(formats: &[FileFormat]) -> Result<(), EngineError> {
+    if formats.is_empty()
+        || (formats.len() > 1 && formats.contains(&FileFormat::Unknown))
+        || formats
+            .iter()
+            .enumerate()
+            .any(|(index, format)| formats[..index].contains(format))
+    {
+        return Err(EngineError::invalid_argument(
+            "source formats must be non-empty and unique; unknown must stand alone",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn chunk_options_for_metadata(
@@ -256,30 +263,16 @@ pub(super) fn symbol_type_name(symbol_type: SymbolType) -> &'static str {
 #[cfg(test)]
 pub(super) fn test_source(format: FileFormat, relative_path: &str, text: &str) -> TextSource {
     TextSource {
-        file: test_file(format, relative_path, text.len() as u64),
+        relative_path: crate::domain::SourcePath::new(relative_path).expect("source path"),
+        formats: vec![format],
         text: text.to_owned(),
     }
 }
 
 #[cfg(test)]
-pub(super) fn test_file(format: FileFormat, relative_path: &str, size_bytes: u64) -> FileRecord {
-    FileRecord {
-        id: crate::domain::FileId::new(format!("file-{}", format.as_str())).expect("file id"),
-        relative_path: PathBuf::from(relative_path),
-        formats: vec![format],
-        index_status: crate::domain::FileIndexStatus::NotIndexed,
-        snapshot: crate::domain::FileSnapshot {
-            size_bytes,
-            modified_epoch_ms: Some(1),
-            content_hash: None,
-        },
-    }
-}
-
-#[cfg(test)]
-pub(super) fn test_content(fragment: &EntityFragment) -> Content {
+pub(super) fn test_content(fragment: &ExtractedFragment) -> Content {
     match fragment {
-        EntityFragment::Standalone(entity) | EntityFragment::Representative(entity) => {
+        ExtractedFragment::Standalone(entity) | ExtractedFragment::Representative(entity) => {
             match &entity.content {
                 EntityContent::Source(contents) => {
                     assert_eq!(contents.len(), 1);
@@ -288,7 +281,7 @@ pub(super) fn test_content(fragment: &EntityFragment) -> Content {
                 EntityContent::Outline(text) => Content::Text(text.clone()),
             }
         }
-        EntityFragment::Window(window) => {
+        ExtractedFragment::Window(window) => {
             assert_eq!(window.contents.len(), 1);
             window.contents[0].clone()
         }
@@ -297,8 +290,9 @@ pub(super) fn test_content(fragment: &EntityFragment) -> Content {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ExtractedEntity;
     use super::*;
-    use crate::domain::{Entity, SourceRange, TableCell, TableCellRole, TableContent};
+    use crate::domain::{SourceRange, TableCell, TableCellRole, TableContent};
 
     #[test]
     fn routes_supported_sources_without_confusing_formats_and_reader_capabilities() {
@@ -313,15 +307,15 @@ mod tests {
             (FileFormat::Unknown, None),
             (FileFormat::Binary, None),
         ] {
-            assert_eq!(source_kind(&test_file(format, "fixture", 1)), expected);
+            assert_eq!(source_kind(&[format]), expected);
         }
         let mut source = test_source(
             FileFormat::Json,
             "tsconfig.json",
             "{\"compilerOptions\": {}}",
         );
-        source.file.formats.push(FileFormat::TypeScript);
-        assert!(!is_code_source(&source.file));
+        source.formats.push(FileFormat::TypeScript);
+        assert!(!is_code_source(&source.formats));
         let fragments = extract(&source, ChunkOptions::default()).expect("data extraction");
         assert_eq!(fragments.len(), 1);
         assert_eq!(test_content(&fragments[0]), Content::Text(source.text));
@@ -333,10 +327,8 @@ mod tests {
         let image = Content::Image(
             crate::domain::ImageContent::new(vec![1], FileFormat::Png).expect("image"),
         );
-        let source = test_file(FileFormat::Markdown, "fixture.md", 1);
-        let fragment = EntityFragment::Standalone(Entity {
-            id: make_entity_id(&source.id, 0),
-            file_id: source.id,
+        let fragment = ExtractedFragment::Standalone(ExtractedEntity {
+            index: 0,
             range: SourceRange::File,
             content: EntityContent::Source(vec![
                 Content::Text("before".to_owned()),
@@ -366,5 +358,18 @@ mod tests {
                 Content::Text("after".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn rejects_invalid_format_sets_without_requiring_file_records() {
+        let mut source = test_source(FileFormat::Text, "fixture.txt", "source text");
+        for formats in [
+            vec![],
+            vec![FileFormat::Rust, FileFormat::Rust],
+            vec![FileFormat::Markdown, FileFormat::Unknown],
+        ] {
+            source.formats = formats;
+            assert!(extract(&source, ChunkOptions::default()).is_err());
+        }
     }
 }

@@ -13,9 +13,9 @@ use crate::{
         context::{
             ContextOptions, ContextResult,
             result::{
-                ContentRange, ContextCoverage, ContextDiagnostics, ContextItem, ContextItemKind,
-                ContextItemStatus, ContextSource, EmptyReason, MatchedBy, RgDiagnostics,
-                TimingEntry,
+                ContentRange, ContextContainer, ContextCoverage, ContextDiagnostics, ContextItem,
+                ContextItemKind, ContextItemStatus, ContextSource, EmptyReason, MatchedBy,
+                RgDiagnostics, TimingEntry,
             },
         },
         index::{IndexOptions, IndexResult},
@@ -23,7 +23,9 @@ use crate::{
     },
     lexical::{
         LexicalSearchService,
-        structure::enrich_lexical_items_with_structure,
+        structure::{
+            EnrichedLexicalMatch, StructureEnrichmentResult, enrich_lexical_matches_with_structure,
+        },
         types::{LexicalCoverage, LexicalOptions, LexicalSearchReply, LexicalSearchRequest},
     },
     models::ModelRuntimeManager,
@@ -104,17 +106,18 @@ impl EngineService {
                 modified_before_epoch_ms: options.modified_before_epoch_ms,
             },
         };
-        let reply = self.lexical.search(&root, &request).await?;
-        let mut result = context_from_lexical(normalized.display_query, reply);
+        let mut reply = self.lexical.search(&root, &request).await?;
         let structure_started = Instant::now();
-        let enrichment =
-            enrich_lexical_items_with_structure(&root, result.items, structure_max_file_size_bytes);
-        result.items = enrichment.items;
-        result.diagnostics.structure = Some(enrichment.diagnostics);
+        let enrichment = enrich_lexical_matches_with_structure(
+            &root,
+            std::mem::take(&mut reply.matches),
+            structure_max_file_size_bytes,
+        );
+        let structure_duration = structure_started.elapsed();
+        let mut result = context_from_lexical(normalized.display_query, reply, enrichment);
         result.diagnostics.timings.push(TimingEntry {
             name: "structure_enrichment".to_owned(),
-            duration_micros: structure_started
-                .elapsed()
+            duration_micros: structure_duration
                 .as_micros()
                 .try_into()
                 .unwrap_or(u64::MAX),
@@ -179,8 +182,12 @@ impl EngineService {
     }
 }
 
-fn context_from_lexical(query: String, reply: LexicalSearchReply) -> ContextResult {
-    let hits_returned = reply.matches.len();
+fn context_from_lexical(
+    query: String,
+    reply: LexicalSearchReply,
+    enrichment: StructureEnrichmentResult,
+) -> ContextResult {
+    let hits_returned = enrichment.items.len();
     let empty_reason = (hits_returned == 0).then_some({
         if !reply.diagnostics.missing_paths.is_empty()
             && reply.diagnostics.searched_paths.is_empty()
@@ -201,30 +208,42 @@ fn context_from_lexical(query: String, reply: LexicalSearchReply) -> ContextResu
             LexicalCoverage::Truncated => ContextCoverage::RgTruncated,
         },
         workspace_index: None,
-        items: reply
-            .matches
+        items: enrichment
+            .items
             .into_iter()
-            .map(|item| ContextItem {
-                kind: ContextItemKind::LexicalMatch,
-                rank: item.rank,
-                absolute_path: item.absolute_path,
-                relative_path: item.relative_path,
-                range: lexical_range(item.range),
-                excerpt_range: item.excerpt_range.map(lexical_range),
-                content: item.content,
-                content_role: Some(crate::api::context::result::ContextContentRole::Source),
-                outline: None,
-                status: ContextItemStatus::Fresh,
-                score: None,
-                matched_by: MatchedBy::Lexical,
-                metadata: None,
-                entity_id: None,
-                container: None,
-                trace: None,
-                query_groups: Vec::new(),
-                selection_reason: None,
-                coverage_group: None,
-            })
+            .map(
+                |EnrichedLexicalMatch {
+                     matched: item,
+                     container,
+                 }| ContextItem {
+                    kind: ContextItemKind::LexicalMatch,
+                    rank: item.rank,
+                    absolute_path: item.absolute_path,
+                    relative_path: item.relative_path,
+                    range: lexical_range(item.range),
+                    excerpt_range: item.excerpt_range.map(lexical_range),
+                    content: item.content,
+                    content_role: Some(crate::api::context::result::ContextContentRole::Source),
+                    outline: None,
+                    status: ContextItemStatus::Fresh,
+                    score: None,
+                    matched_by: MatchedBy::Lexical,
+                    metadata: container
+                        .as_ref()
+                        .and_then(|value| value.metadata.as_ref())
+                        .map(Into::into),
+                    entity_id: None,
+                    container: container.map(|value| ContextContainer {
+                        entity_id: value.entity_id.as_str().to_owned(),
+                        range: value.range.into(),
+                        metadata: value.metadata.map(Into::into),
+                    }),
+                    trace: None,
+                    query_groups: Vec::new(),
+                    selection_reason: None,
+                    coverage_group: None,
+                },
+            )
             .collect(),
         group_results: Vec::new(),
         diagnostics: ContextDiagnostics {
@@ -240,7 +259,7 @@ fn context_from_lexical(query: String, reply: LexicalSearchReply) -> ContextResu
                 limit: reply.diagnostics.limit,
                 truncated: reply.diagnostics.truncated,
             }),
-            structure: None,
+            structure: Some(enrichment.diagnostics),
             timings: Vec::new(),
         },
     }

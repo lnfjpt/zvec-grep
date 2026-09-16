@@ -21,6 +21,7 @@ import {
   run,
   selectPlatform,
   sha256File,
+  stageZvecRuntime,
   workspaceDir,
 } from "./npm-package-core.mjs";
 
@@ -152,6 +153,7 @@ async function packPlatform(options) {
     if (entry.os !== "win32") {
       await chmod(packagedBinary, 0o755);
     }
+    await stageZvecRuntime(options.libDir ?? dirname(binary), binDir, entry.os);
     if (options.libDir) {
       await cp(options.libDir, join(temporary, "lib"), {
         recursive: true,

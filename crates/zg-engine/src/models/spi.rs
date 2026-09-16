@@ -2,7 +2,8 @@
 
 use std::{borrow::Cow, collections::HashSet, fmt, path::PathBuf, sync::Arc};
 
-use crate::{api::index::options::Device, domain::Content};
+use crate::domain::Content;
+pub(crate) use crate::domain::EmbeddingMetric;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -10,12 +11,15 @@ use tokio_util::sync::CancellationToken;
 use super::compute::ModelComputeRuntime;
 pub(super) use super::error::ModelError;
 
+/// Execution device requested for a local embedding model.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum EmbeddingMetric {
-    Cosine,
-    DotProduct,
-    Euclidean,
+pub enum Device {
+    Auto,
+    Cpu,
+    Metal,
+    Vulkan,
+    Cuda,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -98,6 +102,24 @@ pub enum EmbeddingModelProgress {
     Ready {
         model: String,
     },
+}
+
+/// Observes model preparation together with the operation's effective concurrency.
+#[derive(Clone)]
+pub(crate) struct ModelProgressReporter(
+    Arc<dyn Fn(EmbeddingModelProgress, usize) + Send + Sync + 'static>,
+);
+
+impl ModelProgressReporter {
+    pub(crate) fn new(
+        reporter: impl Fn(EmbeddingModelProgress, usize) + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(reporter))
+    }
+
+    pub(super) fn report(&self, progress: EmbeddingModelProgress, concurrency: usize) {
+        (self.0)(progress, concurrency);
+    }
 }
 
 #[derive(Clone, Default)]

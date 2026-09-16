@@ -137,7 +137,7 @@ pub fn query_authorization(
     if !query_text && !workspace_content {
         return Ok(None);
     }
-    if manifest.embedding.is_none() {
+    if manifest.embedding().is_none() {
         return Ok(None);
     }
     let target = authorization_for_manifest(
@@ -346,7 +346,7 @@ pub fn grant(
         .or_else(|| {
             manifest
                 .as_ref()
-                .and_then(|m| m.embedding.as_ref())
+                .and_then(|m| m.embedding())
                 .map(|e| format!("{}/{}", e.provider, e.model))
         })
         .or_else(|| {
@@ -589,9 +589,10 @@ mod tests {
     #[test]
     fn resumed_build_discloses_its_destination_while_queries_use_the_active_index() {
         use crate::{
-            api::{
-                context::{ContextOptions, options::RefreshPolicy},
-                info::result::{WorkspaceIndexEmbedding, WorkspaceIndexInfo, WorkspaceIndexPolicy},
+            api::context::{ContextOptions, options::RefreshPolicy},
+            domain::{
+                EmbeddingMetric, EmbeddingSchema, FileSelection, IndexPolicy, Workspace,
+                WorkspaceIndex, WorkspaceName,
             },
             workspace::{
                 build::prepare_build,
@@ -601,24 +602,25 @@ mod tests {
         let directory = tempfile::tempdir().expect("workspace");
         let home = directory.path().join(".zvec-grep");
         let active = WorkspaceManifest::new(
-            WorkspaceIndexInfo {
-                id: "workspace".into(),
-                name: "workspace".into(),
+            Workspace {
+                name: WorkspaceName::new("workspace").expect("workspace name"),
                 root: directory.path().to_path_buf(),
-                path: home.clone(),
-                discovery: crate::api::index::options::DiscoveryOptions::default(),
-                policy: WorkspaceIndexPolicy::Enabled,
-                embedding: Some(WorkspaceIndexEmbedding {
-                    provider: "qwen".into(),
-                    model: "text-embedding-v4".into(),
-                    dimension: 1024,
-                    metric: "cosine".into(),
+                file_selection: FileSelection::default(),
+                index_policy: IndexPolicy::Enabled,
+                index: Some(WorkspaceIndex {
+                    embedding: EmbeddingSchema {
+                        provider: "qwen".into(),
+                        model: "text-embedding-v4".into(),
+                        dimension: 1024,
+                        metric: EmbeddingMetric::Cosine,
+                    },
+                    revision: 1,
                 }),
-                index_version: Some(5),
-                generation: Some(1),
                 created_epoch_ms: 1,
                 updated_epoch_ms: 1,
             },
+            home.clone(),
+            Some(5),
             EmbeddingRuntimeConfig {
                 endpoint: Some("https://active.test/embeddings".into()),
                 ..EmbeddingRuntimeConfig::default()

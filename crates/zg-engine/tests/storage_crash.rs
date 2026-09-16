@@ -3,7 +3,7 @@
 mod support;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -48,9 +48,10 @@ async fn checkpoint_crash_fixture() -> TestResult {
     // active index, exercising storage recovery rather than build publication.
     assert_eq!(engine.index(index_options(&root)).await?.files_added, 0);
     let index_path = engine.info(info_options(&root)).await?.index_path;
+    fs::create_dir_all(root.join("src").join("deep"))?;
     for index in 0..TOTAL_FILES {
         fs::write(
-            root.join(format!("crash-{index:03}.txt")),
+            root.join(fixture_source_path(index)),
             format!("Orchard document {index}.\n"),
         )?;
     }
@@ -116,7 +117,12 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
         .map(source_name)
         .collect::<BTreeSet<_>>();
     let indexed_names = (0..TOTAL_FILES)
-        .map(|index| format!("crash-{index:03}.txt"))
+        .map(|index| {
+            fixture_source_path(index)
+                .to_str()
+                .expect("UTF-8 fixture path")
+                .to_owned()
+        })
         .filter(|name| !pending_names.contains(name))
         .collect::<BTreeSet<_>>();
     child.0.kill()?;
@@ -131,6 +137,14 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
         TOTAL_FILES,
         "{child_log}"
     );
+
+    // The killed writer has released every native handle. Read durable logical
+    // identities before engine recovery; never open a parent handle before spawn.
+    let catalog_home = root.join(".zvec-grep/catalog");
+    let identities_before_recovery = catalog_identities(&catalog_home)?;
+    let directory_ids = &identities_before_recovery.directories;
+    assert_eq!(identities_before_recovery.files.len(), TOTAL_FILES);
+    assert_eq!(directory_ids.len(), 2);
 
     let recovery_requests = server.requests.load(Ordering::Acquire);
     let engine = ZvecGrep::new();
@@ -178,8 +192,44 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
             assert_eq!(file["value"]["index_status"]["entity_count"], 1);
         }
     }
-    let indexed_source_ids = native_documents(&index_path.join("files"))?
-        .into_iter()
+    let file_paths = files
+        .iter()
+        .map(|file| {
+            (
+                file["value"]["id"].as_u64().expect("numeric file ID"),
+                PathBuf::from(source_name(file)),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        file_paths.len(),
+        TOTAL_FILES,
+        "every source has a unique numeric identity"
+    );
+    assert_eq!(
+        file_paths
+            .iter()
+            .map(|(id, path)| (path.clone(), *id))
+            .collect::<BTreeMap<_, _>>(),
+        identities_before_recovery.files,
+        "recovered file records retain their catalog identities"
+    );
+    let file_documents = native_documents(&index_path.join("files"))?;
+    // Recovery restores NotIndexed rows as well as their directory projection.
+    // This also checks root-file empty arrays in the same active collection.
+    assert_document_file_metadata(&file_documents, &file_paths, directory_ids)?;
+    assert!(pending_names.iter().any(|name| {
+        Path::new(name)
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+    }));
+    assert_eq!(
+        catalog_identities(&catalog_home)?,
+        identities_before_recovery,
+        "recovery preserves every allocated file and directory ID"
+    );
+    let indexed_file_ids = file_documents
+        .iter()
         .filter_map(|doc| {
             let file: Value = serde_json::from_str(
                 &doc.get_string("payload")
@@ -188,9 +238,9 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
             )
             .expect("file JSON");
             indexed_names.contains(&source_name(&file)).then(|| {
-                doc.get_string("source_id")
-                    .expect("source ID")
-                    .expect("file source ID")
+                doc.get_u64("file_id")
+                    .expect("numeric file ID")
+                    .expect("file identity")
             })
         })
         .collect::<BTreeSet<_>>();
@@ -203,18 +253,21 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
             searchable_collections += 1;
             let documents = native_documents(&entry.path())?;
             assert_eq!(documents.len(), CHECKPOINT_FILES, "{name}");
-            let source_ids = documents
+            let file_ids = documents
                 .iter()
                 .map(|doc| {
-                    doc.get_string("source_id")
-                        .expect("source ID")
-                        .expect("document source ID")
+                    doc.get_u64("file_id")
+                        .expect("numeric file ID")
+                        .expect("document file identity")
                 })
                 .collect::<BTreeSet<_>>();
             assert_eq!(
-                source_ids, indexed_source_ids,
+                file_ids, indexed_file_ids,
                 "{name}: unfinished records must be removed"
             );
+            if name != "entities" {
+                assert_document_file_metadata(&documents, &file_paths, directory_ids)?;
+            }
         }
     }
     assert_eq!(searchable_collections, 3);
@@ -264,7 +317,102 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
             indexed_names.union(&pending_names).cloned().collect()
         );
     }
+    for entry in fs::read_dir(&index_path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == "fragments" || name.starts_with("vectors_") {
+            let documents = native_documents(&entry.path())?;
+            assert_eq!(documents.len(), TOTAL_FILES);
+            assert_document_file_metadata(&documents, &file_paths, directory_ids)?;
+        }
+    }
+    assert_document_file_metadata(
+        &native_documents(&index_path.join("files"))?,
+        &file_paths,
+        directory_ids,
+    )?;
+    assert_eq!(
+        catalog_identities(&catalog_home)?,
+        identities_before_recovery,
+        "recovery and reindex preserve every allocated file and directory ID"
+    );
     engine.close();
+    Ok(())
+}
+
+fn fixture_source_path(index: usize) -> PathBuf {
+    let name = format!("crash-{index:03}.txt");
+    // Fewer root files than pending slots guarantees that the interrupted batch
+    // contains a nested file regardless of extraction completion order.
+    if index < PENDING_FILES - 1 {
+        PathBuf::from(name)
+    } else {
+        Path::new("src").join("deep").join(name)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct IdentitySnapshot {
+    files: BTreeMap<PathBuf, u64>,
+    directories: BTreeMap<PathBuf, u64>,
+}
+
+fn catalog_identities(home: &Path) -> TestResult<IdentitySnapshot> {
+    Ok(IdentitySnapshot {
+        files: identity_paths(&home.join("file_identities"))?,
+        directories: identity_paths(&home.join("directories"))?,
+    })
+}
+
+fn identity_paths(collection: &Path) -> TestResult<BTreeMap<PathBuf, u64>> {
+    let mut identities = BTreeMap::new();
+    let mut ids = BTreeSet::new();
+    for doc in native_documents(collection)? {
+        let id = doc.get_u64("id")?.expect("numeric catalog identity");
+        let path: Value = serde_json::from_str(&doc.get_string("path")?.expect("native path"))?;
+        assert_eq!(path["encoding"], "utf8");
+        let path = PathBuf::from(path["value"].as_str().expect("UTF-8 fixture path"));
+        assert!(ids.insert(id), "catalog IDs must be unique");
+        assert!(
+            identities.insert(path, id).is_none(),
+            "catalog paths must be unique"
+        );
+    }
+    Ok(identities)
+}
+
+fn assert_document_file_metadata(
+    documents: &[zvec_rust::Doc],
+    file_paths: &BTreeMap<u64, PathBuf>,
+    directory_ids: &BTreeMap<PathBuf, u64>,
+) -> TestResult {
+    for document in documents {
+        let id = document.get_u64("file_id")?.expect("numeric file ID");
+        let path = file_paths.get(&id).expect("registered file owner");
+        assert_eq!(
+            document.get_string("file_name")?.as_deref(),
+            path.file_name().and_then(|name| name.to_str())
+        );
+        let mut ancestors = path
+            .ancestors()
+            .skip(1)
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| directory_ids[parent])
+            .collect::<Vec<_>>();
+        ancestors.reverse();
+        assert!(document.has_field("ancestor_directory_ids"));
+        assert!(!document.is_field_null("ancestor_directory_ids"));
+        // zvec-rust's pointer getter represents an empty array as None.
+        assert_eq!(
+            document
+                .get_array_u64("ancestor_directory_ids")?
+                .unwrap_or_default(),
+            ancestors,
+            "{}: root files have no ancestors; nested files retain the complete ancestry",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -328,6 +476,15 @@ fn spawn_writer(root: &Path, log_path: &Path) -> TestResult<CrashFixtureChild> {
                 "--test-threads=1",
             ])
             .env(CRASH_FIXTURE_ROOT_ENV, root)
+            .env(
+                "ZVEC_GREP_WORKSPACE_REGISTRY",
+                std::env::var_os("ZVEC_GREP_WORKSPACE_REGISTRY").unwrap_or_else(|| {
+                    root.parent()
+                        .expect("fixture parent")
+                        .join("workspaces.json")
+                        .into_os_string()
+                }),
+            )
             .stdin(Stdio::null())
             .stdout(output)
             .stderr(errors)

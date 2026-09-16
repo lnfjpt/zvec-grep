@@ -13,7 +13,7 @@ use crate::{
             IndexRouteDiagnostics, MatchedBy,
         },
     },
-    domain::{Content, EntityContent, EntityFragment, FileRecord},
+    domain::{Content, EntityContent, EntityFragment, FileRecord, Workspace},
     storage::spi::WorkspaceIndexStorage,
     utils::sha256_hex,
 };
@@ -148,7 +148,8 @@ pub(crate) fn normalize_context_request(
 
 pub(crate) async fn context_from_index(
     root: &Path,
-    workspace_index: &crate::api::info::result::WorkspaceIndexInfo,
+    workspace: &Workspace,
+    workspace_home: &Path,
     storage: &dyn WorkspaceIndexStorage,
     embedding_model: Option<&dyn SearchEmbeddingRuntime>,
     options: &ContextOptions,
@@ -177,7 +178,7 @@ pub(crate) async fn context_from_index(
     for group in &groups {
         searches.push(
             search_workspace_index(
-                &workspace_index.root,
+                &workspace.root,
                 SearchPlan {
                     routes: group.routes.clone(),
                     limit: Some(limit),
@@ -202,7 +203,8 @@ pub(crate) async fn context_from_index(
 
     Ok(build_context_result(
         root,
-        workspace_index,
+        workspace,
+        workspace_home,
         request,
         &groups,
         searches,
@@ -211,7 +213,8 @@ pub(crate) async fn context_from_index(
 
 fn build_context_result(
     root: &Path,
-    workspace_index: &crate::api::info::result::WorkspaceIndexInfo,
+    workspace: &Workspace,
+    workspace_home: &Path,
     request: &NormalizedContextRequest,
     groups: &[NormalizedContextGroup],
     searches: Vec<SearchPlanResult>,
@@ -219,7 +222,7 @@ fn build_context_result(
     let group_items = searches
         .iter()
         .zip(groups)
-        .map(|(search, group)| search_plan_to_context_items(search, &workspace_index.root, group))
+        .map(|(search, group)| search_plan_to_context_items(search, &workspace.root, group))
         .collect::<Vec<_>>();
     let coverage_groups = groups
         .iter()
@@ -244,10 +247,13 @@ fn build_context_result(
         source: ContextSource::Index,
         coverage: ContextCoverage::RankedSample,
         workspace_index: Some(ContextWorkspaceIndex {
-            id: workspace_index.id.clone(),
-            name: workspace_index.name.clone(),
-            path: workspace_index.path.clone(),
-            generation: workspace_index.generation,
+            name: workspace.name.as_str().to_owned(),
+            path: workspace_home.to_path_buf(),
+            generation: workspace
+                .index
+                .as_ref()
+                .map(|index| index.revision)
+                .filter(|revision| *revision != 0),
         }),
         items,
         group_results: groups
@@ -314,7 +320,7 @@ fn search_plan_to_context_items(
                 kind: ContextItemKind::IndexedEntity,
                 rank: hit.rank,
                 absolute_path: workspace_root.join(&hit.file.relative_path),
-                relative_path: hit.file.relative_path.clone(),
+                relative_path: hit.file.relative_path.to_path_buf(),
                 range: hit.entity.range.into(),
                 excerpt_range: target.excerpt_range,
                 content: target.content,
@@ -679,14 +685,14 @@ mod tests {
             pipelines::search::pipeline::{SearchEvidence, SearchHit},
         };
 
-        let file_id = FileId::new("file").expect("file id");
+        let file_id = FileId::new(1);
         let range = SourceRange::Text(
             TextRange::from_coordinates(0, 100, 1, 20, 0, 5).expect("valid range"),
         );
         let mut hit = SearchHit {
             entity: Entity {
                 id: EntityId::new("entity").expect("entity id"),
-                file_id: file_id.clone(),
+                file_id,
                 range,
                 content: EntityContent::Source(vec![Content::Text(
                     "A short source excerpt".to_owned(),
@@ -694,8 +700,8 @@ mod tests {
                 metadata: None,
             },
             file: FileRecord {
-                id: file_id.clone(),
-                relative_path: PathBuf::from("file.txt"),
+                id: file_id,
+                relative_path: crate::domain::SourcePath::new("file.txt").expect("source path"),
                 formats: vec![FileFormat::Text],
                 snapshot: FileSnapshot {
                     size_bytes: 100,
@@ -746,13 +752,10 @@ mod tests {
     )]
     fn resolves_context_paths_and_freshness_after_workspace_relocation() {
         use crate::{
-            api::{
-                index::options::DiscoveryOptions,
-                info::result::{WorkspaceIndexInfo, WorkspaceIndexPolicy},
-            },
             domain::{
-                Content, Entity, EntityContent, EntityId, FileFormat, FileId, FileIndexStatus,
-                FileRecord, FileSnapshot, SourceRange, TextRange,
+                Content, EmbeddingMetric, EmbeddingSchema, Entity, EntityContent, EntityId,
+                FileFormat, FileId, FileIndexStatus, FileRecord, FileSelection, FileSnapshot,
+                IndexPolicy, SourceRange, TextRange, Workspace, WorkspaceIndex, WorkspaceName,
             },
             pipelines::search::pipeline::{SearchHit, SearchPlanResult},
             utils::sha256_hex,
@@ -765,9 +768,8 @@ mod tests {
         let content = "source contents";
         std::fs::write(original_root.join("src/file.txt"), content).expect("source file");
         let source = FileRecord {
-            id: FileId::for_path("workspace", std::path::Path::new("src/file.txt"))
-                .expect("file id"),
-            relative_path: PathBuf::from("src/file.txt"),
+            id: FileId::new(1),
+            relative_path: crate::domain::SourcePath::new("src/file.txt").expect("source path"),
             formats: vec![FileFormat::Text],
             snapshot: FileSnapshot {
                 size_bytes: content.len() as u64,
@@ -788,7 +790,7 @@ mod tests {
             hits: vec![SearchHit {
                 entity: Entity {
                     id: EntityId::new("entity").expect("entity id"),
-                    file_id: source.id.clone(),
+                    file_id: source.id,
                     range: SourceRange::Text(
                         TextRange::from_coordinates(0, content.len(), 1, 1, 0, content.len())
                             .expect("range"),
@@ -810,30 +812,37 @@ mod tests {
             ..ContextOptions::default()
         })
         .expect("request");
-        let mut index = WorkspaceIndexInfo {
-            id: "workspace".to_owned(),
-            name: "workspace".to_owned(),
-            path: directory.path().join("index"),
+        let mut workspace = Workspace {
+            name: WorkspaceName::new("workspace").expect("workspace name"),
             root: original_root.clone(),
-            discovery: DiscoveryOptions::default(),
-            policy: WorkspaceIndexPolicy::Enabled,
-            embedding: None,
-            index_version: None,
-            generation: None,
+            file_selection: FileSelection::default(),
+            index_policy: IndexPolicy::Enabled,
+            index: Some(WorkspaceIndex {
+                embedding: EmbeddingSchema {
+                    provider: "local".to_owned(),
+                    model: "fixture".to_owned(),
+                    dimension: 2,
+                    metric: EmbeddingMetric::Cosine,
+                },
+                // Legacy indexes can lack a known committed revision.
+                revision: 0,
+            }),
             created_epoch_ms: 0,
             updated_epoch_ms: 0,
         };
+        let workspace_home = directory.path().join("index");
 
         for root in [&original_root, &moved_root] {
             if root == &moved_root {
                 std::fs::rename(&original_root, &moved_root).expect("move workspace");
-                index.root = moved_root.clone();
+                workspace.root = moved_root.clone();
             }
             // The request may start in a subdirectory; source paths retain the workspace base.
             let requested_root = root.join("src");
             let result = super::build_context_result(
                 &requested_root,
-                &index,
+                &workspace,
+                &workspace_home,
                 &request,
                 &request.groups,
                 vec![search.clone()],
@@ -842,6 +851,15 @@ mod tests {
             assert_eq!(result.items[0].absolute_path, root.join("src/file.txt"));
             assert_eq!(result.items[0].relative_path, PathBuf::from("src/file.txt"));
             assert_eq!(result.items[0].status, ContextItemStatus::Fresh);
+            assert_eq!(
+                result
+                    .workspace_index
+                    .as_ref()
+                    .expect("workspace metadata")
+                    .generation,
+                None,
+                "unknown revisions must not be exposed as committed generation zero"
+            );
         }
         assert_eq!(
             super::file_freshness_status(&original_root, &file),
