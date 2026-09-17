@@ -291,7 +291,7 @@ pub fn write_index_result(
 ///
 /// Returns the underlying writer error.
 pub fn write_info_result(mut writer: impl Write, result: &InfoResult) -> io::Result<()> {
-    let state = if result.indexed { "ready" } else { "missing" };
+    let state = result.index_status().as_str();
     writeln!(writer, "Workspace index: {state}")?;
     writeln!(writer, "Root: {}", result.root.display())?;
     writeln!(writer, "Index path: {}", result.index_path.display())?;

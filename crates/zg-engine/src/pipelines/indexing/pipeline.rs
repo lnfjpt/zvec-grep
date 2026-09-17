@@ -27,12 +27,12 @@ use crate::{
             },
             result::{IndexResult, SkippedFile, SkippedFileReason, TimingEntry},
         },
-        info::result::WorkspaceIndexStatus,
+        info::result::IndexStats,
     },
     domain::{
         Entity, EntityFragment, EntityId, FileCategory, FileFormat, FileId, FileIndexStatus,
-        FileRecord, FileSnapshot, FragmentId, ImageContent, IndexPolicy, SourcePath,
-        WindowFragment, Workspace, validate_fragments,
+        FileRecord, FileSnapshot, FragmentId, ImageContent, IndexState, SourcePath, WindowFragment,
+        Workspace, validate_fragments,
     },
     extraction::{
         ExtractedFragment, ImageSource, IndexingExtractionFragment, SourceKind, TextSource,
@@ -203,7 +203,7 @@ pub(crate) async fn get_workspace_index_status(
     storage: &dyn WorkspaceIndexStorage,
     scanner: &dyn WorkspaceScannerPort,
     signal: Option<CancellationToken>,
-) -> Result<WorkspaceIndexStatus, EngineError> {
+) -> Result<IndexStats, EngineError> {
     let stored_files = storage.list_files()?;
     let control = task_control(signal);
     let snapshot = scanner
@@ -230,7 +230,7 @@ pub(crate) async fn get_workspace_index_status(
         .filter(|file| file.index_status.is_indexed())
         .collect::<Vec<_>>();
 
-    Ok(WorkspaceIndexStatus {
+    Ok(IndexStats {
         files_scanned: diff.files_scanned,
         files_stored: stored_files.len(),
         files_indexed: indexed_files.len(),
@@ -263,12 +263,12 @@ struct ProgressBase {
 struct IndexPassResult {
     files_scanned: usize,
     diff: DiffPlan,
-    stats: IndexStats,
+    stats: IndexWriteStats,
     skipped: Vec<SkippedFile>,
 }
 
 #[derive(Default)]
-struct IndexStats {
+struct IndexWriteStats {
     files_indexed: usize,
     files_failed: usize,
     entities_created: usize,
@@ -565,14 +565,14 @@ async fn index_candidates(
     diff: &mut DiffPlan,
     timings: &mut TimingCollector,
     progress_base: Option<ProgressBase>,
-) -> Result<IndexStats, EngineError> {
+) -> Result<IndexWriteStats, EngineError> {
     let policy = resolve_embedding_policy(
         context.embedding_concurrency,
         context.embedding_model.info(),
     )?;
     let scheduler = Arc::new(EmbeddingScheduler::new(policy));
     let max_batch_size = context.embedding_model.info().limits.max_batch_size;
-    let mut stats = IndexStats::default();
+    let mut stats = IndexWriteStats::default();
     let mut current_batch = Vec::new();
     let mut current_fragments = 0;
     let mut running: FuturesUnordered<EmbeddingFuture<'_>> = FuturesUnordered::new();
@@ -722,7 +722,7 @@ fn apply_embedding_outcome(
     diff: &DiffPlan,
     progress_base: Option<ProgressBase>,
     timings: &mut TimingCollector,
-    stats: &mut IndexStats,
+    stats: &mut IndexWriteStats,
     outcome: EmbeddingBatchOutcome,
 ) -> Result<(), EngineError> {
     timings.record("index_embedding", outcome.duration, outcome.outcomes.len());
@@ -755,7 +755,7 @@ fn apply_embedding_files(
     diff: &DiffPlan,
     progress_base: Option<ProgressBase>,
     timings: &mut TimingCollector,
-    stats: &mut IndexStats,
+    stats: &mut IndexWriteStats,
     outcomes: Vec<EmbeddedFileOutcome>,
 ) -> Result<(), EngineError> {
     for outcome in outcomes {
@@ -810,7 +810,7 @@ fn commit_file(
     storage: &dyn WorkspaceIndexStorage,
     file: PreparedFile,
     vectors: Vec<Vec<f32>>,
-    stats: &mut IndexStats,
+    stats: &mut IndexWriteStats,
 ) -> Result<(), CommitError> {
     if file.fragments.len() != vectors.len() {
         return Err(CommitError {
@@ -993,7 +993,7 @@ fn mark_file_failed(
     Ok(reason)
 }
 
-fn record_file_failed(stats: &mut IndexStats, file: &FileRecord, reason: &str) {
+fn record_file_failed(stats: &mut IndexWriteStats, file: &FileRecord, reason: &str) {
     stats.files_failed += 1;
     stats.failed_files.push(file.relative_path.to_path_buf());
     stats
@@ -1599,7 +1599,7 @@ fn report_embedding_progress(
 
 fn report_indexing(
     context: &IndexingContext<'_>,
-    stats: &IndexStats,
+    stats: &IndexWriteStats,
     diff: &DiffPlan,
     progress_base: Option<ProgressBase>,
     detail: Option<String>,
@@ -1647,7 +1647,7 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
         ));
     }
     context.workspace_index.validate()?;
-    if context.workspace_index.index_policy != IndexPolicy::Enabled {
+    if !context.workspace_index.index_enabled() {
         return Err(EngineError::invalid_argument(
             "indexing requires an enabled workspace",
         ));
@@ -1657,7 +1657,7 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
             "embedding model max_batch_size must be greater than zero",
         ));
     }
-    if let Some(index) = &context.workspace_index.index {
+    if let IndexState::Enabled(index) = &context.workspace_index.index {
         let schema = &index.embedding;
         let model = context.embedding_model.info();
         if schema.provider != model.provider
@@ -2029,7 +2029,7 @@ fn build_index_result(
         generation: context
             .workspace_index
             .index
-            .as_ref()
+            .descriptor()
             .map_or(0, |index| index.revision)
             .saturating_add(1),
         files_scanned: final_pass.files_scanned,
@@ -2078,7 +2078,7 @@ mod tests {
 
     use crate::{
         api::index::progress::IndexProgressPhase,
-        domain::{Content, EmbeddingSchema, FileSelection, WorkspaceIndex, WorkspaceName},
+        domain::{Content, EmbeddingSchema, FileSelection, IndexDescriptor},
         models::{EmbeddingMetric, EmbeddingModelLimits},
         storage::spi::{StorageResult, StorageSearchFilter, StorageSearchHit},
     };
@@ -2386,14 +2386,13 @@ mod tests {
 
     fn workspace(root: &Path) -> Workspace {
         Workspace {
-            name: WorkspaceName::new("fixture").expect("workspace name"),
+            name: "fixture".to_owned(),
             root: root.to_path_buf(),
             file_selection: FileSelection {
                 no_ignore: true,
                 ..FileSelection::default()
             },
-            index_policy: IndexPolicy::Enabled,
-            index: Some(WorkspaceIndex {
+            index: IndexState::Enabled(IndexDescriptor {
                 embedding: EmbeddingSchema {
                     provider: "local".to_owned(),
                     model: "test".to_owned(),

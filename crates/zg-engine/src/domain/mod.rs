@@ -31,5 +31,5 @@ pub(crate) use entity::{EntityFragment, FragmentId, WindowFragment, validate_fra
 
 pub use workspace::FileSelection;
 pub(crate) use workspace::{
-    EmbeddingMetric, EmbeddingSchema, IndexPolicy, Workspace, WorkspaceIndex, WorkspaceName,
+    EmbeddingMetric, EmbeddingSchema, IndexDescriptor, IndexState, Workspace,
 };

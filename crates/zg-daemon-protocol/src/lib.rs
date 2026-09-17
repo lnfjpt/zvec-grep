@@ -279,7 +279,7 @@ mod tests {
         use zg_engine::api::index::options::DiscoveryOptions;
         use zg_engine::api::info::{
             InfoResult,
-            result::{InfoSource, WorkspaceIndexInfo, WorkspaceIndexPolicy, WorkspaceIndexStatus},
+            result::{IndexStats, InfoSource, WorkspaceIndexInfo, WorkspaceIndexPolicy},
         };
 
         let count = u64::from(u32::MAX) + 1;
@@ -302,10 +302,10 @@ mod tests {
                 created_epoch_ms: 1,
                 updated_epoch_ms: 2,
             }),
-            status: Some(WorkspaceIndexStatus {
+            status: Some(IndexStats {
                 entities_indexed: count,
                 indexed_size_bytes: count + 3,
-                ..WorkspaceIndexStatus::default()
+                ..IndexStats::default()
             }),
             suggestion: None,
         }));

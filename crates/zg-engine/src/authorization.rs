@@ -591,8 +591,8 @@ mod tests {
         use crate::{
             api::context::{ContextOptions, options::RefreshPolicy},
             domain::{
-                EmbeddingMetric, EmbeddingSchema, FileSelection, IndexPolicy, Workspace,
-                WorkspaceIndex, WorkspaceName,
+                EmbeddingMetric, EmbeddingSchema, FileSelection, IndexDescriptor, IndexState,
+                Workspace,
             },
             workspace::{
                 build::prepare_build,
@@ -603,11 +603,10 @@ mod tests {
         let home = directory.path().join(".zvec-grep");
         let active = WorkspaceManifest::new(
             Workspace {
-                name: WorkspaceName::new("workspace").expect("workspace name"),
+                name: "workspace".to_owned(),
                 root: directory.path().to_path_buf(),
                 file_selection: FileSelection::default(),
-                index_policy: IndexPolicy::Enabled,
-                index: Some(WorkspaceIndex {
+                index: IndexState::Enabled(IndexDescriptor {
                     embedding: EmbeddingSchema {
                         provider: "qwen".into(),
                         model: "text-embedding-v4".into(),

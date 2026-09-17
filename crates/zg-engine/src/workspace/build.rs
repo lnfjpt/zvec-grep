@@ -294,8 +294,7 @@ mod tests {
 
     use crate::{
         domain::{
-            EmbeddingMetric, EmbeddingSchema, FileSelection, IndexPolicy, Workspace,
-            WorkspaceIndex, WorkspaceName,
+            EmbeddingMetric, EmbeddingSchema, FileSelection, IndexDescriptor, IndexState, Workspace,
         },
         storage::spi::{StorageResult, WorkspaceIndexStorage, WorkspaceIndexStorageOptions},
         workspace::manifest::EmbeddingRuntimeConfig,
@@ -337,11 +336,10 @@ mod tests {
     fn manifest(root: &Path) -> WorkspaceManifest {
         WorkspaceManifest::new(
             Workspace {
-                name: WorkspaceName::new("workspace").expect("workspace name"),
+                name: "workspace".to_owned(),
                 root: root.to_path_buf(),
                 file_selection: FileSelection::default(),
-                index_policy: IndexPolicy::Enabled,
-                index: Some(WorkspaceIndex {
+                index: IndexState::Enabled(IndexDescriptor {
                     embedding: EmbeddingSchema {
                         provider: "local".into(),
                         model: "example".into(),
@@ -409,7 +407,7 @@ mod tests {
                 1 => target.embedding_runtime.endpoint = Some("https://other.example".into()),
                 2 => target.index_version = Some(6),
                 3 => target.record_revision(8, 3),
-                _ => target.workspace.name = WorkspaceName::new("renamed").expect("new name"),
+                _ => target.workspace.name = "renamed".to_owned(),
             }
             let replaced = prepare_build(target, Some(&active), Some(build.clone()), &factory)
                 .expect("new stage");
@@ -481,7 +479,7 @@ mod tests {
         assert!(active.storage_home().exists());
         assert!(has_build(&active.path));
         assert!(active.path.join("catalog").exists());
-        committed.workspace.name = WorkspaceName::new("renamed").expect("new workspace name");
+        committed.workspace.name = "renamed".to_owned();
         write_workspace_manifest(&active.path, &committed).expect("rename after publication");
         factory.fail_delete.store(false, Ordering::Relaxed);
         let (pending, published) = recover_build(&active.path, &factory).expect("complete cleanup");

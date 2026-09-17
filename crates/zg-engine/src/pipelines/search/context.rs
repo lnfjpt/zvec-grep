@@ -251,7 +251,7 @@ fn build_context_result(
             path: workspace_home.to_path_buf(),
             generation: workspace
                 .index
-                .as_ref()
+                .descriptor()
                 .map(|index| index.revision)
                 .filter(|revision| *revision != 0),
         }),
@@ -754,7 +754,7 @@ mod tests {
             domain::{
                 Content, EmbeddingMetric, EmbeddingSchema, Entity, EntityContent, EntityId,
                 FileFormat, FileId, FileIndexStatus, FileRecord, FileSelection, FileSnapshot,
-                IndexPolicy, SourceRange, TextRange, Workspace, WorkspaceIndex, WorkspaceName,
+                IndexDescriptor, IndexState, SourceRange, TextRange, Workspace,
             },
             pipelines::search::pipeline::{SearchHit, SearchPlanResult},
             utils::sha256_hex,
@@ -812,11 +812,10 @@ mod tests {
         })
         .expect("request");
         let mut workspace = Workspace {
-            name: WorkspaceName::new("workspace").expect("workspace name"),
+            name: "workspace".to_owned(),
             root: original_root.clone(),
             file_selection: FileSelection::default(),
-            index_policy: IndexPolicy::Enabled,
-            index: Some(WorkspaceIndex {
+            index: IndexState::Enabled(IndexDescriptor {
                 embedding: EmbeddingSchema {
                     provider: "local".to_owned(),
                     model: "fixture".to_owned(),

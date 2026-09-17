@@ -159,6 +159,7 @@ pub struct IndexOperationResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexRuntimeSnapshot {
+    pub index_status: Option<zg_engine::api::info::result::IndexStatusSnapshot>,
     pub watcher_active: bool,
     pub dirty_revision: u64,
     pub indexed_revision: u64,
@@ -177,6 +178,14 @@ pub trait IndexOperationProvider: Send + Sync {
     ) -> Result<IndexOperationResult, EngineError>;
 
     async fn drop_index(&self, options: InfoOptions) -> Result<bool, EngineError>;
+
+    async fn info(
+        &self,
+        engine: &ZvecGrep,
+        options: InfoOptions,
+    ) -> Result<InfoResult, EngineError> {
+        engine.info(options).await
+    }
 
     async fn search(
         &self,
@@ -453,13 +462,15 @@ impl ZvecGrepMcpServer {
             root: Some(root),
             include_status: true,
         };
-        Ok(match self.engine.info(request).await {
-            Ok(reply) => {
-                let runtime = self.index_operations.runtime_snapshot(&reply.root);
-                info_result_to_tool_result(reply, runtime)
-            }
-            Err(error) => error_result(&error),
-        })
+        Ok(
+            match self.index_operations.info(&self.engine, request).await {
+                Ok(reply) => {
+                    let runtime = self.index_operations.runtime_snapshot(&reply.root);
+                    info_result_to_tool_result(reply, runtime)
+                }
+                Err(error) => error_result(&error),
+            },
+        )
     }
 
     #[tool(
@@ -729,6 +740,7 @@ struct IndexDropOutput {
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 struct IndexStatusOutput {
+    status: String,
     root: String,
     indexed: bool,
     index_policy: String,
@@ -740,6 +752,8 @@ struct IndexStatusOutput {
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 struct IndexRuntimeStatusOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_status: Option<IndexStatusSnapshotOutput>,
     watcher_active: bool,
     dirty_revision: u64,
     indexed_revision: u64,
@@ -751,6 +765,12 @@ struct IndexRuntimeStatusOutput {
     progress: Option<IndexJobProgressOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<IndexJobErrorOutput>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct IndexStatusSnapshotOutput {
+    status: String,
+    checked_epoch_ms: u64,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -1544,6 +1564,7 @@ fn info_result_to_tool_result(
 
 impl From<InfoResult> for IndexStatusOutput {
     fn from(reply: InfoResult) -> Self {
+        let status = reply.index_status().as_str().to_owned();
         let workspace_index = reply.workspace_index.map(|info| WorkspaceIndexOutput {
             name: info.name,
             path: info.path.display().to_string(),
@@ -1574,6 +1595,7 @@ impl From<InfoResult> for IndexStatusOutput {
         Self {
             root: reply.root.display().to_string(),
             indexed: reply.indexed,
+            status,
             index_policy: index_policy_label(reply.index_policy).to_owned(),
             source: match reply.source {
                 InfoSource::Index => "index",
@@ -1595,6 +1617,12 @@ impl From<InfoResult> for IndexStatusOutput {
 impl From<IndexRuntimeSnapshot> for IndexRuntimeStatusOutput {
     fn from(runtime: IndexRuntimeSnapshot) -> Self {
         Self {
+            index_status: runtime
+                .index_status
+                .map(|snapshot| IndexStatusSnapshotOutput {
+                    status: snapshot.status.as_str().to_owned(),
+                    checked_epoch_ms: snapshot.checked_epoch_ms,
+                }),
             watcher_active: runtime.watcher_active,
             dirty_revision: runtime.dirty_revision,
             indexed_revision: runtime.indexed_revision,
@@ -1692,7 +1720,7 @@ fn index_policy_label(policy: WorkspaceIndexPolicy) -> &'static str {
     match policy {
         WorkspaceIndexPolicy::Enabled => "enabled",
         WorkspaceIndexPolicy::Disabled => "disabled",
-        WorkspaceIndexPolicy::Undecided => "undecided",
+        WorkspaceIndexPolicy::Uninitialized => "uninitialized",
     }
 }
 
@@ -1875,7 +1903,7 @@ mod tests {
 
     #[test]
     fn index_status_exposes_exact_source_bytes_without_truncation_statistics() {
-        use zg_engine::api::info::result::{WorkspaceIndexInfo, WorkspaceIndexStatus};
+        use zg_engine::api::info::result::{IndexStats, WorkspaceIndexInfo};
 
         let count = u64::from(u32::MAX) + 1;
         let root = test_root();
@@ -1898,10 +1926,10 @@ mod tests {
                 created_epoch_ms: 1,
                 updated_epoch_ms: 2,
             }),
-            status: Some(WorkspaceIndexStatus {
+            status: Some(IndexStats {
                 entities_indexed: count,
                 indexed_size_bytes: count + 3,
-                ..WorkspaceIndexStatus::default()
+                ..IndexStats::default()
             }),
             suggestion: None,
         };

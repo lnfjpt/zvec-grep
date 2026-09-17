@@ -13,7 +13,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EngineError, EngineResult, domain::WorkspaceName, utils::atomic_write};
+use crate::{EngineError, EngineResult, domain::Workspace, utils::atomic_write};
 
 use super::lock::acquire_exclusive_lock;
 
@@ -64,15 +64,12 @@ impl WorkspaceRegistry {
     }
 
     /// Reserve a name before creating its first manifest. Retrying is idempotent.
-    pub(crate) fn register(&self, name: &WorkspaceName, root: &Path) -> EngineResult<()> {
+    pub(crate) fn register(&self, name: &str, root: &Path) -> EngineResult<()> {
+        Workspace::validate_name(name)?;
         let root = canonical_root(root)?;
         let _lock = acquire_exclusive_lock(&self.lock_path(), "register workspace")?;
         let mut document = self.read()?;
-        if let Some(existing) = document
-            .workspaces
-            .iter()
-            .find(|entry| entry.name == name.as_str())
-        {
+        if let Some(existing) = document.workspaces.iter().find(|entry| entry.name == name) {
             if existing.root == root {
                 return Ok(());
             }
@@ -80,48 +77,46 @@ impl WorkspaceRegistry {
         }
         ensure_root_available(&document, &root)?;
         document.workspaces.push(Registration {
-            name: name.as_str().to_owned(),
+            name: name.to_owned(),
             root,
         });
         self.write(&document)
     }
 
-    pub(crate) fn name_for_root(&self, root: &Path) -> EngineResult<Option<WorkspaceName>> {
+    pub(crate) fn name_for_root(&self, root: &Path) -> EngineResult<Option<String>> {
         let root = existing_or_absolute_root(root)?;
         // Atomic replacement lets lookups read a complete snapshot without
         // creating a lock file or a previously absent configuration directory.
-        self.read()?
-            .workspaces
-            .into_iter()
-            .find(|entry| entry.root == root)
-            .map(|entry| WorkspaceName::new(entry.name))
-            .transpose()
-    }
-
-    pub(crate) fn root_for_name(&self, name: &WorkspaceName) -> EngineResult<Option<PathBuf>> {
         Ok(self
             .read()?
             .workspaces
             .into_iter()
-            .find(|entry| entry.name == name.as_str())
+            .find(|entry| entry.root == root)
+            .map(|entry| entry.name))
+    }
+
+    pub(crate) fn root_for_name(&self, name: &str) -> EngineResult<Option<PathBuf>> {
+        Workspace::validate_name(name)?;
+        Ok(self
+            .read()?
+            .workspaces
+            .into_iter()
+            .find(|entry| entry.name == name)
             .map(|entry| entry.root))
     }
 
     /// Commit the authoritative name before updating the local manifest.
     /// A retry also succeeds after another workspace has reused the old name.
-    pub(crate) fn rename(
-        &self,
-        old_name: &WorkspaceName,
-        new_name: &WorkspaceName,
-        root: &Path,
-    ) -> EngineResult<()> {
+    pub(crate) fn rename(&self, old_name: &str, new_name: &str, root: &Path) -> EngineResult<()> {
+        Workspace::validate_name(old_name)?;
+        Workspace::validate_name(new_name)?;
         let root = canonical_root(root)?;
         let _lock = acquire_exclusive_lock(&self.lock_path(), "rename workspace")?;
         let mut document = self.read()?;
         if let Some(existing) = document
             .workspaces
             .iter()
-            .find(|entry| entry.name == new_name.as_str())
+            .find(|entry| entry.name == new_name)
         {
             return if existing.root == root {
                 Ok(())
@@ -132,26 +127,27 @@ impl WorkspaceRegistry {
         let existing = document
             .workspaces
             .iter_mut()
-            .find(|entry| entry.name == old_name.as_str())
+            .find(|entry| entry.name == old_name)
             .ok_or_else(|| {
                 EngineError::not_found(format!("Workspace name '{old_name}' is not registered"))
             })?;
         if existing.root != root {
             return Err(name_conflict(old_name, &existing.root));
         }
-        new_name.as_str().clone_into(&mut existing.name);
+        new_name.clone_into(&mut existing.name);
         self.write(&document)
     }
 
     /// Remove only the expected name/root pair, including an abandoned reservation.
-    pub(crate) fn unregister(&self, name: &WorkspaceName, root: &Path) -> EngineResult<()> {
+    pub(crate) fn unregister(&self, name: &str, root: &Path) -> EngineResult<()> {
+        Workspace::validate_name(name)?;
         let root = existing_or_absolute_root(root)?;
         let _lock = acquire_exclusive_lock(&self.lock_path(), "unregister workspace")?;
         let mut document = self.read()?;
         let Some(index) = document
             .workspaces
             .iter()
-            .position(|entry| entry.name == name.as_str())
+            .position(|entry| entry.name == name)
         else {
             return Ok(());
         };
@@ -197,10 +193,11 @@ impl WorkspaceRegistry {
     /// Adopt an explicitly moved workspace without allowing a copy to steal its name.
     pub(crate) fn relocate(
         &self,
-        name: &WorkspaceName,
+        name: &str,
         old_root: &Path,
         new_root: &Path,
     ) -> EngineResult<()> {
+        Workspace::validate_name(name)?;
         let old_root = existing_or_absolute_root(old_root)?;
         let new_root = canonical_root(new_root)?;
         let _lock = acquire_exclusive_lock(&self.lock_path(), "relocate workspace")?;
@@ -208,7 +205,7 @@ impl WorkspaceRegistry {
         let index = document
             .workspaces
             .iter()
-            .position(|entry| entry.name == name.as_str())
+            .position(|entry| entry.name == name)
             .ok_or_else(|| {
                 EngineError::not_found(format!("Workspace name '{name}' is not registered"))
             })?;
@@ -257,7 +254,7 @@ impl WorkspaceRegistry {
         let mut names = HashSet::new();
         let mut roots = HashSet::new();
         for entry in &document.workspaces {
-            WorkspaceName::new(entry.name.clone())
+            Workspace::validate_name(&entry.name)
                 .map_err(|error| self.invalid(format!("invalid name: {error}")))?;
             if !entry.root.is_absolute() {
                 return Err(self.invalid("workspace roots must be absolute"));
@@ -352,7 +349,7 @@ fn ensure_root_available(document: &RegistryDocument, root: &Path) -> EngineResu
     Ok(())
 }
 
-fn name_conflict(name: &WorkspaceName, root: &Path) -> EngineError {
+fn name_conflict(name: &str, root: &Path) -> EngineError {
     EngineError::invalid_argument(format!("Workspace name '{name}' is already registered for {}", root.display()))
         .with_help("Choose a different workspace name, or explicitly relocate or delete the existing workspace.")
 }
@@ -368,8 +365,55 @@ mod tests {
 
     use super::*;
 
-    fn name(value: &str) -> WorkspaceName {
-        WorkspaceName::new(value.to_owned()).expect("valid name")
+    fn name(value: &str) -> String {
+        value.to_owned()
+    }
+
+    #[test]
+    fn invalid_string_names_never_mutate_the_registry() {
+        let directory = tempdir().expect("workspace");
+        let path = directory.path().join("workspaces.json");
+        let registry = WorkspaceRegistry::at(path.clone()).expect("registry");
+        let root = directory.path();
+        assert!(registry.register("bad/name", root).is_err());
+        assert!(!path.exists());
+        assert!(!registry.lock_path().exists());
+        registry.register("project", root).expect("register");
+        let original = fs::read(&path).expect("original registry");
+        for invalid in ["", " ", ".", "..", "a/b", "a\\b", "a\nb"] {
+            assert!(registry.register(invalid, root).is_err());
+            assert!(registry.rename("project", invalid, root).is_err());
+            assert!(registry.rename(invalid, "project", root).is_err());
+            assert!(registry.unregister(invalid, root).is_err());
+            assert!(registry.relocate(invalid, root, root).is_err());
+            assert!(registry.root_for_name(invalid).is_err());
+            assert_eq!(fs::read(&path).expect("preserved registry"), original);
+        }
+    }
+
+    #[test]
+    fn names_remain_case_sensitive_registry_keys() {
+        let directory = tempdir().expect("workspace roots");
+        let registry =
+            WorkspaceRegistry::at(directory.path().join("workspaces.json")).expect("registry");
+        for (index, name) in ["Backend", "backend", "项目 backend"]
+            .into_iter()
+            .enumerate()
+        {
+            // Use separate numbered roots even on case-insensitive filesystems.
+            let root = directory.path().join(index.to_string());
+            fs::create_dir(&root).expect("workspace root");
+            registry.register(name, &root).expect("distinct name");
+            assert_eq!(
+                registry.name_for_root(&root).expect("stored name"),
+                Some(name.to_owned())
+            );
+            assert_eq!(
+                registry.root_for_name(name).expect("stored root"),
+                Some(fs::canonicalize(&root).expect("root"))
+            );
+        }
+        assert_eq!(registry.read().expect("registry").workspaces.len(), 3);
     }
 
     #[test]
@@ -611,6 +655,7 @@ mod tests {
         let root = fs::canonicalize(directory.path()).expect("canonical root");
         for value in [
             serde_json::json!({"version": 2, "workspaces": []}),
+            serde_json::json!({"version": 1, "workspaces": [{"name": "bad/name", "root": root}]}),
             serde_json::json!({"version": 1, "workspaces": [{"name": "project", "root": "relative"}]}),
             serde_json::json!({"version": 1, "workspaces": [{"name": "project", "root": root}, {"name": "project", "root": root.join("other")}]}),
             serde_json::json!({"version": 1, "workspaces": [{"name": "project", "root": root}, {"name": "other", "root": root}]}),

@@ -561,11 +561,7 @@ async fn execute_status(
     if output.debug {
         eprintln!("Status diagnostics: indexed={}", result.indexed);
     }
-    let ready = result.indexed
-        && result
-            .status
-            .as_ref()
-            .is_none_or(|status| status.files_pending == 0 && status.files_failed == 0);
+    let ready = result.index_status() == zg_engine::api::info::result::IndexStatus::Ready;
     if check_ready && !ready {
         return Err(io::Error::other("workspace index is not ready").into());
     }

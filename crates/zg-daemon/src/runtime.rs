@@ -277,8 +277,8 @@ async fn execute_command(
         ),
         DaemonCommand::Info(request) => engine_execution(
             state
-                .engine
-                .info(request)
+                .runtimes
+                .info(&state.engine, request)
                 .await
                 .map(|reply| DaemonReply::Info(Box::new(reply))),
         ),

@@ -1,8 +1,7 @@
 use crate::{
     EngineError,
     domain::{
-        EmbeddingMetric, EmbeddingSchema, FileSelection, IndexPolicy, Workspace, WorkspaceIndex,
-        WorkspaceName,
+        EmbeddingMetric, EmbeddingSchema, FileSelection, IndexDescriptor, IndexState, Workspace,
     },
     models::Device,
     utils::{atomic_write, sync_directory},
@@ -45,6 +44,15 @@ pub(crate) struct WorkspaceManifest {
 
 // Retain the existing flat disk representation, while retiring its UUID identity.
 // Unknown legacy `id` fields are ignored; the next write stores only the name.
+// Serialized policy is a disk concern; domain enabled state always has a descriptor.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IndexPolicy {
+    Uninitialized,
+    Enabled,
+    Disabled,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestData {
@@ -144,7 +152,7 @@ impl TryFrom<ManifestData> for WorkspaceManifest {
         let index = input
             .embedding
             .map(|embedding| -> Result<_, String> {
-                Ok(WorkspaceIndex {
+                Ok(IndexDescriptor {
                     embedding: embedding.try_into()?,
                     // Zero records an unknown legacy revision or an unpublished first build.
                     // It is never exposed as a known API generation.
@@ -152,14 +160,20 @@ impl TryFrom<ManifestData> for WorkspaceManifest {
                 })
             })
             .transpose()?;
+        let index = match input.index_policy {
+            IndexPolicy::Disabled => IndexState::Disabled,
+            IndexPolicy::Uninitialized => IndexState::Uninitialized,
+            IndexPolicy::Enabled => {
+                IndexState::Enabled(index.ok_or("enabled workspace requires an index descriptor")?)
+            }
+        };
         let manifest = Self {
             manifest_version: input.manifest_version,
             recorded_root: root.clone(),
             workspace: Workspace {
-                name: WorkspaceName::new(input.name).map_err(|error| error.to_string())?,
+                name: input.name,
                 root,
                 file_selection: discovery.into(),
-                index_policy: input.index_policy,
                 index,
                 created_epoch_ms: input.created_time,
                 updated_epoch_ms: input.updated_time,
@@ -180,13 +194,20 @@ impl From<WorkspaceManifest> for ManifestData {
         let workspace = manifest.workspace;
         Self {
             manifest_version: manifest.manifest_version,
-            name: workspace.name.to_string(),
+            name: workspace.name,
             path: manifest.path,
             root: Some(workspace.root),
             discovery: workspace.file_selection.into(),
             root_paths: None,
-            index_policy: workspace.index_policy,
-            embedding: workspace.index.map(|index| index.embedding.into()),
+            index_policy: match &workspace.index {
+                IndexState::Uninitialized => IndexPolicy::Uninitialized,
+                IndexState::Disabled => IndexPolicy::Disabled,
+                IndexState::Enabled(_) => IndexPolicy::Enabled,
+            },
+            embedding: workspace
+                .index
+                .descriptor()
+                .map(|index| index.embedding.clone().into()),
             index_version: manifest.index_version,
             storage_generation: manifest.storage_generation,
             generation,
@@ -225,18 +246,21 @@ impl WorkspaceManifest {
     }
 
     pub(crate) fn embedding(&self) -> Option<&EmbeddingSchema> {
-        self.workspace.index.as_ref().map(|index| &index.embedding)
+        self.workspace
+            .index
+            .descriptor()
+            .map(|index| &index.embedding)
     }
 
     pub(crate) fn revision(&self) -> Option<u64> {
         self.workspace
             .index
-            .as_ref()
+            .descriptor()
             .and_then(|index| (index.revision != 0).then_some(index.revision))
     }
 
     pub(crate) fn record_revision(&mut self, revision: u64, updated_epoch_ms: u64) {
-        if let Some(index) = &mut self.workspace.index {
+        if let IndexState::Enabled(index) = &mut self.workspace.index {
             index.revision = revision;
         }
         self.workspace.updated_epoch_ms = updated_epoch_ms;
@@ -438,15 +462,14 @@ mod tests {
     fn fixture_manifest(home: &Path) -> WorkspaceManifest {
         WorkspaceManifest::new(
             Workspace {
-                name: WorkspaceName::new("fixture").expect("name"),
+                name: "fixture".to_owned(),
                 root: home.parent().expect("workspace root").to_path_buf(),
                 file_selection: FileSelection {
                     globs: vec!["*.rs".into()],
                     hidden: true,
                     ..FileSelection::default()
                 },
-                index_policy: IndexPolicy::Enabled,
-                index: Some(WorkspaceIndex {
+                index: IndexState::Enabled(IndexDescriptor {
                     embedding: EmbeddingSchema {
                         provider: "local".into(),
                         model: "minilm".into(),
@@ -467,6 +490,29 @@ mod tests {
             },
         )
         .expect("fixture manifest")
+    }
+
+    #[test]
+    fn enabled_manifest_requires_a_descriptor_and_does_not_persist_runtime_status() {
+        let directory = tempdir().expect("workspace");
+        let mut manifest = fixture_manifest(&directory.path().join(".zvec-grep"));
+        let mut json = serde_json::to_value(&manifest).expect("serialize");
+        json["embedding"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<WorkspaceManifest>(json).is_err());
+        for index in [
+            IndexState::Uninitialized,
+            IndexState::Disabled,
+            manifest.workspace.index.clone(),
+        ] {
+            manifest.workspace.index = index;
+            let json = serde_json::to_value(&manifest).expect("serialize");
+            assert!(json.get("status").is_none());
+            assert!(json.get("indexStatus").is_none());
+            assert_eq!(
+                serde_json::from_value::<WorkspaceManifest>(json).expect("deserialize"),
+                manifest
+            );
+        }
     }
 
     #[test]
@@ -601,6 +647,26 @@ mod tests {
         manifest.workspace.root = moved.clone();
         manifest.path = moved.join(".zvec-grep");
         assert_eq!(relocated, manifest);
+    }
+
+    #[test]
+    fn string_names_are_validated_on_manifest_read_and_write() {
+        let directory = tempdir().expect("workspace");
+        let home = directory.path().join(".zvec-grep");
+        let mut manifest = fixture_manifest(&home);
+        write_workspace_manifest(&home, &manifest).expect("valid manifest");
+        let original = fs::read(workspace_manifest_path(&home)).expect("original manifest");
+        for name in ["", " ", " project", ".", "..", "a/b", "a\\b", "a\nb"] {
+            manifest.workspace.name = name.to_owned();
+            assert!(write_workspace_manifest(&home, &manifest).is_err());
+            assert_eq!(
+                fs::read(workspace_manifest_path(&home)).expect("preserved"),
+                original
+            );
+            // Raw JSON can bypass in-memory validation; reads must still reject it.
+            let json = serde_json::to_value(&manifest).expect("raw manifest");
+            assert!(serde_json::from_value::<WorkspaceManifest>(json).is_err());
+        }
     }
 
     #[test]
