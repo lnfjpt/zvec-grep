@@ -1,6 +1,6 @@
 use crate::{
     EngineError,
-    domain::{Content, EntityContent, EntityMetadata, FileFormat, SourceRange},
+    domain::{Content, EntityContent, EntityMetadata, FileFormat, MarkdownMetadata, SourceRange},
     utils::{byte_offset_at_utf16_ceil, line_byte_offsets, utf16_len},
 };
 
@@ -86,28 +86,24 @@ pub(super) fn extract(
                     metadata_heading(&metadata).unwrap_or("markdown section"),
                     content_max,
                 )),
-                metadata: Some(metadata.clone()),
+                metadata: Some(metadata),
             }));
 
             for window in windows {
-                let index = fragments.len();
-                fragments.push(markdown_window_to_fragment(
-                    metadata.clone(),
-                    window,
-                    index,
-                    Some(entity_index),
-                ));
+                fragments.push(ExtractedFragment::Window(ExtractedWindow {
+                    index: fragments.len(),
+                    entity_index,
+                    range: SourceRange::Text(window.range),
+                    contents: vec![Content::Text(window.text)],
+                }));
             }
-        } else {
-            for window in windows {
-                let index = fragments.len();
-                fragments.push(markdown_window_to_fragment(
-                    metadata.clone(),
-                    window,
-                    index,
-                    None,
-                ));
-            }
+        } else if let Some(window) = windows.into_iter().next() {
+            fragments.push(ExtractedFragment::Standalone(ExtractedEntity {
+                index: fragments.len(),
+                range: SourceRange::Text(window.range),
+                content: EntityContent::Source(vec![Content::Text(window.text)]),
+                metadata: Some(metadata),
+            }));
         }
     }
 
@@ -140,31 +136,6 @@ fn resolve_options(options: ChunkOptions) -> Result<(usize, usize), EngineError>
         ));
     }
     Ok((max_chars, overlap_chars))
-}
-
-fn markdown_window_to_fragment(
-    metadata: EntityMetadata,
-    window: MarkdownWindow,
-    index: usize,
-    owner: Option<usize>,
-) -> ExtractedFragment {
-    let range = SourceRange::Text(window.range);
-    let contents = vec![Content::Text(window.text)];
-    match owner {
-        Some(entity_index) => ExtractedFragment::Window(ExtractedWindow {
-            index,
-            entity_index,
-            range,
-            contents,
-            metadata: Some(metadata),
-        }),
-        None => ExtractedFragment::Standalone(ExtractedEntity {
-            index,
-            range,
-            content: EntityContent::Source(contents),
-            metadata: Some(metadata),
-        }),
-    }
 }
 
 fn scan_headings(lines: &[&str]) -> Vec<Heading> {
@@ -477,25 +448,27 @@ fn compute_markdown_overlap_lines(
 }
 
 fn markdown_metadata(section: &Section) -> EntityMetadata {
-    EntityMetadata::Markdown {
+    EntityMetadata::Markdown(MarkdownMetadata {
         heading: section.heading.as_ref().map(|heading| heading.text.clone()),
         level: section.heading.as_ref().map(|heading| heading.level),
         scope: (!section.breadcrumb.is_empty()).then(|| section.breadcrumb.join("::")),
-    }
+    })
 }
 
 fn metadata_heading(metadata: &EntityMetadata) -> Option<&str> {
     match metadata {
-        EntityMetadata::Markdown { heading, .. } => heading.as_deref(),
-        EntityMetadata::Code { .. } => None,
+        EntityMetadata::Markdown(MarkdownMetadata { heading, .. }) => heading.as_deref(),
+        EntityMetadata::Code(_) => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{Content, EntityMetadata, FileFormat, SourceRange, TextRange};
+    use crate::domain::{
+        Content, EntityMetadata, FileFormat, MarkdownMetadata, SourceRange, TextRange,
+    };
 
-    use super::super::test_content;
+    use super::super::{test_content, test_metadata};
 
     use super::super::{ChunkOptions, ExtractedFragment, test_source};
     use super::extract;
@@ -533,20 +506,20 @@ mod tests {
         .expect("markdown extraction");
         assert!(fragments.len() >= 4);
         assert!(fragments.iter().any(|item| matches!(
-            &item.metadata(),
-            Some(EntityMetadata::Markdown { heading: Some(heading), .. }) if heading == "Parent"
+            &test_metadata(item),
+            Some(EntityMetadata::Markdown(MarkdownMetadata { heading: Some(heading), .. })) if heading == "Parent"
         )));
         assert!(fragments.iter().any(|item| matches!(
-            &item.metadata(),
-            Some(EntityMetadata::Markdown {
+            &test_metadata(item),
+            Some(EntityMetadata::Markdown(MarkdownMetadata {
                 heading: Some(heading),
                 scope: Some(scope),
                 ..
-            }) if heading == "Child" && scope == "Parent"
+            })) if heading == "Child" && scope == "Parent"
         )));
         assert!(!fragments.iter().any(|item| matches!(
-            &item.metadata(),
-            Some(EntityMetadata::Markdown { heading: Some(heading), .. }) if heading == "Not a heading"
+            &test_metadata(item),
+            Some(EntityMetadata::Markdown(MarkdownMetadata { heading: Some(heading), .. })) if heading == "Not a heading"
         )));
         assert!(fragments.iter().any(|item| matches!(
             item,
@@ -565,7 +538,8 @@ mod tests {
             if let ExtractedFragment::Window(window) = fragment {
                 let owner = &fragments[window.entity_index];
                 assert!(matches!(owner, ExtractedFragment::Representative(_)));
-                assert_eq!(owner.metadata(), fragment.metadata());
+                assert!(test_metadata(owner).is_some());
+                assert!(owner.range().contains(fragment.range()));
             }
             if matches!(fragment, ExtractedFragment::Representative(_)) {
                 continue;
@@ -594,7 +568,7 @@ mod tests {
             test_content(&fragments[0]),
             Content::Text("plain markdown".to_owned())
         );
-        assert!(fragments[0].metadata().is_none());
+        assert!(test_metadata(&fragments[0]).is_none());
 
         assert!(
             extract(

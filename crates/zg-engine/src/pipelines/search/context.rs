@@ -329,7 +329,7 @@ fn search_plan_to_context_items(
                 status: file_freshness_status(workspace_root, &hit.file),
                 score: Some(hit.score),
                 matched_by: hit.matched_by,
-                metadata: hit.entity.metadata.as_ref().map(Into::into),
+                metadata: hit.entity.metadata.clone(),
                 entity_id: Some(hit.entity.id.as_str().to_owned()),
                 container: None,
                 trace: hit.trace.clone(),
@@ -735,7 +735,6 @@ mod tests {
                 file_id,
                 range: window_range,
                 contents: vec![Content::Text("Exact source".to_owned())],
-                metadata: None,
             }),
         });
         let target = super::context_item_target(&hit);

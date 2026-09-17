@@ -5,14 +5,14 @@ use crate::{EngineError, EngineResult};
 use super::{format::FileFormat, path::SourcePath};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct FileId(u64);
+pub(crate) struct FileId(u32);
 
 impl FileId {
-    pub(crate) const fn new(value: u64) -> Self {
+    pub(crate) const fn new(value: u32) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> u64 {
+    pub(crate) const fn get(self) -> u32 {
         self.0
     }
 }

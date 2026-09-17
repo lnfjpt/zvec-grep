@@ -1,9 +1,11 @@
 use super::super::pending::{self, PendingChange, PendingChanges};
 use super::super::spi::StoragePathFilter;
 use super::*;
+use crate::domain::SourcePath;
 use crate::domain::{
-    Content, Entity, EntityContent, EntityFragment, EntityMetadata, FileFormat, FileRecord,
-    FileSnapshot, SourceRange, SymbolType, TableCell, TableCellRole, TableContent,
+    CodeMetadata, Content, Entity, EntityContent, EntityFragment, EntityId, EntityMetadata,
+    FileFormat, FileRecord, FileSnapshot, SourceRange, SymbolType, TableCell, TableCellRole,
+    TableContent,
 };
 
 fn file_at(storage: &dyn WorkspaceIndexStorage, path: &str) -> (FileRecord, IndexedFragment) {
@@ -47,24 +49,20 @@ fn directory_and_filename_filters_match_both_retrieval_collections() {
             .expect("indexed fixture");
         files.push(file);
     }
-    let src = storage
-        .directory_id(Path::new("src"))
-        .expect("lookup")
-        .expect("src ID");
-    let nested = storage
-        .directory_id(Path::new("src/nested"))
-        .expect("lookup")
-        .expect("nested ID");
-    assert!(storage.directory_id(Path::new("")).expect("root").is_none());
+    let src = SourcePath::new("src").expect("path");
+    let nested = SourcePath::new("src/nested").expect("path");
     let cases = [
-        (StoragePathFilter::Directory(src), vec![1, 2, 3, 6, 7, 8]),
         (
-            StoragePathFilter::Not(Box::new(StoragePathFilter::Directory(src))),
+            StoragePathFilter::Directory(src.clone()),
+            vec![1, 2, 3, 6, 7, 8],
+        ),
+        (
+            StoragePathFilter::Not(Box::new(StoragePathFilter::Directory(src.clone()))),
             vec![0, 4, 5],
         ),
         (
             StoragePathFilter::Not(Box::new(StoragePathFilter::Or(vec![
-                StoragePathFilter::Directory(src),
+                StoragePathFilter::Directory(src.clone()),
                 StoragePathFilter::FileNameExact("main.rs".into()),
             ]))),
             vec![5],
@@ -89,15 +87,15 @@ fn directory_and_filename_filters_match_both_retrieval_collections() {
         (StoragePathFilter::FileNameSuffix("%.rs".into()), vec![7]),
         (
             StoragePathFilter::And(vec![
-                StoragePathFilter::Directory(src),
+                StoragePathFilter::Directory(src.clone()),
                 StoragePathFilter::FileNameSuffix(".rs".into()),
-                StoragePathFilter::Not(Box::new(StoragePathFilter::Directory(nested))),
+                StoragePathFilter::Not(Box::new(StoragePathFilter::Directory(nested.clone()))),
             ]),
             vec![1, 6, 7, 8],
         ),
         (
             StoragePathFilter::Or(vec![
-                StoragePathFilter::Directory(nested),
+                StoragePathFilter::Directory(nested.clone()),
                 StoragePathFilter::FileNameSuffix(".md".into()),
             ]),
             vec![2, 5],
@@ -132,7 +130,7 @@ fn directory_and_filename_filters_match_both_retrieval_collections() {
                 .search_vector(&[1.0, 0.0, 0.0], 20, Some(&filter))
                 .expect("vector"),
         ] {
-            let mut actual = hits.into_iter().map(|hit| hit.file.id).collect::<Vec<_>>();
+            let mut actual = hits.into_iter().map(|hit| hit.file_id).collect::<Vec<_>>();
             actual.sort();
             assert_eq!(actual, expected, "{path:?}");
         }
@@ -141,7 +139,7 @@ fn directory_and_filename_filters_match_both_retrieval_collections() {
         .delete_file(files[2].id)
         .expect("delete nested file");
     let filter = StorageSearchFilter {
-        path: Some(StoragePathFilter::Directory(nested)),
+        path: Some(StoragePathFilter::Directory(nested.clone())),
         ..StorageSearchFilter::default()
     };
     assert!(
@@ -152,81 +150,84 @@ fn directory_and_filename_filters_match_both_retrieval_collections() {
     );
     storage.close().expect("checkpoint");
     let reader = open(directory.path(), true);
-    assert_eq!(
+    assert!(
         reader
-            .directory_id(Path::new("src"))
-            .expect("reopened directory"),
-        Some(src)
+            .search_vector(&[1.0, 0.0, 0.0], 20, Some(&filter))
+            .expect("reopened filter")
+            .is_empty()
     );
     assert!(reader.resolve_file_ids(&[PathBuf::from("new.rs")]).is_err());
     reader.close().expect("close reader");
 }
 
 #[test]
-fn file_id_reservations_survive_deletion_and_generation_rebuilds() {
-    let directory = tempfile::tempdir().expect("workspace");
-    let home = directory.path();
-    let generation = |name: &str| {
-        let path = home.join(name);
-        ZvecStorageFactory::new()
-            .open(WorkspaceIndexStorageOptions::ReadWrite {
-                storage_path: path,
-                workspace_path: home.to_owned(),
-                embedding: schema(),
-            })
-            .expect("generation")
-    };
-    let first = generation("first");
+fn file_ids_are_local_to_index_records_and_rebuilds_are_independent() {
+    let temporary = tempfile::tempdir().expect("workspace");
+    let first_home = temporary.path().join("first");
+    let second_home = temporary.path().join("second");
+    let first = open(&first_home, false);
     let (file, entry) = file_at(first.as_ref(), "src/main.rs");
-    let src = first.directory_id(Path::new("src")).expect("directory");
     first.replace_file(&file, &[entry]).expect("write");
-    first.delete_file(file.id).expect("delete");
     let reserved = first
         .resolve_file_ids(&[PathBuf::from("pending.rs")])
-        .expect("reservation")[0];
+        .expect("reserve")[0];
     first.close().expect("checkpoint");
-    let second = generation("second");
-    let ids = second
-        .resolve_file_ids(&[
-            PathBuf::from("pending.rs"),
-            PathBuf::from("src/main.rs"),
-            PathBuf::from("new.rs"),
-        ])
-        .expect("rebuild identities");
-    assert_eq!(ids[0], reserved);
-    assert_eq!(ids[1], file.id);
-    assert!(ids[2] > reserved);
+    assert!(!first_home.join("catalog").exists());
+    let reopened = open(&first_home, false);
+    assert_eq!(
+        reopened
+            .resolve_file_ids(&[PathBuf::from("src/main.rs")])
+            .expect("stored ID"),
+        [file.id]
+    );
+    // An unjournaled reservation is not a durable source record.
+    assert_eq!(
+        reopened
+            .resolve_file_ids(&[PathBuf::from("different.rs")])
+            .expect("new ID"),
+        [reserved]
+    );
+    reopened.close().expect("close");
+    let second = open(&second_home, false);
     assert_eq!(
         second
-            .directory_id(Path::new("src"))
-            .expect("same directory"),
-        src
+            .resolve_file_ids(&[PathBuf::from("unrelated.rs")])
+            .expect("new generation"),
+        [FileId::new(0)]
     );
-    let (mut mismatched, entry) = file_at(second.as_ref(), "another.rs");
-    mismatched.relative_path = crate::domain::SourcePath::new("src/main.rs").expect("source path");
-    assert!(second.replace_file(&mismatched, &[entry]).is_err());
-    second.close().expect("close rebuild");
+    second.close().expect("close");
 }
 
 #[test]
-fn missing_catalog_does_not_restart_file_id_allocation() {
-    let directory = tempfile::tempdir().expect("workspace");
-    let home = directory.path();
-    let storage = open(home, false);
+fn deleting_a_record_releases_its_path_but_never_reuses_a_live_id() {
+    let temporary = tempfile::tempdir().expect("workspace");
+    let storage = open(temporary.path(), false);
     let (file, entry) = file_at(storage.as_ref(), "src/main.rs");
-    storage.replace_file(&file, &[entry]).expect("index file");
+    storage.replace_file(&file, &[entry]).expect("write");
+    storage.delete_file(file.id).expect("delete");
+    let (replacement, entry) = file_at(storage.as_ref(), "src/main.rs");
+    assert_ne!(file.id, replacement.id);
+    storage
+        .replace_file(&replacement, &[entry])
+        .expect("replace");
+    let (mut mismatched, entry) = file_at(storage.as_ref(), "other.rs");
+    mismatched.relative_path = replacement.relative_path.clone();
+    assert!(storage.replace_file(&mismatched, &[entry]).is_err());
     storage.close().expect("checkpoint");
-    fs::remove_dir_all(home.join("catalog")).expect("simulate catalog loss");
-    let error = ZvecStorageFactory::new()
-        .open(WorkspaceIndexStorageOptions::ReadWrite {
-            storage_path: home.to_owned(),
-            workspace_path: home.to_owned(),
-            embedding: schema(),
-        })
-        .err()
-        .expect("missing identity catalog is rejected");
-    assert!(error.message().contains("identity catalog is missing"));
-    assert!(!home.join("catalog").exists());
+    let reopened = open(temporary.path(), false);
+    assert_eq!(
+        reopened
+            .resolve_file_ids(&[PathBuf::from("src/main.rs")])
+            .expect("retained"),
+        [replacement.id]
+    );
+    assert!(
+        reopened
+            .resolve_file_ids(&[PathBuf::from("new.rs")])
+            .expect("new")[0]
+            > replacement.id
+    );
+    reopened.close().expect("close");
 }
 
 #[test]
@@ -234,13 +235,7 @@ fn failed_files_retain_queryable_paths_and_directory_ownership() {
     let temporary = tempfile::tempdir().expect("workspace");
     let storage = open(temporary.path(), false);
     let (file, _) = file_at(storage.as_ref(), "src/deep/failed.rs");
-    let expected = ["src", "src/deep"].map(|path| {
-        storage
-            .directory_id(Path::new(path))
-            .expect("lookup")
-            .expect("directory")
-            .get()
-    });
+    let expected = [0, 1];
     storage
         .mark_file_failed(&file, "extraction failed")
         .expect("record failure");
@@ -259,11 +254,13 @@ fn failed_files_retain_queryable_paths_and_directory_ownership() {
         .expect("inspect files");
     let mut docs = files.iter_with_options(None, false).expect("iterator");
     let doc = docs.next().expect("failed file").expect("document");
-    assert_eq!(
-        doc.get_array_u64("ancestor_directory_ids")
-            .expect("ancestors"),
-        Some(expected.to_vec())
-    );
+    for key in expected {
+        let mut query = zvec_rust::SearchQuery::scalar(2).expect("query");
+        query
+            .set_filter(&format!("ancestor_directory_ids CONTAIN_ANY ({key})"))
+            .expect("directory filter");
+        assert_eq!(files.query(&query).expect("directory membership").len(), 1);
+    }
     assert_eq!(
         doc.get_string("file_name").expect("file name"),
         Some("failed.rs".into())
@@ -272,7 +269,7 @@ fn failed_files_retain_queryable_paths_and_directory_ownership() {
 }
 
 #[test]
-fn recovery_validates_catalog_owners_before_mutating_any_collection() {
+fn recovery_validates_source_record_owners_before_mutating_any_collection() {
     let directory = tempfile::tempdir().expect("workspace");
     let home = directory.path();
     let storage = open(home, false);
@@ -291,7 +288,6 @@ fn recovery_validates_catalog_owners_before_mutating_any_collection() {
         ZvecStorageFactory::new()
             .open(WorkspaceIndexStorageOptions::ReadOnly {
                 storage_path: home.to_owned(),
-                workspace_path: home.to_owned(),
             })
             .is_err()
     );
@@ -313,12 +309,10 @@ fn open(path: &Path, read_only: bool) -> Box<dyn WorkspaceIndexStorage> {
     let options = if read_only {
         WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: path.to_owned(),
-            workspace_path: path.to_owned(),
         }
     } else {
         WorkspaceIndexStorageOptions::ReadWrite {
             storage_path: path.to_owned(),
-            workspace_path: path.to_owned(),
             embedding: schema(),
         }
     };
@@ -359,15 +353,13 @@ fn fixture(
             file_id: id,
             range: SourceRange::File,
             content: EntityContent::Source(vec![Content::Text(text.to_owned())]),
-            metadata: Some(EntityMetadata::Code {
-                symbol_type: SymbolType::Function,
+            metadata: Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("quoted'\\name\0suffix".to_owned()),
                 scope: None,
-                node_type: None,
                 signature: None,
                 documentation: None,
-                modifiers: Vec::new(),
-            }),
+            })),
         }),
         vector,
     };
@@ -416,20 +408,26 @@ fn persists_filters_and_replaces_complete_files() {
             .search_fts(query, 10, Some(&filter))
             .expect("filtered FTS");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].fragment, entry.fragment);
+        let loaded = storage.load_search_hits(&hits).expect("FTS result details");
+        assert_eq!(loaded.fragments[&hits[0].document_id], entry.fragment);
     }
     let hits = storage
         .search_vector(&[1.0, 0.0, 0.0], 10, Some(&filter))
         .expect("filtered ANN");
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].file.id, first.id);
-    assert_eq!(hits[0].file.snapshot, first.snapshot);
-    assert!(hits[0].file.index_status.is_indexed());
+    assert_eq!(hits[0].file_id, first.id);
+    let loaded = storage.load_search_hits(&hits).expect("ANN result details");
+    let stored = &loaded.entities[&hits[0].entity_id];
+    assert_eq!(stored.file.snapshot, first.snapshot);
+    assert!(stored.file.index_status.is_indexed());
     let ranked = storage
         .search_vector(&[1.0, 0.0, 0.0], 10, None)
         .expect("ranked ANN");
     assert_eq!(ranked.len(), 2);
-    assert_eq!(ranked[0].fragment, entry.fragment);
+    let loaded = storage
+        .load_search_hits(&ranked)
+        .expect("ranked result details");
+    assert_eq!(loaded.fragments[&ranked[0].document_id], entry.fragment);
     for rejected in [
         StorageSearchFilter {
             file_ids: Some(vec![second.id]),
@@ -462,11 +460,7 @@ fn persists_filters_and_replaces_complete_files() {
         );
     }
     assert_eq!(
-        storage
-            .get_entity(entry.fragment.entity_id())
-            .expect("entity")
-            .expect("exists")
-            .entity,
+        loaded.entities[entry.fragment.entity_id()].entity,
         *entry.fragment.as_entity().expect("standalone")
     );
     let empty = StorageSearchFilter {
@@ -498,9 +492,9 @@ fn persists_filters_and_replaces_complete_files() {
     );
     assert!(
         storage
-            .get_entity(entry.fragment.entity_id())
-            .expect("old entity removed")
-            .is_none()
+            .search_vector(&entry.vector, 10, Some(&filter))
+            .expect("old vector removed")
+            .is_empty()
     );
     assert_eq!(
         storage.list_files().expect("files")[0].index_status.error(),
@@ -616,7 +610,7 @@ fn invalidates_interrupted_batches_before_serving_readers() {
         entity_count: 1,
     };
     native
-        .apply_replace(&partial, std::slice::from_ref(&replacement), &[])
+        .apply_replace(&partial, std::slice::from_ref(&replacement))
         .expect("uncheckpointed replacement");
     native.flush().expect("persist partial mutation");
     drop(native);
@@ -624,7 +618,6 @@ fn invalidates_interrupted_batches_before_serving_readers() {
     let recovery_error = ZvecStorageFactory::new()
         .open(WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: home.to_owned(),
-            workspace_path: home.to_owned(),
         })
         .err()
         .expect("recovery requires exclusive access");
@@ -665,12 +658,6 @@ fn invalidates_interrupted_batches_before_serving_readers() {
                 .expect("no partial vectors")
                 .is_empty()
         );
-        assert!(
-            reader
-                .get_entity(entry.fragment.entity_id())
-                .expect("no partial entities")
-                .is_none()
-        );
     }
     let recovered = reader.list_files().expect("recovered source metadata");
     assert_eq!(recovered.len(), 3);
@@ -693,18 +680,16 @@ fn invalidates_interrupted_batches_before_serving_readers() {
             .len(),
         1
     );
+    let hits = reader
+        .search_vector(&unaffected_entry.vector, 10, None)
+        .expect("unaffected vector");
+    assert_eq!(hits.len(), 1);
+    let loaded = reader
+        .load_search_hits(&hits)
+        .expect("unaffected result details");
     assert_eq!(
-        reader
-            .search_vector(&unaffected_entry.vector, 10, None)
-            .expect("unaffected vector")
-            .len(),
-        1
-    );
-    assert!(
-        reader
-            .get_entity(unaffected_entry.fragment.entity_id())
-            .expect("unaffected entity")
-            .is_some()
+        loaded.entities[unaffected_entry.fragment.entity_id()].entity,
+        *unaffected_entry.fragment.as_entity().expect("standalone")
     );
     reader.close().expect("close recovered reader");
     drop(acquire_storage_lock(home, false).expect("closing recovered reader releases its lock"));
@@ -718,7 +703,6 @@ fn invalidates_interrupted_batches_before_serving_readers() {
         ZvecStorageFactory::new()
             .open(WorkspaceIndexStorageOptions::ReadOnly {
                 storage_path: home.to_owned(),
-                workspace_path: home.to_owned(),
             })
             .is_err()
     );
@@ -852,7 +836,12 @@ fn changed_prepared_metadata_and_deletions_refresh_recovery_intent() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
     let storage = open(home, false);
-    let (old, _) = fixture(Some(storage.as_ref()), "source", "old orchard", vec![1.0, 0.0, 0.0]);
+    let (old, _) = fixture(
+        Some(storage.as_ref()),
+        "source",
+        "old orchard",
+        vec![1.0, 0.0, 0.0],
+    );
     storage
         .prepare_file_replacements(&[&old])
         .expect("prepare old snapshot");
@@ -1065,6 +1054,7 @@ fn retains_only_the_latest_intent_for_repeated_file_updates() {
     assert_eq!(
         pending::read(&path).expect("pending intentions"),
         PendingChanges::from([
+            (file.id, PendingChange::Delete(file.id)),
             (latest.id, PendingChange::Reindex(latest.clone())),
             (deleted.id, PendingChange::Delete(deleted.id)),
         ])
@@ -1084,12 +1074,6 @@ fn retains_only_the_latest_intent_for_repeated_file_updates() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0], latest);
     assert_eq!(files[0].index_status.indexed_epoch_ms(), None);
-    assert!(
-        reader
-            .get_entity(replacement.fragment.entity_id())
-            .expect("requires fresh fragments")
-            .is_none()
-    );
     assert!(
         reader
             .search_vector(&replacement.vector, 10, None)
@@ -1150,8 +1134,9 @@ async fn assert_failed_marker_write(prepared: bool) {
             .search_vector(&entry.vector, 10, None)
             .expect_err("failed writer cannot search vectors"),
         storage
-            .get_entity(entry.fragment.entity_id())
-            .expect_err("failed writer cannot read entities"),
+            .load_search_hits(&[])
+            .err()
+            .expect("failed writer cannot load search results"),
         storage
             .delete_file(file.id)
             .expect_err("failed writer cannot mutate"),
@@ -1190,7 +1175,12 @@ fn invalid_prepared_files_leave_the_writer_usable_and_readers_reject_preparation
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
     let storage = open(home, false);
-    let (file, entry) = fixture(Some(storage.as_ref()), "source", "orchard", vec![1.0, 0.0, 0.0]);
+    let (file, entry) = fixture(
+        Some(storage.as_ref()),
+        "source",
+        "orchard",
+        vec![1.0, 0.0, 0.0],
+    );
     let mut invalid = file.clone();
     invalid.formats.clear();
     assert!(
@@ -1302,7 +1292,6 @@ fn rejects_invalid_writes_without_poisoning_storage() {
         ZvecStorageFactory::new()
             .open(WorkspaceIndexStorageOptions::ReadOnly {
                 storage_path: home.to_owned(),
-                workspace_path: home.to_owned(),
             })
             .is_err(),
         "readers cannot open during a writer lease"
@@ -1314,7 +1303,6 @@ fn rejects_invalid_writes_without_poisoning_storage() {
         ZvecStorageFactory::new()
             .open(WorkspaceIndexStorageOptions::ReadWrite {
                 storage_path: home.to_owned(),
-                workspace_path: home.to_owned(),
                 embedding: incompatible
             })
             .is_err()
@@ -1396,7 +1384,7 @@ fn native_replacements_require_a_consistent_complete_file_state() {
         file.index_status = status;
         assert!(
             native
-                .apply_replace(&file, std::slice::from_ref(&entry), &[])
+                .apply_replace(&file, std::slice::from_ref(&entry))
                 .is_err()
         );
     }
@@ -1411,25 +1399,25 @@ fn native_replacements_require_a_consistent_complete_file_state() {
         entity_count: 1,
     };
     native
-        .apply_replace(&file, std::slice::from_ref(&entry), &[])
+        .apply_replace(&file, std::slice::from_ref(&entry))
         .expect("consistent result");
-    assert_eq!(
-        native
-            .get_entity(entry.fragment.entity_id())
-            .expect("stored entity")
-            .expect("entity exists")
-            .file,
-        file
-    );
+    let hits = native
+        .search_vector(&entry.vector, 10, None)
+        .expect("stored vector");
+    assert_eq!(hits.len(), 1);
+    let loaded = native
+        .load_search_hits(&hits)
+        .expect("stored result details");
+    assert_eq!(loaded.entities[entry.fragment.entity_id()].file, file);
     file.index_status = FileIndexStatus::NotIndexed;
     native
-        .apply_replace(&file, &[], &[])
+        .apply_replace(&file, &[])
         .expect("discard interrupted result");
     assert!(
         native
-            .get_entity(entry.fragment.entity_id())
-            .expect("no partial entity")
-            .is_none()
+            .search_vector(&entry.vector, 10, None)
+            .expect("no partial vector")
+            .is_empty()
     );
     assert_eq!(native.list_files().expect("reindex marker"), vec![file]);
 }
@@ -1453,11 +1441,9 @@ fn rejects_legacy_schemas_before_opening_collections() {
         for options in [
             WorkspaceIndexStorageOptions::ReadOnly {
                 storage_path: home.to_owned(),
-                workspace_path: home.to_owned(),
             },
             WorkspaceIndexStorageOptions::ReadWrite {
                 storage_path: home.to_owned(),
-                workspace_path: home.to_owned(),
                 embedding: schema(),
             },
         ] {
@@ -1512,13 +1498,14 @@ fn writes_fragments_across_native_batch_boundaries() {
             .len(),
         entries.len()
     );
-    assert_eq!(
-        storage
-            .search_vector(&prototype.vector, 10, Some(&filter))
-            .expect("last batch ANN")[0]
-            .fragment,
-        last.fragment
-    );
+    let hits = storage
+        .search_vector(&prototype.vector, 10, Some(&filter))
+        .expect("last batch ANN");
+    assert_eq!(hits.len(), 1);
+    let loaded = storage
+        .load_search_hits(&hits)
+        .expect("last batch result details");
+    assert_eq!(loaded.fragments[&hits[0].document_id], last.fragment);
     storage
         .replace_file(&file, &[])
         .expect("replace with empty file");
@@ -1530,9 +1517,101 @@ fn writes_fragments_across_native_batch_boundaries() {
     );
     assert!(
         storage
-            .get_entity(last.fragment.entity_id())
-            .expect("no stale entity")
-            .is_none()
+            .search_vector(&prototype.vector, 10, Some(&filter))
+            .expect("no stale vector")
+            .is_empty()
     );
     storage.close().expect("close storage");
+}
+
+#[cfg(unix)]
+#[test]
+fn reopened_readers_detect_non_unicode_names_without_loading_the_allocation_cache() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    let temporary = tempfile::tempdir().expect("workspace");
+    let storage = open(temporary.path(), false);
+    let (mut file, _) = fixture(None, "native", "source", vec![1.0, 0.0, 0.0]);
+    file.relative_path =
+        SourcePath::new(OsString::from_vec(b"src/\xff.rs".to_vec())).expect("native path");
+    file.id = storage
+        .resolve_file_ids(&[file.relative_path.to_path_buf()])
+        .expect("ID")[0];
+    storage
+        .mark_file_failed(&file, "fixture")
+        .expect("file record");
+    assert!(storage.has_non_unicode_file_names().expect("writer"));
+    storage.close().expect("checkpoint");
+    let reader = open(temporary.path(), true);
+    assert!(reader.has_non_unicode_file_names().expect("reader"));
+    reader.close().expect("close");
+    let writer = open(temporary.path(), false);
+    writer.delete_file(file.id).expect("delete");
+    writer.close().expect("checkpoint");
+    let reader = open(temporary.path(), true);
+    assert!(!reader.has_non_unicode_file_names().expect("empty reader"));
+    reader.close().expect("close");
+}
+
+#[test]
+fn directory_filters_rebuild_missing_cache_and_recovery_ignores_stale_cache() {
+    use super::super::directories::CACHE_NAME;
+    let home = tempfile::tempdir().expect("workspace");
+    let storage = open(home.path(), false);
+    let (file, entry) = file_at(storage.as_ref(), "src/nested/file.rs");
+    storage
+        .replace_file(&file, &[entry])
+        .expect("indexed source");
+    storage.close().expect("checkpoint");
+    let cache = home.path().join("storage").join(CACHE_NAME);
+    let filter = StorageSearchFilter {
+        path: Some(StoragePathFilter::Directory(
+            crate::domain::SourcePath::new("src").expect("path"),
+        )),
+        ..StorageSearchFilter::default()
+    };
+    for corrupt in [false, true] {
+        if corrupt {
+            fs::write(&cache, b"invalid cache").expect("corrupt cache");
+        } else {
+            fs::remove_file(&cache).expect("remove cache");
+        }
+        let reader = open(home.path(), true);
+        assert_eq!(
+            reader
+                .search_fts("orchard", 10, Some(&filter))
+                .expect("directory query")
+                .len(),
+            1
+        );
+        reader.close().expect("close reader");
+    }
+    // A valid but stale cache must never override source membership during recovery.
+    fs::write(
+        &cache,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "directories": [[999, super::super::path::encode_path(&crate::domain::SourcePath::new("src").expect("path")).expect("encoded path")]]
+        })).expect("valid stale cache"),
+    )
+    .expect("stale cache");
+    pending::write(
+        &home.path().join("storage"),
+        &PendingChanges::from([(file.id, PendingChange::reindex(&file))]),
+    )
+    .expect("intent");
+    let writer = open(home.path(), false);
+    let (_, entry) = file_at(writer.as_ref(), "src/nested/file.rs");
+    writer
+        .replace_file(&file, &[entry])
+        .expect("reindex source");
+    writer.close().expect("checkpoint recovered source");
+    let reader = open(home.path(), true);
+    assert_eq!(
+        reader
+            .search_fts("orchard", 10, Some(&filter))
+            .expect("recovered directory query")
+            .len(),
+        1
+    );
+    reader.close().expect("close reader");
 }

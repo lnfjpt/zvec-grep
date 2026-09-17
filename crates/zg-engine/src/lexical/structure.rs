@@ -6,7 +6,8 @@ use std::{
 
 use crate::{
     domain::{
-        EntityId, EntityMetadata, FileCategory, FileFormat, SourcePath, SourceRange, TextRange,
+        CodeMetadata, EntityId, EntityMetadata, FileCategory, FileFormat, MarkdownMetadata,
+        SourcePath, SourceRange, TextRange,
     },
     extraction::{ChunkOptions, ExtractedFragment, TextSource, extract},
     utils::{decode_text, sha256_hex_parts},
@@ -54,10 +55,15 @@ pub(crate) struct LexicalContainer {
 }
 
 struct StructuralFragment {
+    entity_index: usize,
     entity_id: EntityId,
     document_id: String,
     range: SourceRange,
-    metadata: Option<EntityMetadata>,
+}
+
+struct StructuralSource {
+    fragments: Vec<StructuralFragment>,
+    metadata: HashMap<usize, EntityMetadata>,
 }
 
 pub(crate) fn enrich_lexical_matches_with_structure(
@@ -97,7 +103,7 @@ pub(crate) fn enrich_lexical_matches_with_structure(
             Some(LexicalContainer {
                 entity_id: container.entity_id.clone(),
                 range: container.range,
-                metadata: container.metadata.clone(),
+                metadata: source.metadata.get(&container.entity_index).cloned(),
             })
         } else {
             None
@@ -137,7 +143,7 @@ fn parse_structural_source(
     root: &Path,
     absolute_path: &Path,
     explicit_max_size: Option<u64>,
-) -> Option<Vec<StructuralFragment>> {
+) -> Option<StructuralSource> {
     // Direct lexical searches may target a single file or files outside the requested root.
     // Use the filename as the relative path when the requested root is not a parent.
     let relative_path = match absolute_path.strip_prefix(root) {
@@ -173,76 +179,94 @@ fn parse_structural_source(
         text,
     };
     let fragments = extract(&source, ChunkOptions::default()).ok()?;
-    let structural = namespace_lexical_fragments(&fragments, &namespace)
-        .into_iter()
-        .filter(|fragment| fragment.metadata.is_some())
-        .collect::<Vec<_>>();
-    if structural.is_empty() {
+    let structural = namespace_lexical_fragments(fragments, &namespace);
+    if structural.fragments.is_empty() {
         return None;
     }
     Some(structural)
 }
 
 fn namespace_lexical_fragments(
-    fragments: &[ExtractedFragment],
+    fragments: Vec<ExtractedFragment>,
     namespace: &str,
-) -> Vec<StructuralFragment> {
+) -> StructuralSource {
     let mut entities = HashMap::<usize, EntityId>::new();
-    fragments
-        .iter()
-        .enumerate()
-        .map(|(ordinal, fragment)| {
-            let next_entity = (entities.len() as u64).to_le_bytes();
-            let entity_id = entities
-                .entry(fragment.entity_index())
-                .or_insert_with(|| {
-                    EntityId::new(sha256_hex_parts([
+    let mut metadata = HashMap::new();
+    let mut fragments: Vec<_> =
+        fragments
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, fragment)| {
+                let entity_index = fragment.entity_index();
+                let next_entity = (entities.len() as u64).to_le_bytes();
+                let entity_id = entities
+                    .entry(fragment.entity_index())
+                    .or_insert_with(|| {
+                        EntityId::new(sha256_hex_parts([
+                            namespace.as_bytes(),
+                            b"\0entity\0",
+                            &next_entity,
+                        ]))
+                        .expect("SHA-256 produces a nonempty entity ID")
+                    })
+                    .clone();
+                let document_id = match &fragment {
+                    ExtractedFragment::Standalone(_) | ExtractedFragment::Representative(_) => {
+                        entity_id.as_str().to_owned()
+                    }
+                    ExtractedFragment::Window(_) => sha256_hex_parts([
                         namespace.as_bytes(),
-                        b"\0entity\0",
-                        &next_entity,
-                    ]))
-                    .expect("SHA-256 produces a nonempty entity ID")
-                })
-                .clone();
-            let document_id = match fragment {
-                ExtractedFragment::Standalone(_) | ExtractedFragment::Representative(_) => {
-                    entity_id.as_str().to_owned()
+                        b"\0window\0",
+                        &(ordinal as u64).to_le_bytes(),
+                    ]),
+                };
+                let range = *fragment.range();
+                if let ExtractedFragment::Standalone(entity)
+                | ExtractedFragment::Representative(entity) = fragment
+                    && let Some(value) = entity.metadata
+                {
+                    metadata.insert(entity_index, value);
                 }
-                ExtractedFragment::Window(_) => sha256_hex_parts([
-                    namespace.as_bytes(),
-                    b"\0window\0",
-                    &(ordinal as u64).to_le_bytes(),
-                ]),
-            };
-            StructuralFragment {
-                entity_id,
-                document_id,
-                range: *fragment.range(),
-                metadata: fragment.metadata().cloned(),
-            }
-        })
-        .collect()
+                StructuralFragment {
+                    entity_index,
+                    entity_id,
+                    document_id,
+                    range,
+                }
+            })
+            .collect();
+    fragments.retain(|fragment| metadata.contains_key(&fragment.entity_index));
+    StructuralSource {
+        fragments,
+        metadata,
+    }
 }
 
 fn smallest_containing_fragment<'fragment>(
-    fragments: &'fragment [StructuralFragment],
+    source: &'fragment StructuralSource,
     inner: &TextRange,
 ) -> Option<&'fragment StructuralFragment> {
-    fragments
+    source
+        .fragments
         .iter()
         .filter(
             |fragment| matches!(&fragment.range, SourceRange::Text(outer) if outer.contains(inner)),
         )
-        .min_by(|left, right| compare_fragment_container(left, right))
+        .min_by(|left, right| compare_fragment_container(source, left, right))
 }
 
 fn compare_fragment_container(
+    source: &StructuralSource,
     left: &StructuralFragment,
     right: &StructuralFragment,
 ) -> std::cmp::Ordering {
     fragment_byte_span(left)
         .cmp(&fragment_byte_span(right))
-        .then_with(|| fragment_specificity(right).cmp(&fragment_specificity(left)))
+        .then_with(|| {
+            metadata_specificity(source.metadata.get(&right.entity_index)).cmp(
+                &metadata_specificity(source.metadata.get(&left.entity_index)),
+            )
+        })
         .then_with(|| left.document_id.cmp(&right.document_id))
 }
 
@@ -255,16 +279,18 @@ fn fragment_byte_span(fragment: &StructuralFragment) -> usize {
     }
 }
 
-fn fragment_specificity(fragment: &StructuralFragment) -> u8 {
-    match &fragment.metadata {
-        Some(EntityMetadata::Code { symbol_name, .. }) => {
+fn metadata_specificity(metadata: Option<&EntityMetadata>) -> u8 {
+    match metadata {
+        Some(EntityMetadata::Code(CodeMetadata { symbol_name, .. })) => {
             if symbol_name.is_some() {
                 2
             } else {
                 1
             }
         }
-        Some(EntityMetadata::Markdown { heading, .. }) => u8::from(heading.is_some()),
+        Some(EntityMetadata::Markdown(MarkdownMetadata { heading, .. })) => {
+            u8::from(heading.is_some())
+        }
         None => 0,
     }
 }
@@ -279,7 +305,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::domain::{EntityMetadata, TextRange};
+    use crate::domain::{CodeMetadata, EntityMetadata, MarkdownMetadata, TextRange};
     use crate::lexical::types::LexicalMatch;
 
     use super::{
@@ -325,7 +351,7 @@ mod tests {
                 .container
                 .as_ref()
                 .and_then(|container| container.metadata.as_ref()),
-            Some(EntityMetadata::Code { symbol_name, .. }) if symbol_name.as_deref() == Some("greet")
+            Some(EntityMetadata::Code(CodeMetadata { symbol_name, .. })) if symbol_name.as_deref() == Some("greet")
         ));
         assert_eq!(
             result.diagnostics.source,
@@ -429,11 +455,38 @@ mod tests {
                 b"\0",
                 directory.path().join(path).as_os_str().as_encoded_bytes(),
             ]);
-            super::namespace_lexical_fragments(&fragments, &namespace)[0]
+            super::namespace_lexical_fragments(fragments.clone(), &namespace).fragments[0]
                 .entity_id
                 .clone()
         });
         assert_ne!(identities[0], identities[1]);
+    }
+
+    #[test]
+    fn enriches_window_matches_with_their_owners_metadata() {
+        let directory = tempdir().expect("workspace");
+        let line = "A long section contains the needle and enough text for several windows.";
+        let text = format!("# Shared heading\n\n{}", format!("{line}\n").repeat(200));
+        fs::write(directory.path().join("section.md"), &text).expect("markdown fixture");
+        let result = enrich_lexical_matches_with_structure(
+            directory.path(),
+            vec![lexical_item(directory.path(), "section.md", 150, line)],
+            None,
+        );
+        let container = result.items[0]
+            .container
+            .as_ref()
+            .expect("window container");
+        assert!(matches!(
+            &container.metadata,
+            Some(EntityMetadata::Markdown(MarkdownMetadata { heading: Some(heading), .. }))
+                if heading == "Shared heading"
+        ));
+        let crate::domain::SourceRange::Text(range) = container.range else {
+            panic!("text window expected");
+        };
+        assert!(range.start_line() > 1);
+        assert!(range.contains(&result.items[0].matched.range));
     }
 
     #[test]
@@ -450,7 +503,7 @@ mod tests {
                 .container
                 .as_ref()
                 .and_then(|container| container.metadata.as_ref()),
-            Some(EntityMetadata::Markdown { heading, .. }) if heading.as_deref() == Some("Large section")
+            Some(EntityMetadata::Markdown(MarkdownMetadata { heading, .. })) if heading.as_deref() == Some("Large section")
         ));
 
         let skipped = enrich_lexical_matches_with_structure(directory.path(), items, Some(8));
@@ -476,7 +529,7 @@ mod tests {
         for (item, expected) in result.items.iter().zip(["alpha", "beta"]) {
             assert!(matches!(
                 item.container.as_ref().and_then(|container| container.metadata.as_ref()),
-                Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == expected
+                Some(EntityMetadata::Code(CodeMetadata { symbol_name: Some(name), .. })) if name == expected
             ));
         }
     }
@@ -505,7 +558,7 @@ mod tests {
         let container = enriched.container.as_ref().expect("matched function");
         assert!(matches!(
             container.metadata.as_ref(),
-            Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == "beta"
+            Some(EntityMetadata::Code(CodeMetadata { symbol_name: Some(name), .. })) if name == "beta"
         ));
         assert!(
             container

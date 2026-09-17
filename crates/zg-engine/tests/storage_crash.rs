@@ -140,8 +140,16 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
 
     // The killed writer has released every native handle. Read durable logical
     // identities before engine recovery; never open a parent handle before spawn.
-    let catalog_home = root.join(".zvec-grep/catalog");
-    let identities_before_recovery = catalog_identities(&catalog_home)?;
+    let mut identities_before_recovery = index_identities(&index_path)?;
+    // New records may exist only in durable write intent until recovery.
+    for source in &pending_sources {
+        let path = PathBuf::from(source_name(source));
+        let id = u32::try_from(source["value"]["id"].as_u64().expect("pending file ID"))?;
+        if let Some(existing) = identities_before_recovery.files.insert(path, id) {
+            assert_eq!(existing, id, "intent preserves an existing source identity");
+        }
+    }
+    assert!(!root.join(".zvec-grep/catalog").exists());
     let directory_ids = &identities_before_recovery.directories;
     assert_eq!(identities_before_recovery.files.len(), TOTAL_FILES);
     assert_eq!(directory_ids.len(), 2);
@@ -196,7 +204,8 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
         .iter()
         .map(|file| {
             (
-                file["value"]["id"].as_u64().expect("numeric file ID"),
+                u32::try_from(file["value"]["id"].as_u64().expect("numeric file ID"))
+                    .expect("u32 file ID"),
                 PathBuf::from(source_name(file)),
             )
         })
@@ -212,7 +221,7 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
             .map(|(id, path)| (path.clone(), *id))
             .collect::<BTreeMap<_, _>>(),
         identities_before_recovery.files,
-        "recovered file records retain their catalog identities"
+        "recovered file records retain source and journal identities"
     );
     let file_documents = native_documents(&index_path.join("files"))?;
     // Recovery restores NotIndexed rows as well as their directory projection.
@@ -224,7 +233,7 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
             .is_some_and(|parent| !parent.as_os_str().is_empty())
     }));
     assert_eq!(
-        catalog_identities(&catalog_home)?,
+        index_identities(&index_path)?,
         identities_before_recovery,
         "recovery preserves every allocated file and directory ID"
     );
@@ -238,7 +247,7 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
             )
             .expect("file JSON");
             indexed_names.contains(&source_name(&file)).then(|| {
-                doc.get_u64("file_id")
+                doc.get_u32("file_id")
                     .expect("numeric file ID")
                     .expect("file identity")
             })
@@ -256,7 +265,7 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
             let file_ids = documents
                 .iter()
                 .map(|doc| {
-                    doc.get_u64("file_id")
+                    doc.get_u32("file_id")
                         .expect("numeric file ID")
                         .expect("document file identity")
                 })
@@ -333,7 +342,7 @@ async fn recovers_only_the_uncheckpointed_batch_after_process_termination() -> T
         directory_ids,
     )?;
     assert_eq!(
-        catalog_identities(&catalog_home)?,
+        index_identities(&index_path)?,
         identities_before_recovery,
         "recovery and reindex preserve every allocated file and directory ID"
     );
@@ -354,41 +363,55 @@ fn fixture_source_path(index: usize) -> PathBuf {
 
 #[derive(Debug, Eq, PartialEq)]
 struct IdentitySnapshot {
-    files: BTreeMap<PathBuf, u64>,
-    directories: BTreeMap<PathBuf, u64>,
+    files: BTreeMap<PathBuf, u32>,
+    directories: BTreeMap<PathBuf, u32>,
 }
 
-fn catalog_identities(home: &Path) -> TestResult<IdentitySnapshot> {
-    Ok(IdentitySnapshot {
-        files: identity_paths(&home.join("file_identities"))?,
-        directories: identity_paths(&home.join("directories"))?,
-    })
-}
-
-fn identity_paths(collection: &Path) -> TestResult<BTreeMap<PathBuf, u64>> {
-    let mut identities = BTreeMap::new();
+fn index_identities(home: &Path) -> TestResult<IdentitySnapshot> {
+    let mut files = BTreeMap::new();
+    let mut directories = BTreeMap::new();
     let mut ids = BTreeSet::new();
-    for doc in native_documents(collection)? {
-        let id = doc.get_u64("id")?.expect("numeric catalog identity");
+    for doc in native_documents(&home.join("files"))? {
+        let id = doc.get_u32("file_id")?.expect("numeric source identity");
         let path: Value = serde_json::from_str(&doc.get_string("path")?.expect("native path"))?;
         assert_eq!(path["encoding"], "utf8");
         let path = PathBuf::from(path["value"].as_str().expect("UTF-8 fixture path"));
-        assert!(ids.insert(id), "catalog IDs must be unique");
+        let mut ancestors = path
+            .ancestors()
+            .skip(1)
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect::<Vec<_>>();
+        ancestors.reverse();
+        let membership = doc
+            .get_array_u32("ancestor_directory_ids")?
+            .unwrap_or_default();
+        assert_eq!(ancestors.len(), membership.len());
+        for (path, directory_id) in ancestors.into_iter().zip(membership) {
+            if let Some(existing) = directories.insert(path.to_path_buf(), directory_id) {
+                assert_eq!(existing, directory_id, "shared ancestors have one ID");
+            }
+        }
+        assert!(ids.insert(id), "source IDs must be unique");
         assert!(
-            identities.insert(path, id).is_none(),
-            "catalog paths must be unique"
+            files.insert(path, id).is_none(),
+            "source paths must be unique"
         );
     }
-    Ok(identities)
+    assert_eq!(
+        directories.values().collect::<BTreeSet<_>>().len(),
+        directories.len(),
+        "directory IDs must be unique"
+    );
+    Ok(IdentitySnapshot { files, directories })
 }
 
 fn assert_document_file_metadata(
     documents: &[zvec_rust::Doc],
-    file_paths: &BTreeMap<u64, PathBuf>,
-    directory_ids: &BTreeMap<PathBuf, u64>,
+    file_paths: &BTreeMap<u32, PathBuf>,
+    directory_ids: &BTreeMap<PathBuf, u32>,
 ) -> TestResult {
     for document in documents {
-        let id = document.get_u64("file_id")?.expect("numeric file ID");
+        let id = document.get_u32("file_id")?.expect("numeric file ID");
         let path = file_paths.get(&id).expect("registered file owner");
         assert_eq!(
             document.get_string("file_name")?.as_deref(),
@@ -406,7 +429,7 @@ fn assert_document_file_metadata(
         // zvec-rust's pointer getter represents an empty array as None.
         assert_eq!(
             document
-                .get_array_u64("ancestor_directory_ids")?
+                .get_array_u32("ancestor_directory_ids")?
                 .unwrap_or_default(),
             ancestors,
             "{}: root files have no ancestors; nested files retain the complete ancestry",

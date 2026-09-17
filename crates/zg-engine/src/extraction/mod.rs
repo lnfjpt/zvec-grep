@@ -21,14 +21,14 @@ pub(crate) use spi::{
 
 use crate::{
     EngineError,
-    domain::{Content, FileFormat, TextRange},
+    domain::{Content, EntityMetadata, FileFormat, TextRange},
 };
 
 // Shared implementation helpers used by the format-specific extractors.
-use service::{chunk_options_for_metadata, fit_text_to_chars, symbol_type_name, validate_formats};
+use service::{chunk_options_for_metadata, fit_text_to_chars, validate_formats};
 
 #[cfg(test)]
-use service::{test_content, test_source};
+use service::{test_content, test_metadata, test_source};
 
 pub(crate) fn source_kind(formats: &[FileFormat]) -> Option<SourceKind> {
     service::source_kind(formats)
@@ -50,8 +50,9 @@ pub(crate) fn extract_for_indexing<'source>(
 
 pub(crate) fn vector_content_for_fragment(
     fragment: &ExtractedFragment,
+    metadata: Option<&EntityMetadata>,
     embedding_content: Option<&[Content]>,
     max_chars: Option<usize>,
 ) -> Vec<Content> {
-    service::vector_content_for_fragment(fragment, embedding_content, max_chars)
+    service::vector_content_for_fragment(fragment, metadata, embedding_content, max_chars)
 }

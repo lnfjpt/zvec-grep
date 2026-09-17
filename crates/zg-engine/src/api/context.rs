@@ -137,6 +137,7 @@ pub mod options {
 
 /// Values returned by [`crate::ZvecGrep::context`].
 pub mod result {
+    pub use crate::domain::{CodeMetadata, EntityMetadata, MarkdownMetadata};
     pub use crate::lexical::structure::{
         StructureEnrichmentDiagnostics, StructureEnrichmentSource,
     };
@@ -148,8 +149,6 @@ pub mod result {
     use std::path::PathBuf;
 
     use serde::{Deserialize, Serialize};
-
-    use super::options::SymbolType;
 
     #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
     pub struct ContextResult {
@@ -338,25 +337,6 @@ pub mod result {
             end_offset: u64,
         },
     }
-
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    #[serde(rename_all = "snake_case", tag = "kind")]
-    pub enum EntityMetadata {
-        Code {
-            symbol_type: SymbolType,
-            symbol_name: Option<String>,
-            scope: Option<String>,
-            node_type: Option<String>,
-            signature: Option<String>,
-            documentation: Option<String>,
-            modifiers: Vec<String>,
-        },
-        Markdown {
-            heading: Option<String>,
-            level: Option<usize>,
-            scope: Option<String>,
-        },
-    }
 }
 
 impl From<crate::domain::SourceRange> for result::ContentRange {
@@ -398,55 +378,16 @@ impl From<&crate::domain::TextRange> for result::ContentRange {
     }
 }
 
-impl From<crate::domain::EntityMetadata> for result::EntityMetadata {
-    fn from(metadata: crate::domain::EntityMetadata) -> Self {
-        match metadata {
-            crate::domain::EntityMetadata::Code {
-                symbol_type,
-                symbol_name,
-                scope,
-                node_type,
-                signature,
-                documentation,
-                modifiers,
-            } => Self::Code {
-                symbol_type,
-                symbol_name,
-                scope,
-                node_type,
-                signature,
-                documentation,
-                modifiers,
-            },
-            crate::domain::EntityMetadata::Markdown {
-                heading,
-                level,
-                scope,
-            } => Self::Markdown {
-                heading,
-                level,
-                scope,
-            },
-        }
-    }
-}
-
-impl From<&crate::domain::EntityMetadata> for result::EntityMetadata {
-    fn from(metadata: &crate::domain::EntityMetadata) -> Self {
-        metadata.clone().into()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use crate::domain::{ByteRange, EntityMetadata, SourceRange, SymbolType, TextRange};
+    use crate::domain::{ByteRange, SourceRange, TextRange};
 
     use super::result;
 
     #[test]
-    fn domain_values_preserve_public_wire_coordinates_and_metadata() {
+    fn domain_ranges_preserve_public_wire_coordinates() {
         let file: result::ContentRange = SourceRange::File.into();
         assert_eq!(
             serde_json::to_value(file).expect("file range"),
@@ -481,23 +422,6 @@ mod tests {
                 "kind": "text", "start_line": 2, "end_line": 2,
                 "start_byte_offset": 9, "end_byte_offset": 12,
                 "start_byte_column": 3, "end_byte_column": 6,
-            })
-        );
-        let metadata: result::EntityMetadata = EntityMetadata::Code {
-            symbol_type: SymbolType::Function,
-            symbol_name: Some("calculate".to_owned()),
-            scope: None,
-            node_type: None,
-            signature: None,
-            documentation: None,
-            modifiers: vec!["public".to_owned()],
-        }
-        .into();
-        assert_eq!(
-            serde_json::to_value(metadata).expect("metadata"),
-            json!({
-                "kind": "code", "symbol_type": "function", "symbol_name": "calculate", "scope": null,
-                "node_type": null, "signature": null, "documentation": null, "modifiers": ["public"],
             })
         );
     }

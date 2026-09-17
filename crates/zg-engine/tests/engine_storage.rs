@@ -18,14 +18,112 @@ use zg_engine::{
     api::{
         context::{
             ContextOptions,
-            options::{ContextRoute, ContextRouteMode},
-            result::ContextItemStatus,
+            options::{ContextRoute, ContextRouteMode, SymbolType},
+            result::{ContextItemStatus, EntityMetadata},
         },
         index::{IndexOptions, options::WorkspaceChange},
     },
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[tokio::test]
+async fn public_symbol_filters_distinguish_all_categories_and_implementation_blocks() -> TestResult
+{
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(root, server.address)?;
+    fs::write(
+        root.join("symbols.rs"),
+        r"/// orchard module
+pub mod catalog {
+    /// orchard class
+    pub struct Model { pub count: u32 }
+    /// orchard enum
+    pub enum Status { Ready, Waiting }
+    /// orchard interface
+    pub trait Contract { fn execute(&self); }
+    /// orchard alias
+    pub type Handle = Model;
+    /// orchard value
+    pub const LIMIT: u32 = 10;
+    /// orchard implementation
+    impl Model {
+        /// orchard function
+        pub fn execute(&self) {}
+    }
+}
+",
+    )?;
+    let engine = ZvecGrep::new();
+    assert_eq!(engine.index(index_options(root)).await?.files_failed, 0);
+    for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
+        for symbol_type in [
+            SymbolType::Alias,
+            SymbolType::Class,
+            SymbolType::Enum,
+            SymbolType::Function,
+            SymbolType::Interface,
+            SymbolType::Module,
+            SymbolType::Value,
+        ] {
+            let result = engine
+                .context(ContextOptions {
+                    root: Some(root.to_path_buf()),
+                    routes: vec![ContextRoute {
+                        mode,
+                        query: "orchard".into(),
+                    }],
+                    symbol_types: vec![symbol_type],
+                    limit: Some(30),
+                    auto_update: false,
+                    allow_remote: true,
+                    ..ContextOptions::default()
+                })
+                .await?;
+            assert!(!result.items.is_empty(), "{mode:?}: {symbol_type:?}");
+            assert!(result.items.iter().all(|item| matches!(
+                &item.metadata,
+                Some(EntityMetadata::Code(metadata)) if metadata.symbol_type == Some(symbol_type)
+            )));
+            if symbol_type == SymbolType::Class {
+                for signature in ["pub struct Model", "impl Model"] {
+                    assert!(
+                        result.items.iter().any(|item| matches!(
+                            &item.metadata,
+                            Some(EntityMetadata::Code(metadata))
+                                if metadata.signature.as_deref() == Some(signature)
+                        )),
+                        "{mode:?}: {signature}"
+                    );
+                }
+            }
+        }
+    }
+    let unfiltered = engine
+        .context(ContextOptions {
+            root: Some(root.to_path_buf()),
+            routes: vec![ContextRoute {
+                mode: ContextRouteMode::Fts,
+                query: "orchard".into(),
+            }],
+            limit: Some(30),
+            auto_update: false,
+            allow_remote: true,
+            ..ContextOptions::default()
+        })
+        .await?;
+    assert!(unfiltered.items.iter().any(|item| matches!(
+        &item.metadata,
+        Some(EntityMetadata::Code(metadata))
+            if metadata.signature.as_deref() == Some("impl Model")
+                && metadata.symbol_type == Some(SymbolType::Class)
+    )));
+    engine.drop_index(info_options(root)).await?;
+    engine.close();
+    Ok(())
+}
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -681,4 +779,94 @@ async fn fts_paths(
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+#[tokio::test]
+async fn version_four_requires_explicit_rebuild_to_version_five() -> TestResult {
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(root, server.address)?;
+    fs::write(root.join("one.txt"), "Orchard first source.")?;
+    fs::write(root.join("two.txt"), "Orchard second source.")?;
+    let engine = ZvecGrep::new();
+    engine.index(index_options(root)).await?;
+    let before = engine.info(info_options(root)).await?;
+    assert_eq!(
+        before
+            .workspace_index
+            .as_ref()
+            .expect("workspace")
+            .index_version,
+        Some(5)
+    );
+    let manifest_path = before.home.join("manifest.json");
+    let mut old: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    old["indexVersion"] = json!(4);
+    let old_manifest = serde_json::to_vec(&old)?;
+    fs::write(&manifest_path, &old_manifest)?;
+    let schema_path = before.index_path.join("schema.json");
+    let mut schema: Value = serde_json::from_slice(&fs::read(&schema_path)?)?;
+    schema["version"] = json!(0);
+    fs::write(&schema_path, serde_json::to_vec(&schema)?)?;
+    let inputs = server.inputs.load(Ordering::Acquire);
+    let error = engine
+        .index(index_options(root))
+        .await
+        .expect_err("no automatic upgrade");
+    assert!(error.message().contains("zg index --rebuild"));
+    let error = engine
+        .context(ContextOptions {
+            root: Some(root.to_path_buf()),
+            routes: vec![ContextRoute {
+                mode: ContextRouteMode::Fts,
+                query: "orchard".into(),
+            }],
+            auto_update: true,
+            allow_remote: true,
+            ..ContextOptions::default()
+        })
+        .await
+        .expect_err("query refresh must not upgrade the format");
+    assert!(error.message().contains("zg index --rebuild"));
+    assert_eq!(fs::read(&manifest_path)?, old_manifest);
+    assert!(before.index_path.exists());
+    assert!(!before.home.join("build.json").exists());
+    assert_eq!(server.inputs.load(Ordering::Acquire), inputs);
+    let result = engine
+        .index(IndexOptions {
+            rebuild: true,
+            ..index_options(root)
+        })
+        .await?;
+    assert_eq!(result.files_added, 2);
+    let after = engine.info(info_options(root)).await?;
+    assert_eq!(
+        after
+            .workspace_index
+            .as_ref()
+            .expect("workspace")
+            .index_version,
+        Some(5)
+    );
+    assert_eq!(after.status.as_ref().expect("status").files_indexed, 2);
+    assert_ne!(after.index_path, before.index_path);
+    assert!(!before.index_path.exists());
+    let current: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    for field in [
+        "name",
+        "root",
+        "discovery",
+        "embeddingRuntime",
+        "createdTime",
+    ] {
+        assert_eq!(current[field], old[field], "{field}");
+    }
+    assert_eq!(engine.index(index_options(root)).await?.files_unchanged, 2);
+    assert_eq!(
+        engine.info(info_options(root)).await?.index_path,
+        after.index_path
+    );
+    engine.close();
+    Ok(())
 }

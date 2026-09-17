@@ -7,6 +7,7 @@ use ignore::overrides::{Override, OverrideBuilder};
 
 use crate::{
     EngineError,
+    domain::SourcePath,
     storage::spi::{StoragePathFilter, WorkspaceIndexStorage},
 };
 
@@ -71,7 +72,7 @@ impl<'a> GlobFilter<'a> {
                 let Some(directory) = recursive_directory(pattern) else {
                     return Ok(None);
                 };
-                excludes.push(directory_filter(storage, directory)?);
+                excludes.push(directory_filter(directory)?);
                 has_exclusion = true;
             } else {
                 // Re-inclusion depends on which parent directories a later
@@ -79,7 +80,7 @@ impl<'a> GlobFilter<'a> {
                 if has_exclusion {
                     return Ok(None);
                 }
-                let Some((predicate, name)) = positive_filter(storage, pattern)? else {
+                let Some((predicate, name)) = positive_filter(pattern)? else {
                     return Ok(None);
                 };
                 uses_file_name |= name;
@@ -87,7 +88,7 @@ impl<'a> GlobFilter<'a> {
             }
         }
         if uses_file_name && storage.has_non_unicode_file_names()? {
-            // The catalog retains native paths. Lossy STRING metadata must
+            // Source records retain native paths. Lossy STRING metadata must
             // never determine the result for a non-Unicode basename.
             return Ok(None);
         }
@@ -108,15 +109,12 @@ fn glob_error(error: &ignore::Error) -> EngineError {
     EngineError::invalid_argument(format!("invalid ripgrep glob: {error}"))
 }
 
-fn positive_filter(
-    storage: &dyn WorkspaceIndexStorage,
-    pattern: &str,
-) -> Result<Option<(StoragePathFilter, bool)>, EngineError> {
+fn positive_filter(pattern: &str) -> Result<Option<(StoragePathFilter, bool)>, EngineError> {
     if matches!(pattern, "*" | "**" | "**/*") {
         return Ok(Some((StoragePathFilter::All, false)));
     }
     if let Some(directory) = recursive_directory(pattern) {
-        return Ok(Some((directory_filter(storage, directory)?, false)));
+        return Ok(Some((directory_filter(directory)?, false)));
     }
     // **/foo and foo both match basenames at any depth.
     let unanchored = pattern.strip_prefix("**/").unwrap_or(pattern);
@@ -128,7 +126,7 @@ fn positive_filter(
         && let Some(predicate) = file_name_filter(basename)
     {
         return Ok(Some((
-            all(vec![directory_filter(storage, directory)?, predicate]),
+            all(vec![directory_filter(directory)?, predicate]),
             true,
         )));
     }
@@ -148,14 +146,11 @@ fn literal_directory(directory: &str) -> bool {
             .all(|part| literal_name(part) && !matches!(part, "." | ".."))
 }
 
-fn directory_filter(
-    storage: &dyn WorkspaceIndexStorage,
-    directory: &str,
-) -> Result<StoragePathFilter, EngineError> {
+fn directory_filter(directory: &str) -> Result<StoragePathFilter, EngineError> {
     let directory = directory.strip_prefix('/').unwrap_or(directory);
-    Ok(storage
-        .directory_id(Path::new(directory))?
-        .map_or(StoragePathFilter::None, StoragePathFilter::Directory))
+    Ok(StoragePathFilter::Directory(SourcePath::new(Path::new(
+        directory,
+    ))?))
 }
 
 fn file_name_filter(pattern: &str) -> Option<StoragePathFilter> {

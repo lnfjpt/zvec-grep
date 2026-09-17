@@ -6,7 +6,9 @@ use tree_sitter::{Language, Node, Parser};
 
 use crate::{
     EngineError,
-    domain::{Content, EntityContent, EntityMetadata, FileFormat, SourceRange, SymbolType},
+    domain::{
+        CodeMetadata, Content, EntityContent, EntityMetadata, FileFormat, SourceRange, SymbolType,
+    },
     utils::{
         byte_offset_at_utf16_ceil, byte_offset_at_utf16_floor, collapse_whitespace,
         line_byte_offsets, take_utf16, utf16_len,
@@ -16,7 +18,7 @@ use crate::{
 use self::adapter::{LanguageAdapter, named_children, resolve_adapter, text};
 use super::{
     ChunkOptions, ExtractedEntity, ExtractedFragment, ExtractedWindow, IndexingExtractionFragment,
-    TextRange, TextSource, chunk_options_for_metadata, fit_text_to_chars, symbol_type_name,
+    TextRange, TextSource, chunk_options_for_metadata, fit_text_to_chars,
     text::extract_plain_text_fragments, validate_formats,
 };
 
@@ -157,11 +159,10 @@ fn fallback(
 struct CodeEntity<'tree> {
     node: Node<'tree>,
     name: Option<String>,
-    symbol_type: SymbolType,
+    symbol_type: Option<SymbolType>,
     breadcrumb: Vec<String>,
     signature: Option<String>,
     documentation: Option<String>,
-    modifiers: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -176,7 +177,6 @@ struct CodeFragmentOutput {
     starts_group: bool,
     range: SourceRange,
     content: Content,
-    metadata: EntityMetadata,
     embedding_text: Option<String>,
 }
 
@@ -197,11 +197,10 @@ fn walk_code_node<'tree>(
                 out.push(CodeEntity {
                     node: entity,
                     name,
-                    symbol_type: adapter.classify(entity, source, &entity_breadcrumb),
+                    symbol_type: adapter.classify(entity),
                     breadcrumb: entity_breadcrumb,
                     signature: adapter.extract_signature(entity, source),
                     documentation: LanguageAdapter::extract_doc(entity, source),
-                    modifiers: adapter.extract_modifiers(entity, source),
                 });
             }
         }
@@ -233,8 +232,11 @@ fn append_entity(
     overlap_chars: usize,
     output: &mut Vec<IndexingExtractionFragment>,
 ) {
+    let mut metadata = Some(code_entity_metadata(entity));
+    let (content_max, content_overlap) =
+        chunk_options_for_metadata(max_chars, overlap_chars, metadata.as_ref());
     let fragments =
-        code_entity_to_search_fragments(source, adapter, entity, max_chars, overlap_chars);
+        code_entity_to_search_fragments(source, adapter, entity, content_max, content_overlap);
     let owner_index = fragments
         .first()
         .filter(|fragment| fragment.starts_group)
@@ -250,7 +252,7 @@ fn append_entity(
                 index,
                 range: fragment.range,
                 content: EntityContent::Outline(outline),
-                metadata: Some(fragment.metadata),
+                metadata: metadata.take(),
             })
         } else if let Some(entity_index) = owner_index {
             ExtractedFragment::Window(ExtractedWindow {
@@ -258,14 +260,13 @@ fn append_entity(
                 entity_index,
                 range: fragment.range,
                 contents: vec![fragment.content],
-                metadata: Some(fragment.metadata),
             })
         } else {
             ExtractedFragment::Standalone(ExtractedEntity {
                 index,
                 range: fragment.range,
                 content: EntityContent::Source(vec![fragment.content]),
-                metadata: Some(fragment.metadata),
+                metadata: metadata.take(),
             })
         };
         output.push(IndexingExtractionFragment {
@@ -281,18 +282,15 @@ fn code_entity_to_search_fragments(
     source: &TextSource,
     adapter: &LanguageAdapter,
     entity: &CodeEntity<'_>,
-    max_chars: usize,
-    overlap_chars: usize,
+    content_max: usize,
+    content_overlap: usize,
 ) -> Vec<CodeFragmentOutput> {
-    let metadata = code_entity_metadata(entity);
-    let (content_max, content_overlap) =
-        chunk_options_for_metadata(max_chars, overlap_chars, Some(&metadata));
     let node_text = text(entity.node, source.text.as_bytes());
     if utf16_len(node_text) <= content_max {
-        return vec![window_to_fragment(
-            entity,
-            node_to_window(entity.node, source.text.as_bytes()),
-        )];
+        return vec![window_to_fragment(node_to_window(
+            entity.node,
+            source.text.as_bytes(),
+        ))];
     }
 
     let major = CodeFragmentOutput {
@@ -304,7 +302,6 @@ fn code_entity_to_search_fragments(
             source.text.as_bytes(),
             content_max,
         )),
-        metadata: metadata.clone(),
         embedding_text: None,
     };
     let mut fragments = vec![major];
@@ -316,17 +313,16 @@ fn code_entity_to_search_fragments(
             content_overlap,
         )
         .into_iter()
-        .map(|window| window_to_fragment(entity, window)),
+        .map(window_to_fragment),
     );
     fragments
 }
 
-fn window_to_fragment(entity: &CodeEntity<'_>, window: CodeWindow) -> CodeFragmentOutput {
+fn window_to_fragment(window: CodeWindow) -> CodeFragmentOutput {
     CodeFragmentOutput {
         starts_group: false,
         range: SourceRange::Text(window.range),
         content: Content::Text(window.text),
-        metadata: code_entity_metadata(entity),
         embedding_text: window.embedding_text,
     }
 }
@@ -626,18 +622,21 @@ fn code_entity_outline(
 ) -> String {
     let header = extract_code_header(text(entity.node, source));
     let mut lines = vec![if header.is_empty() {
-        entity
-            .name
-            .clone()
-            .unwrap_or_else(|| symbol_type_name(entity.symbol_type).to_owned())
+        entity.name.clone().unwrap_or_else(|| {
+            entity
+                .symbol_type
+                .map_or("code", SymbolType::as_str)
+                .to_owned()
+        })
     } else {
         header
     }];
 
     if matches!(
         entity.symbol_type,
-        SymbolType::Class | SymbolType::Interface | SymbolType::Module
-    ) {
+        Some(SymbolType::Class | SymbolType::Enum | SymbolType::Interface | SymbolType::Module)
+    ) || matches!(entity.node.kind(), "union_item" | "union_specifier")
+    {
         let members = collect_structure_outline_members(entity, adapter, source);
         if !members.is_empty() {
             lines.push(String::new());
@@ -648,7 +647,7 @@ fn code_entity_outline(
                     .map(|member| format!("- {}", format_outline_member(member))),
             );
         }
-    } else if entity.symbol_type == SymbolType::Function {
+    } else if entity.symbol_type == Some(SymbolType::Function) {
         let calls = collect_function_call_names(entity.node, source);
         if !calls.is_empty() {
             lines.push(String::new());
@@ -676,7 +675,7 @@ fn extract_code_header(value: &str) -> String {
 
 #[derive(Debug)]
 struct OutlineMember {
-    symbol_type: SymbolType,
+    symbol_type: Option<SymbolType>,
     name: Option<String>,
     signature: Option<String>,
 }
@@ -690,7 +689,6 @@ fn collect_structure_outline_members(
         root: Node<'tree>,
         adapter: &'adapter LanguageAdapter,
         source: &'source [u8],
-        breadcrumb: &'adapter [String],
         members: Vec<OutlineMember>,
         seen: HashSet<String>,
     }
@@ -706,13 +704,11 @@ fn collect_structure_outline_members(
                         break;
                     }
                     let name = self.adapter.extract_name(resolved, self.source);
-                    let symbol_type = self
-                        .adapter
-                        .classify(resolved, self.source, self.breadcrumb);
+                    let symbol_type = self.adapter.classify(resolved);
                     let signature = self.adapter.extract_signature(resolved, self.source);
                     let key = format!(
                         "{}:{}:{}:{}",
-                        symbol_type_name(symbol_type),
+                        symbol_type.map_or("", SymbolType::as_str),
                         name.as_deref().unwrap_or_default(),
                         signature.as_deref().unwrap_or_default(),
                         resolved.start_byte()
@@ -737,7 +733,6 @@ fn collect_structure_outline_members(
         root: entity.node,
         adapter,
         source,
-        breadcrumb: &entity.breadcrumb,
         members: Vec::new(),
         seen: HashSet::new(),
     };
@@ -753,17 +748,19 @@ fn format_outline_member(member: &OutlineMember) -> String {
         .map(collapse_whitespace)
         .map(|value| fit_text_to_chars(&value, OUTLINE_MAX_LINE_CHARS))
         .unwrap_or_default();
-    let symbol = symbol_type_name(member.symbol_type);
+    let symbol = member.symbol_type.map_or("", SymbolType::as_str);
     if !signature.is_empty() {
         if !name.is_empty() && !signature.contains(name) {
             format!("{symbol} {name}: {signature}")
+                .trim_start()
+                .to_owned()
         } else {
-            format!("{symbol} {signature}")
+            format!("{symbol} {signature}").trim_start().to_owned()
         }
     } else if name.is_empty() {
         symbol.to_owned()
     } else {
-        format!("{symbol} {name}")
+        format!("{symbol} {name}").trim_start().to_owned()
     }
 }
 
@@ -825,25 +822,13 @@ fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
 }
 
 fn code_entity_metadata(entity: &CodeEntity<'_>) -> EntityMetadata {
-    EntityMetadata::Code {
+    EntityMetadata::Code(CodeMetadata {
         symbol_type: entity.symbol_type,
         symbol_name: entity.name.clone(),
         scope: (!entity.breadcrumb.is_empty()).then(|| entity.breadcrumb.join("::")),
-        node_type: Some(normalized_node_type(entity.node.kind()).to_owned()),
         signature: entity.signature.clone(),
         documentation: entity.documentation.clone(),
-        modifiers: entity.modifiers.clone(),
-    }
-}
-
-fn normalized_node_type(node_type: &str) -> &str {
-    // The native Go grammar renamed the same interface member node used by
-    // tree-sitter-wasms. Keep persisted metadata compatible with main.
-    if node_type == "method_elem" {
-        "method_spec"
-    } else {
-        node_type
-    }
+    })
 }
 
 #[derive(Debug)]
@@ -1007,9 +992,11 @@ fn remap_script_block_fragments(
 mod tests {
     use std::collections::HashSet;
 
-    use crate::domain::{Content, EntityMetadata, FileFormat, SourceRange, SymbolType, TextRange};
+    use crate::domain::{
+        CodeMetadata, Content, EntityMetadata, FileFormat, SourceRange, SymbolType, TextRange,
+    };
 
-    use super::super::test_content;
+    use super::super::{test_content, test_metadata};
 
     use super::super::{
         ChunkOptions, ExtractedFragment, extract, extract_for_indexing, test_source,
@@ -1023,10 +1010,17 @@ mod tests {
         fragments
             .iter()
             .find(|fragment| matches!(
-                &fragment.metadata(),
-                Some(EntityMetadata::Code { symbol_name: Some(candidate), .. }) if candidate == name
+                &test_metadata(fragment),
+                Some(EntityMetadata::Code(CodeMetadata { symbol_name: Some(candidate), .. })) if candidate == name
             ))
             .unwrap_or_else(|| panic!("expected fragment for {name}"))
+    }
+
+    fn signature<'a>(fragments: &'a [super::ExtractedFragment], name: &str) -> &'a str {
+        let Some(EntityMetadata::Code(metadata)) = test_metadata(named(fragments, name)) else {
+            panic!("code metadata expected for {name}");
+        };
+        metadata.signature.as_deref().expect("signature expected")
     }
 
     fn assert_source_backed(source: &super::TextSource, fragment: &super::ExtractedFragment) {
@@ -1077,32 +1071,28 @@ mod tests {
         assert_source_backed(&source, publish);
         assert_source_backed(&source, create);
         assert_eq!(
-            add.metadata().cloned(),
-            Some(EntityMetadata::Code {
-                symbol_type: SymbolType::Function,
+            test_metadata(add).cloned(),
+            Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("add".to_owned()),
                 scope: None,
-                node_type: Some("function_declaration".to_owned()),
                 signature: Some("async function add(value: number): Promise<number>".to_owned()),
                 documentation: Some("Adds one.".to_owned()),
-                modifiers: vec!["async".to_owned()],
-            })
+            }))
         );
         assert!(matches!(
-            &publish.metadata(),
-            Some(EntityMetadata::Code { modifiers, .. }) if modifiers == &["exported"]
+            &test_metadata(publish),
+            Some(EntityMetadata::Code(CodeMetadata { signature: Some(signature), .. })) if signature == "export function publish()"
         ));
         assert_eq!(
-            create.metadata().cloned(),
-            Some(EntityMetadata::Code {
-                symbol_type: SymbolType::Function,
+            test_metadata(create).cloned(),
+            Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("create".to_owned()),
                 scope: Some("Box".to_owned()),
-                node_type: Some("method_definition".to_owned()),
                 signature: Some("static create()".to_owned()),
                 documentation: None,
-                modifiers: vec!["static".to_owned()],
-            })
+            }))
         );
         assert!(matches!(
             *add.range(),
@@ -1137,20 +1127,18 @@ mod tests {
         );
         let c = extract(&c_source, ChunkOptions::default()).expect("c extraction");
         assert_eq!(
-            named(&c, "Widget").metadata().cloned(),
-            Some(EntityMetadata::Code {
-                symbol_type: SymbolType::Class,
+            test_metadata(named(&c, "Widget")).cloned(),
+            Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(SymbolType::Class),
                 symbol_name: Some("Widget".to_owned()),
                 scope: None,
-                node_type: Some("type_definition".to_owned()),
-                signature: Some("typedef struct Widget { int value; } Widget".to_owned()),
+                signature: Some("typedef struct Widget {} Widget".to_owned()),
                 documentation: None,
-                modifiers: Vec::new(),
-            })
+            }))
         );
         assert!(matches!(
-            &named(&c, "add").metadata(),
-            Some(EntityMetadata::Code { modifiers, .. }) if modifiers == &["static"]
+            &test_metadata(named(&c, "add")),
+            Some(EntityMetadata::Code(CodeMetadata { signature: Some(signature), .. })) if signature == "static int add(int a, int b)"
         ));
 
         let go_source = test_source(
@@ -1166,27 +1154,25 @@ mod tests {
         );
         let go = extract(&go_source, ChunkOptions::default()).expect("go extraction");
         assert_eq!(
-            named(&go, "Value").metadata().cloned(),
-            Some(EntityMetadata::Code {
-                symbol_type: SymbolType::Function,
+            test_metadata(named(&go, "Value")).cloned(),
+            Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("Value".to_owned()),
                 scope: Some("Widget".to_owned()),
-                node_type: Some("method_declaration".to_owned()),
                 signature: Some("func (w *Widget) Value() int".to_owned()),
                 documentation: None,
-                modifiers: vec!["exported".to_owned()],
-            })
+            }))
         );
         assert!(matches!(
-            &named(&go, "Reader").metadata(),
-            Some(EntityMetadata::Code {
-                symbol_type: SymbolType::Interface,
+            &test_metadata(named(&go, "Reader")),
+            Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(SymbolType::Interface),
                 ..
-            })
+            }))
         ));
         assert!(matches!(
-            &named(&go, "Read").metadata(),
-            Some(EntityMetadata::Code { scope: Some(scope), .. }) if scope == "Reader"
+            &test_metadata(named(&go, "Read")),
+            Some(EntityMetadata::Code(CodeMetadata { scope: Some(scope), .. })) if scope == "Reader"
         ));
 
         let python_source = test_source(
@@ -1196,17 +1182,454 @@ mod tests {
         );
         let python = extract(&python_source, ChunkOptions::default()).expect("python extraction");
         assert_eq!(
-            named(&python, "fetch").metadata().cloned(),
-            Some(EntityMetadata::Code {
-                symbol_type: SymbolType::Function,
+            test_metadata(named(&python, "fetch")).cloned(),
+            Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("fetch".to_owned()),
                 scope: Some("Service".to_owned()),
-                node_type: Some("decorated_definition".to_owned()),
-                signature: Some("async def fetch(value: str) -> str:".to_owned()),
+                signature: Some("@staticmethod\nasync def fetch(value: str) -> str:".to_owned()),
                 documentation: None,
-                modifiers: vec!["async".to_owned(), "static".to_owned()],
-            })
+            }))
         );
+    }
+
+    #[test]
+    fn signatures_preserve_direct_exports_without_implementation_bodies() {
+        let source = test_source(
+            FileFormat::TypeScript,
+            "signatures.ts",
+            &[
+                "export class Service {",
+                "  static create() { return new Service(); }",
+                "  private load = async (id: number) => { return id; };",
+                "}",
+                "export default async function start() { return new Service(); }",
+                "export const read = (id: number) => id + 1, write = async () => { return 2; };",
+                "const settings = { hidden: 'implementation' };",
+                "export const wrapped = memo((id: number) => { return id; });",
+                "export declare function declared(value: string): void;",
+                "function configure(options = { mode: 'strict  mode' }) { return options; }",
+            ]
+            .join("\n"),
+        );
+        let fragments = extract(&source, ChunkOptions::default()).expect("typescript extraction");
+        for (name, expected) in [
+            ("Service", "export class Service"),
+            ("create", "static create()"),
+            ("load", "private load = async (id: number) =>"),
+            ("start", "export default async function start()"),
+            ("read", "export const read = (id: number) =>"),
+            ("write", "export const write = async () =>"),
+            ("settings", "const settings = {}"),
+            ("wrapped", "export const wrapped = memo((id: number) => {})"),
+            (
+                "declared",
+                "export declare function declared(value: string): void",
+            ),
+            (
+                "configure",
+                "function configure(options = { mode: 'strict  mode' })",
+            ),
+        ] {
+            assert_eq!(signature(&fragments, name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn signatures_preserve_python_decorators_and_their_arguments() {
+        let source = test_source(
+            FileFormat::Python,
+            "signatures.py",
+            &[
+                "@registered(name=\"Service  API\")",
+                "class Service:",
+                "    @staticmethod",
+                "    @route(\"a  b\")",
+                "    async def fetch(value: str) -> str:",
+                "        return value",
+            ]
+            .join("\n"),
+        );
+        let fragments = extract(&source, ChunkOptions::default()).expect("python extraction");
+        assert_eq!(
+            signature(&fragments, "Service"),
+            "@registered(name=\"Service  API\")\nclass Service:"
+        );
+        assert_eq!(
+            signature(&fragments, "fetch"),
+            "@staticmethod\n@route(\"a  b\")\nasync def fetch(value: str) -> str:"
+        );
+    }
+
+    #[test]
+    fn signatures_preserve_rust_visibility_attributes_and_documentation() {
+        let source = test_source(
+            FileFormat::Rust,
+            "signatures.rs",
+            &[
+                "#[must_use = \"use  the result\"]",
+                "// Load a value.",
+                "#[inline]",
+                "/// Keep the result.",
+                "pub(crate) async unsafe fn load(value: usize) -> usize { value }",
+                "pub fn plain() {}",
+            ]
+            .join("\n"),
+        );
+        let fragments = extract(&source, ChunkOptions::default()).expect("rust extraction");
+        assert_eq!(
+            signature(&fragments, "load"),
+            "#[must_use = \"use  the result\"]\n#[inline]\npub(crate) async unsafe fn load(value: usize) -> usize"
+        );
+        assert_eq!(signature(&fragments, "plain"), "pub fn plain()");
+        assert!(matches!(
+            test_metadata(named(&fragments, "load")),
+            Some(EntityMetadata::Code(CodeMetadata { documentation: Some(doc), .. }))
+                if doc == "Load a value.\nKeep the result."
+        ));
+    }
+
+    #[test]
+    fn classifies_enums_across_languages() {
+        let fixtures = [
+            (
+                FileFormat::C,
+                "enum State { READY };",
+                "State",
+                Some(SymbolType::Enum),
+            ),
+            (
+                FileFormat::C,
+                "typedef enum { READY } State;",
+                "State",
+                Some(SymbolType::Enum),
+            ),
+            (
+                FileFormat::Cpp,
+                "enum class State { Ready };",
+                "State",
+                Some(SymbolType::Enum),
+            ),
+            (
+                FileFormat::Java,
+                "enum State { READY }",
+                "State",
+                Some(SymbolType::Enum),
+            ),
+            (
+                FileFormat::Rust,
+                "enum State { Ready }",
+                "State",
+                Some(SymbolType::Enum),
+            ),
+            (
+                FileFormat::TypeScript,
+                "enum State { Ready }",
+                "State",
+                Some(SymbolType::Enum),
+            ),
+        ];
+
+        for (format, text, name, expected) in fixtures {
+            let source = test_source(format, "fixture", text);
+            let fragments = extract(&source, ChunkOptions::default()).expect("symbol extraction");
+            let Some(EntityMetadata::Code(metadata)) = test_metadata(named(&fragments, name))
+            else {
+                panic!("expected code metadata for {format:?} {name}");
+            };
+            assert_eq!(metadata.symbol_type, expected, "{format:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn classifies_classes_interfaces_and_aliases() {
+        let fixtures = [
+            (
+                FileFormat::Cpp,
+                "struct User {};",
+                "User",
+                Some(SymbolType::Class),
+            ),
+            (
+                FileFormat::Java,
+                "record User(int id) {}",
+                "User",
+                Some(SymbolType::Class),
+            ),
+            (
+                FileFormat::Go,
+                "package demo\ntype User struct { id int }",
+                "User",
+                Some(SymbolType::Class),
+            ),
+            (
+                FileFormat::Rust,
+                "struct User { id: u64 }",
+                "User",
+                Some(SymbolType::Class),
+            ),
+            (
+                FileFormat::Rust,
+                "impl Read for User { fn read(&self) {} }",
+                "User",
+                Some(SymbolType::Class),
+            ),
+            (
+                FileFormat::Java,
+                "@interface Label {}",
+                "Label",
+                Some(SymbolType::Interface),
+            ),
+            (
+                FileFormat::Rust,
+                "trait Read { fn read(&self); }",
+                "Read",
+                Some(SymbolType::Interface),
+            ),
+            (
+                FileFormat::TypeScript,
+                "interface Read { read(): void; }",
+                "Read",
+                Some(SymbolType::Interface),
+            ),
+            (
+                FileFormat::C,
+                "typedef int UserID;",
+                "UserID",
+                Some(SymbolType::Alias),
+            ),
+            (
+                FileFormat::Go,
+                "package demo\ntype UserID = int",
+                "UserID",
+                Some(SymbolType::Alias),
+            ),
+            (
+                FileFormat::Rust,
+                "type UserID = u64;",
+                "UserID",
+                Some(SymbolType::Alias),
+            ),
+            (
+                FileFormat::TypeScript,
+                "type UserID = number;",
+                "UserID",
+                Some(SymbolType::Alias),
+            ),
+        ];
+
+        for (format, text, name, expected) in fixtures {
+            let source = test_source(format, "fixture", text);
+            let fragments = extract(&source, ChunkOptions::default()).expect("symbol extraction");
+            let Some(EntityMetadata::Code(metadata)) = test_metadata(named(&fragments, name))
+            else {
+                panic!("expected code metadata for {format:?} {name}");
+            };
+            assert_eq!(metadata.symbol_type, expected, "{format:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn keeps_unclassified_type_declarations_without_value_fallback() {
+        let fixtures = [
+            (
+                FileFormat::Go,
+                "package demo\ntype UserID int",
+                "UserID",
+                None,
+            ),
+            (
+                FileFormat::Rust,
+                "union Data { integer: u32, float: f32 }",
+                "Data",
+                None,
+            ),
+            (
+                FileFormat::C,
+                "typedef union { int integer; float real; } Data;",
+                "Data",
+                None,
+            ),
+        ];
+
+        for (format, text, name, expected) in fixtures {
+            let source = test_source(format, "fixture", text);
+            let fragments = extract(&source, ChunkOptions::default()).expect("symbol extraction");
+            let Some(EntityMetadata::Code(metadata)) = test_metadata(named(&fragments, name))
+            else {
+                panic!("expected code metadata for {format:?} {name}");
+            };
+            assert_eq!(metadata.symbol_type, expected, "{format:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn extracts_named_modules_and_values_without_local_variable_expansion() {
+        let fixtures = [
+            (
+                FileFormat::Cpp,
+                "namespace api { int run() { return 1; } }",
+                "api",
+                SymbolType::Module,
+            ),
+            (
+                FileFormat::Rust,
+                "mod api { pub fn run() {} }",
+                "api",
+                SymbolType::Module,
+            ),
+            (
+                FileFormat::TypeScript,
+                "namespace api { export function run() {} }",
+                "api",
+                SymbolType::Module,
+            ),
+            (
+                FileFormat::TypeScript,
+                "declare module 'api' { export function run(): void; }",
+                "'api'",
+                SymbolType::Module,
+            ),
+            (
+                FileFormat::Rust,
+                "const LIMIT: usize = 8;",
+                "LIMIT",
+                SymbolType::Value,
+            ),
+            (
+                FileFormat::Rust,
+                "static LIMIT: usize = 8;",
+                "LIMIT",
+                SymbolType::Value,
+            ),
+            (
+                FileFormat::JavaScript,
+                "const limit = 8;",
+                "limit",
+                SymbolType::Value,
+            ),
+            (
+                FileFormat::TypeScript,
+                "class User { name: string; }",
+                "name",
+                SymbolType::Value,
+            ),
+            (
+                FileFormat::TypeScript,
+                "interface User { name: string; }",
+                "name",
+                SymbolType::Value,
+            ),
+            (
+                FileFormat::Java,
+                "class User { int limit = 8; }",
+                "limit",
+                SymbolType::Value,
+            ),
+            (
+                FileFormat::Java,
+                "interface User { int LIMIT = 8; }",
+                "LIMIT",
+                SymbolType::Value,
+            ),
+        ];
+        for (format, text, name, expected) in fixtures {
+            let source = test_source(format, "fixture", text);
+            let fragments = extract(&source, ChunkOptions::default()).expect("symbol extraction");
+            assert!(
+                matches!(
+                    test_metadata(named(&fragments, name)),
+                    Some(EntityMetadata::Code(CodeMetadata { symbol_type: Some(actual), .. })) if *actual == expected
+                ),
+                "{format:?}: {text}"
+            );
+        }
+
+        let source = test_source(
+            FileFormat::TypeScript,
+            "locals.ts",
+            "const limit = 8; function run() { const local = 1; return local; } const { nested } = input;",
+        );
+        let fragments = extract(&source, ChunkOptions::default()).expect("symbol extraction");
+        let names = fragments
+            .iter()
+            .filter_map(|fragment| match test_metadata(fragment) {
+                Some(EntityMetadata::Code(metadata)) => metadata.symbol_name.as_deref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["limit", "run"]);
+    }
+
+    #[test]
+    fn value_declarations_preserve_anonymous_class_methods() {
+        for (format, text) in [
+            (FileFormat::JavaScript, "const Worker = class { run() {} };"),
+            (FileFormat::TypeScript, "const Worker = class { run() {} };"),
+            (
+                FileFormat::JavaScript,
+                "class Host { Worker = class { run() {} }; }",
+            ),
+            (
+                FileFormat::Java,
+                "class Host { Object worker = new Object() { void run() {} }; }",
+            ),
+        ] {
+            let source = test_source(format, "fixture", text);
+            let fragments =
+                extract(&source, ChunkOptions::default()).expect("anonymous class extraction");
+            assert!(
+                matches!(
+                    test_metadata(named(&fragments, "run")),
+                    Some(EntityMetadata::Code(CodeMetadata {
+                        symbol_type: Some(SymbolType::Function),
+                        ..
+                    }))
+                ),
+                "{format:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn impl_class_keeps_method_metadata_and_member_outline() {
+        let source = test_source(
+            FileFormat::Rust,
+            "fixture.rs",
+            &format!(
+                "impl User {{\n    fn name(&self) -> &str {{\n        \"{}\"\n    }}\n}}",
+                "a".repeat(300)
+            ),
+        );
+        let fragments = extract(
+            &source,
+            ChunkOptions {
+                max_chunk_chars: Some(160),
+                chunk_overlap_chars: Some(20),
+            },
+        )
+        .expect("impl extraction");
+        let owner = named(&fragments, "User");
+        assert!(matches!(owner, ExtractedFragment::Representative(_)));
+        assert!(matches!(
+            test_metadata(owner),
+            Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(SymbolType::Class),
+                ..
+            }))
+        ));
+        let Content::Text(outline) = test_content(owner) else {
+            panic!("text outline expected")
+        };
+        assert!(outline.contains("members:"));
+        assert!(outline.contains("function fn name(&self)"));
+        assert!(matches!(
+            test_metadata(named(&fragments, "name")),
+            Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(SymbolType::Function),
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -1273,8 +1696,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("{format:?}: {error}"));
             assert!(
                 fragments.iter().any(|fragment| matches!(
-                    &fragment.metadata(),
-                    Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == expected
+                    &test_metadata(fragment),
+                    Some(EntityMetadata::Code(CodeMetadata { symbol_name: Some(name), .. })) if name == expected
                 )),
                 "{format:?} should expose {expected}"
             );
@@ -1311,8 +1734,8 @@ mod tests {
         let service = prepared.iter().find(|item| {
             matches!(item.fragment, ExtractedFragment::Representative(_))
                 && matches!(
-                    &item.fragment.metadata(),
-                    Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == "Service"
+                    &test_metadata(&item.fragment),
+                    Some(EntityMetadata::Code(CodeMetadata { symbol_name: Some(name), .. })) if name == "Service"
                 )
         }).expect("service outline");
         let Content::Text(service_text) = &test_content(&service.fragment) else {
@@ -1324,8 +1747,8 @@ mod tests {
         let function = prepared.iter().find(|item| {
             matches!(item.fragment, ExtractedFragment::Representative(_))
                 && matches!(
-                    &item.fragment.metadata(),
-                    Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == "orchestrate"
+                    &test_metadata(&item.fragment),
+                    Some(EntityMetadata::Code(CodeMetadata { symbol_name: Some(name), .. })) if name == "orchestrate"
                 )
         }).expect("function outline");
         let Content::Text(function_text) = &test_content(&function.fragment) else {
@@ -1385,6 +1808,7 @@ mod tests {
         assert!(!embedding.contains("\n\n"));
         let vector = vector_content_for_fragment(
             &compact.fragment,
+            test_metadata(&prepared[compact.fragment.entity_index()].fragment),
             compact.embedding_source.as_deref(),
             Some(120),
         );
@@ -1456,7 +1880,7 @@ mod tests {
             test_content(&fallback[0]),
             Content::Text("\r\n// 没有声明\r\n".to_owned())
         );
-        assert!(fallback[0].metadata().is_none());
+        assert!(test_metadata(&fallback[0]).is_none());
         assert!(matches!(
             fallback[0].range(),
             SourceRange::Text(range) if range.end_line() == 4 && range.end_byte_column() == 0
@@ -1469,7 +1893,7 @@ mod tests {
             test_content(&fallback[0]),
             Content::Text(no_script.text.clone())
         );
-        assert!(fallback[0].metadata().is_none());
+        assert!(test_metadata(&fallback[0]).is_none());
     }
 
     #[test]
@@ -1505,7 +1929,8 @@ mod tests {
                 if let ExtractedFragment::Window(window) = fragment {
                     let owner = &fragments[window.entity_index];
                     assert!(matches!(owner, ExtractedFragment::Representative(_)));
-                    assert_eq!(owner.metadata(), fragment.metadata());
+                    assert!(test_metadata(owner).is_some());
+                    assert!(owner.range().contains(fragment.range()));
                     assert_source_backed(&source, fragment);
                 }
             }
@@ -1541,8 +1966,8 @@ mod tests {
                 .iter()
                 .filter(|fragment| {
                     matches!(
-                        &fragment.metadata(),
-                        Some(EntityMetadata::Code { symbol_name: Some(name), .. }) if name == "emoji"
+                        &test_metadata(&fragments[fragment.entity_index()]),
+                        Some(EntityMetadata::Code(CodeMetadata { symbol_name: Some(name), .. })) if name == "emoji"
                     ) && !matches!(fragment, ExtractedFragment::Representative(_))
                 })
                 .collect::<Vec<_>>();
@@ -1596,7 +2021,7 @@ mod tests {
                 test_content(&fragments[0]),
                 Content::Text(source.text.clone())
             );
-            assert!(fragments[0].metadata().is_none());
+            assert!(test_metadata(&fragments[0]).is_none());
         }
     }
 }

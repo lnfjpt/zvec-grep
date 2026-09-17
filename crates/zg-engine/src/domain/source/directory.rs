@@ -3,14 +3,14 @@ use std::fmt;
 use super::path::SourcePath;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct DirectoryId(u64);
+pub(crate) struct DirectoryId(u32);
 
 impl DirectoryId {
-    pub(crate) const fn new(value: u64) -> Self {
+    pub(crate) const fn new(value: u32) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> u64 {
+    pub(crate) const fn get(self) -> u32 {
         self.0
     }
 }

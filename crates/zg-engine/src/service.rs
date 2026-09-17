@@ -231,12 +231,12 @@ fn context_from_lexical(
                     metadata: container
                         .as_ref()
                         .and_then(|value| value.metadata.as_ref())
-                        .map(Into::into),
+                        .cloned(),
                     entity_id: None,
                     container: container.map(|value| ContextContainer {
                         entity_id: value.entity_id.as_str().to_owned(),
                         range: value.range.into(),
-                        metadata: value.metadata.map(Into::into),
+                        metadata: value.metadata,
                     }),
                     trace: None,
                     query_groups: Vec::new(),

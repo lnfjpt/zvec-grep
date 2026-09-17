@@ -435,24 +435,21 @@ fn resolve_scanned_identities(
     storage: &dyn WorkspaceIndexStorage,
     scanned: &mut [ScannedFile],
 ) -> Result<(), EngineError> {
-    // Classification is also used by read-only status checks. Durable identities
-    // are allocated only for files this indexing pass will actually process.
     let paths = scanned
         .iter()
+        .filter(|scan| scan.id.is_none())
         .map(|scan| scan.relative_path.to_path_buf())
         .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(());
+    }
     let ids = storage.resolve_file_ids(&paths)?;
-    if ids.len() != scanned.len() {
+    if ids.len() != paths.len() {
         return Err(EngineError::storage_failure(
-            "file catalog returned an incorrect number of identities",
+            "storage returned an incorrect number of file IDs",
         ));
     }
-    for (scan, id) in scanned.iter_mut().zip(ids) {
-        if scan.id.is_some_and(|existing| existing != id) {
-            return Err(EngineError::storage_failure(
-                "file catalog identity differs from the stored file",
-            ));
-        }
+    for (scan, id) in scanned.iter_mut().filter(|scan| scan.id.is_none()).zip(ids) {
         scan.id = Some(id);
     }
     Ok(())
@@ -918,14 +915,26 @@ fn prepare_fragments(
     extracted: Vec<IndexingExtractionFragment>,
     max_chars: Option<usize>,
 ) -> Vec<PreparedFragment> {
-    extracted
-        .into_iter()
-        .map(|item| PreparedFragment {
-            embedding_content: EmbeddingInput::new(vector_content_for_fragment(
+    let embeddings = extracted
+        .iter()
+        .map(|item| {
+            let owner = extracted[item.fragment.entity_index()]
+                .fragment
+                .as_entity()
+                .expect("extracted fragment belongs to an entity");
+            EmbeddingInput::new(vector_content_for_fragment(
                 &item.fragment,
+                owner.metadata.as_ref(),
                 item.embedding_source.as_deref(),
                 max_chars,
-            )),
+            ))
+        })
+        .collect::<Vec<_>>();
+    extracted
+        .into_iter()
+        .zip(embeddings)
+        .map(|(item, embedding_content)| PreparedFragment {
+            embedding_content,
             fragment: bind_fragment(file_id, item.fragment),
         })
         .collect()
@@ -955,7 +964,6 @@ fn bind_fragment(file_id: FileId, fragment: ExtractedFragment) -> EntityFragment
             file_id,
             range: window.range,
             contents: window.contents,
-            metadata: window.metadata,
         }),
     }
 }
@@ -2070,9 +2078,9 @@ mod tests {
 
     use crate::{
         api::index::progress::IndexProgressPhase,
-        domain::{EmbeddingSchema, FileSelection, WorkspaceIndex, WorkspaceName},
+        domain::{Content, EmbeddingSchema, FileSelection, WorkspaceIndex, WorkspaceName},
         models::{EmbeddingMetric, EmbeddingModelLimits},
-        storage::spi::{StorageResult, StorageSearchFilter, StorageSearchHit, StoredEntity},
+        storage::spi::{StorageResult, StorageSearchFilter, StorageSearchHit},
     };
 
     use super::*;
@@ -2098,6 +2106,16 @@ mod tests {
             panic!("large section needs source windows");
         };
         assert_eq!(window.entity_id, *fragments[1].entity_id());
+        for item in prepared
+            .iter()
+            .filter(|item| matches!(item.fragment, EntityFragment::Window(_)))
+        {
+            let [Content::Text(text)] = item.embedding_content.contents.as_slice() else {
+                panic!("markdown embedding is text");
+            };
+            assert!(text.starts_with("heading: "));
+            assert!(crate::utils::utf16_len(text) <= 64);
+        }
         assert!(
             fragments
                 .iter()
@@ -2121,6 +2139,7 @@ mod tests {
     struct MemoryStorage {
         files: Mutex<Vec<FileRecord>>,
         identities: Mutex<HashMap<PathBuf, FileId>>,
+        resolved_paths: Mutex<Vec<Vec<PathBuf>>>,
         finalized: AtomicUsize,
         prepared_batches: Mutex<Vec<Vec<FileId>>>,
     }
@@ -2132,6 +2151,10 @@ mod tests {
         }
 
         fn resolve_file_ids(&self, paths: &[PathBuf]) -> StorageResult<Vec<FileId>> {
+            self.resolved_paths
+                .lock()
+                .expect("record allocation")
+                .push(paths.to_vec());
             let mut identities = self
                 .identities
                 .lock()
@@ -2142,7 +2165,7 @@ mod tests {
                     if let Some(id) = identities.get(path) {
                         return Ok(*id);
                     }
-                    let id = FileId::new(identities.len() as u64);
+                    let id = FileId::new(u32::try_from(identities.len()).expect("fixture ID"));
                     identities.insert(path.clone(), id);
                     Ok(id)
                 })
@@ -2155,13 +2178,6 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone())
-        }
-
-        fn get_entity(
-            &self,
-            _entity_id: &crate::domain::EntityId,
-        ) -> StorageResult<Option<StoredEntity>> {
-            Ok(None)
         }
 
         fn search_fts(
@@ -2209,7 +2225,7 @@ mod tests {
             self.prepared_batches
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(files.iter().map(|file| file.id.clone()).collect());
+                .push(files.iter().map(|file| file.id).collect());
             Ok(())
         }
 
@@ -2392,7 +2408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_does_not_allocate_and_updates_keep_catalog_identity() {
+    async fn unchanged_files_skip_allocation_and_updates_reuse_record_ids() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("file.txt");
         std::fs::write(&path, "alpha").expect("source");
@@ -2417,6 +2433,10 @@ mod tests {
         };
         index_workspace(&context).await.expect("initial index");
         let id = storage.list_files().expect("files")[0].id;
+        assert_eq!(storage.resolved_paths.lock().expect("calls").len(), 1);
+        index_workspace(&context).await.expect("unchanged index");
+        assert_eq!(storage.resolved_paths.lock().expect("calls").len(), 1);
+
         assert_eq!(
             storage
                 .identities
@@ -2447,6 +2467,13 @@ mod tests {
             id
         );
         assert_ne!(files[0].id, files[1].id);
+        assert_eq!(
+            *storage.resolved_paths.lock().expect("calls"),
+            [
+                vec![PathBuf::from("file.txt")],
+                vec![PathBuf::from("new.txt")],
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -2484,7 +2511,7 @@ mod tests {
             .enumerate()
             .map(|(index, candidate)| {
                 let mut scan = candidate.scanned;
-                scan.id = Some(FileId::new(index as u64 + 1));
+                scan.id = Some(FileId::new(u32::try_from(index + 1).expect("fixture ID")));
                 scan.to_record().expect("registered source")
             })
             .collect::<Vec<_>>();

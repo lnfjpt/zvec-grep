@@ -8,7 +8,8 @@ use zg_engine::api::{
     context::{
         ContextResult,
         result::{
-            ContentRange, ContextContentRole, ContextItem, ContextItemStatus, EntityMetadata,
+            CodeMetadata, ContentRange, ContextContentRole, ContextItem, ContextItemStatus,
+            EntityMetadata, MarkdownMetadata,
         },
     },
     index::IndexResult,
@@ -154,28 +155,28 @@ fn write_item_preview(
     }
     if let Some(metadata) = &item.metadata {
         match metadata {
-            EntityMetadata::Code {
+            EntityMetadata::Code(CodeMetadata {
                 symbol_type,
                 symbol_name: Some(name),
                 scope,
                 ..
-            } => {
-                let kind = serde_json::to_value(symbol_type).map_err(io::Error::other)?;
-                write!(
-                    writer,
-                    "symbol: {} {name}",
-                    kind.as_str().unwrap_or_default()
-                )?;
+            }) => {
+                write!(writer, "symbol: ")?;
+                if let Some(symbol_type) = symbol_type {
+                    let kind = serde_json::to_value(symbol_type).map_err(io::Error::other)?;
+                    write!(writer, "{} ", kind.as_str().unwrap_or_default())?;
+                }
+                write!(writer, "{name}")?;
                 if let Some(scope) = scope {
                     write!(writer, " scope: {scope}")?;
                 }
                 writeln!(writer)?;
             }
-            EntityMetadata::Markdown {
+            EntityMetadata::Markdown(MarkdownMetadata {
                 heading,
                 level,
                 scope,
-            } => {
+            }) => {
                 if let Some(heading) = heading {
                     writeln!(writer, "heading: {heading}")?;
                 }
@@ -186,7 +187,7 @@ fn write_item_preview(
                     writeln!(writer, "scope: {scope}")?;
                 }
             }
-            EntityMetadata::Code { .. } => {}
+            EntityMetadata::Code(_) => {}
         }
     }
     if options.preview != PreviewMode::None
@@ -446,7 +447,7 @@ File filters:
   -T, --type-not <type>             Exclude a ripgrep file type; repeatable
   --modified-after <time>           Only files modified after a date or epoch milliseconds
   --modified-before <time>          Only files modified before a date or epoch milliseconds
-  --symbol-type <type>              module, class, interface, function, value, alias
+  --symbol-type <type>              alias, class, enum, function, interface, module, value
   --prefer-symbol                   Prefer exact indexed symbols
 
 Managed --rg supports common ripgrep matching, context, engine, encoding,
@@ -837,6 +838,40 @@ mod output_tests {
         ContextCoverage, ContextDiagnostics, ContextItemKind, ContextSource, MatchedBy,
     };
 
+    fn indexed_item() -> ContextItem {
+        ContextItem {
+            kind: ContextItemKind::IndexedEntity,
+            rank: 1,
+            absolute_path: std::env::temp_dir().join("sample.rs"),
+            relative_path: "sample.rs".into(),
+            range: ContentRange::Text {
+                start_line: 1,
+                end_line: 20,
+                start_byte_offset: 0,
+                end_byte_offset: 130,
+                start_byte_column: 0,
+                end_byte_column: 6,
+            },
+            excerpt_range: None,
+            content: (1..=20)
+                .map(|n| format!("line{n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            content_role: Some(ContextContentRole::Source),
+            outline: None,
+            status: ContextItemStatus::Fresh,
+            score: Some(0.75),
+            matched_by: MatchedBy::Fts,
+            metadata: None,
+            entity_id: None,
+            container: None,
+            trace: None,
+            query_groups: vec![],
+            selection_reason: None,
+            coverage_group: None,
+        }
+    }
+
     #[test]
     fn preview_modes_and_trace_preserve_indexed_result_information() {
         let mut result = ContextResult {
@@ -849,37 +884,7 @@ mod output_tests {
             workspace_index: None,
             group_results: vec![],
             diagnostics: ContextDiagnostics::default(),
-            items: vec![ContextItem {
-                kind: ContextItemKind::IndexedEntity,
-                rank: 1,
-                absolute_path: std::env::temp_dir().join("sample.rs"),
-                relative_path: "sample.rs".into(),
-                range: ContentRange::Text {
-                    start_line: 1,
-                    end_line: 20,
-                    start_byte_offset: 0,
-                    end_byte_offset: 130,
-                    start_byte_column: 0,
-                    end_byte_column: 6,
-                },
-                excerpt_range: None,
-                content: (1..=20)
-                    .map(|n| format!("line{n}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                content_role: Some(ContextContentRole::Source),
-                outline: None,
-                status: ContextItemStatus::Fresh,
-                score: Some(0.75),
-                matched_by: MatchedBy::Fts,
-                metadata: None,
-                entity_id: None,
-                container: None,
-                trace: None,
-                query_groups: vec![],
-                selection_reason: None,
-                coverage_group: None,
-            }],
+            items: vec![indexed_item()],
         };
         let render = |preview, trace| {
             let mut buffer = Vec::new();
@@ -922,5 +927,30 @@ mod output_tests {
         let rendered = String::from_utf8(buffer).expect("UTF-8");
         assert!(rendered.contains("sample.rs:1-20"));
         assert!(!rendered.contains("sample.rs:1-21"));
+    }
+
+    #[test]
+    fn symbol_preview_preserves_names_with_optional_classification() {
+        let mut item = indexed_item();
+        for (symbol_type, expected) in [
+            (None, "symbol: User scope: app"),
+            (
+                Some(zg_engine::api::context::options::SymbolType::Enum),
+                "symbol: enum User scope: app",
+            ),
+        ] {
+            item.metadata = Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type,
+                symbol_name: Some("User".into()),
+                scope: Some("app".into()),
+                signature: None,
+                documentation: None,
+            }));
+            let mut buffer = Vec::new();
+            write_item_preview(&mut buffer, &item, OutputOptions::default())
+                .expect("render symbol metadata");
+            let rendered = String::from_utf8(buffer).expect("UTF-8");
+            assert_eq!(rendered.lines().next(), Some(expected));
+        }
     }
 }

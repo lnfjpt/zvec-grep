@@ -578,7 +578,7 @@ pub struct SearchInput {
     pub prefer_symbol: Option<bool>,
     /// Restrict indexed results to symbol types.
     #[serde(default)]
-    #[schemars(length(max = 6))]
+    #[schemars(length(max = 7))]
     pub symbol_types: Vec<SymbolTypeInput>,
     /// Only query files modified after this time.
     pub modified_after: Option<TimeInput>,
@@ -924,23 +924,25 @@ pub enum DeviceInput {
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolTypeInput {
-    Module,
-    Class,
-    Interface,
-    Function,
-    Value,
     Alias,
+    Class,
+    Enum,
+    Function,
+    Interface,
+    Module,
+    Value,
 }
 
 impl From<SymbolTypeInput> for SymbolType {
     fn from(value: SymbolTypeInput) -> Self {
         match value {
-            SymbolTypeInput::Module => Self::Module,
-            SymbolTypeInput::Class => Self::Class,
-            SymbolTypeInput::Interface => Self::Interface,
-            SymbolTypeInput::Function => Self::Function,
-            SymbolTypeInput::Value => Self::Value,
             SymbolTypeInput::Alias => Self::Alias,
+            SymbolTypeInput::Class => Self::Class,
+            SymbolTypeInput::Enum => Self::Enum,
+            SymbolTypeInput::Function => Self::Function,
+            SymbolTypeInput::Interface => Self::Interface,
+            SymbolTypeInput::Module => Self::Module,
+            SymbolTypeInput::Value => Self::Value,
         }
     }
 }
@@ -982,8 +984,8 @@ impl SearchInput {
         if self.max_file_size_bytes == Some(0) {
             return Err("maxFileSizeBytes must be greater than zero".to_owned());
         }
-        if self.symbol_types.len() > 6 {
-            return Err("symbolTypes accepts at most 6 values".to_owned());
+        if self.symbol_types.len() > 7 {
+            return Err("symbolTypes accepts at most 7 values".to_owned());
         }
 
         let mut queries = normalize_optional_one(self.query, "query")?;
@@ -1959,6 +1961,34 @@ mod tests {
             let request = search.into_request().expect("device should map");
             assert_eq!(serde_json::json!(request.device), device);
         }
+    }
+
+    #[test]
+    fn search_accepts_all_symbol_types() {
+        let types = serde_json::json!([
+            "alias",
+            "class",
+            "enum",
+            "function",
+            "interface",
+            "module",
+            "value"
+        ]);
+        let mut search = input();
+        search.symbol_types = serde_json::from_value(types.clone()).expect("symbol types");
+        let request = search.into_request().expect("all seven types should map");
+        assert_eq!(serde_json::json!(request.symbol_types), types);
+
+        let schema =
+            serde_json::to_value(schemars::schema_for!(SearchInput)).expect("search schema");
+        assert_eq!(schema["properties"]["symbolTypes"]["maxItems"], 7);
+
+        let mut search = input();
+        search.symbol_types = vec![super::SymbolTypeInput::Enum; 8];
+        assert_eq!(
+            search.into_request().expect_err("too many symbol types"),
+            "symbolTypes accepts at most 7 values"
+        );
     }
 
     #[test]

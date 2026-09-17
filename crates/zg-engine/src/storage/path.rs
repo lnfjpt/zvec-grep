@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{EngineError, EngineResult, domain::SourcePath};
 
-use super::super::codec::PathRecord;
+use super::codec::PathRecord;
 
 pub(crate) fn encode_path(path: &SourcePath) -> EngineResult<String> {
     // Component collection unifies accepted Windows separator spellings while

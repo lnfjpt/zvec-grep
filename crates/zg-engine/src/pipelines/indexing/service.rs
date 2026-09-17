@@ -244,7 +244,6 @@ impl WorkspaceIndexService {
             .storage_factory
             .open(WorkspaceIndexStorageOptions::ReadWrite {
                 storage_path: manifest.storage_home(),
-                workspace_path: manifest.path.clone(),
                 embedding: storage_embedding_schema(&model),
             })?;
         let result = index_workspace(&IndexingContext {
@@ -366,7 +365,6 @@ impl WorkspaceIndexService {
         }
         let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: manifest.storage_home(),
-            workspace_path: manifest.path.clone(),
         })?;
         let result = context_from_index(
             &location.root,
@@ -409,7 +407,6 @@ impl WorkspaceIndexService {
         assert_index_version(manifest.index_version)?;
         let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: manifest.storage_home(),
-            workspace_path: manifest.path.clone(),
         })?;
         let status =
             get_workspace_index_status(&manifest.workspace, storage.as_ref(), &self.scanner, None)
@@ -446,7 +443,6 @@ impl WorkspaceIndexService {
             let factory = &self.storage_factory;
             let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
                 storage_path: manifest.storage_home(),
-                workspace_path: manifest.path.clone(),
             })?;
             let status = get_workspace_index_status(
                 &manifest.workspace,
@@ -962,7 +958,7 @@ fn assert_index_version(version: Option<u32>) -> Result<(), EngineError> {
         && version != CURRENT_INDEX_VERSION
     {
         return Err(EngineError::storage_failure(format!(
-            "unsupported index version {version}; expected {CURRENT_INDEX_VERSION}; rebuild the index"
+            "unsupported index version {version}; expected {CURRENT_INDEX_VERSION}; rebuild the index with `zg index --rebuild`"
         )));
     }
     Ok(())
@@ -1100,7 +1096,7 @@ mod tests {
         },
         domain::{FileRecord, FileSelection, IndexPolicy, Workspace, WorkspaceName},
         storage::spi::{
-            IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit, StoredEntity,
+            IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit,
             WorkspaceIndexStorage, WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
         },
     };
@@ -1168,13 +1164,6 @@ mod tests {
                 "this storage fixture only models empty workspaces"
             );
             Ok(Vec::new())
-        }
-
-        fn get_entity(
-            &self,
-            _entity_id: &crate::domain::EntityId,
-        ) -> StorageResult<Option<StoredEntity>> {
-            Ok(None)
         }
 
         fn search_fts(
@@ -1468,7 +1457,7 @@ mod tests {
                 .expect("drop orphaned identities")
         );
         assert!(!home.join("identity.json").exists());
-        assert!(home.join("identity.lock").is_file());
+        assert!(!home.join("identity.lock").exists());
         assert!(
             !service
                 .drop_index(&options)
@@ -1842,7 +1831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_rename_preserves_storage_and_file_identity_catalog() {
+    async fn explicit_rename_preserves_storage_and_legacy_identity_artifacts() {
         let directory = tempdir().expect("workspace");
         let service =
             WorkspaceIndexService::with_storage_factory(Arc::new(MemoryStorageFactory::default()));
@@ -2307,6 +2296,7 @@ mod tests {
         let rebuilt = super::read_workspace_manifest(&info.home)
             .expect("manifest read")
             .expect("manifest");
+        assert_eq!(rebuilt.index_version, Some(5));
         assert_eq!(rebuilt.workspace.root, manifest.workspace.root);
         assert_eq!(
             rebuilt.workspace.file_selection,

@@ -20,6 +20,7 @@ mod tests {
         extract_for_indexing, test_content,
     };
     use super::extract;
+    use crate::extraction::test_metadata;
 
     fn image_source(data: Vec<u8>) -> ImageSource {
         ImageSource {
@@ -35,7 +36,7 @@ mod tests {
         assert_eq!(fragments[0].index(), 0);
         assert_eq!(fragments[0].range(), &SourceRange::File);
         assert!(matches!(fragments[0], ExtractedFragment::Standalone(_)));
-        assert_eq!(fragments[0].metadata(), None);
+        assert_eq!(test_metadata(&fragments[0]), None);
         assert_eq!(test_content(&fragments[0]), Content::Image(source.content));
     }
 

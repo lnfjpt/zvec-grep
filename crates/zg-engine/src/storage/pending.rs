@@ -52,7 +52,7 @@ struct PendingRecord {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ChangeRecord {
     Reindex { source: String },
-    Delete { file_id: u64 },
+    Delete { file_id: u32 },
 }
 
 pub(super) fn write(storage_path: &Path, changes: &PendingChanges) -> EngineResult<()> {
@@ -199,7 +199,7 @@ mod tests {
     fn persists_only_source_metadata_and_deletion_intents() {
         let directory = tempfile::tempdir().expect("pending directory");
         let source = source();
-        let deletion = FileId::new(u64::MAX);
+        let deletion = FileId::new(u32::MAX);
         let changes = PendingChanges::from([
             (source.id, PendingChange::Reindex(source)),
             (deletion, PendingChange::Delete(deletion)),
@@ -235,6 +235,7 @@ mod tests {
             json!({"version": VERSION, "files": [reindex.clone(), reindex.clone()]}),
             json!({"version": VERSION, "files": [reindex.clone(), {"kind": "delete", "file_id": 0}]}),
             json!({"version": VERSION, "files": [reindex.clone(), {"kind": "delete", "file_id": -1}]}),
+            json!({"version": VERSION, "files": [reindex.clone(), {"kind": "delete", "file_id": u64::from(u32::MAX) + 1}]}),
             json!({"version": VERSION, "files": [reindex.clone(), {"kind": "reindex", "source": "broken"}]}),
             json!({"version": VERSION, "files": [{"kind": "reindex", "source": invalid_source.to_string()}]}),
             json!({"version": VERSION, "files": [{"kind": "reindex", "source": invalid_id.to_string()}]}),

@@ -12,12 +12,11 @@ use crate::{
     domain::{
         ByteRange, Content, Entity, EntityContent, EntityFragment, EntityId, EntityMetadata,
         FileFormat, FileId, FileIndexStatus, FileRecord, FileSnapshot, FragmentId, ImageContent,
-        SourcePath, SourceRange, SymbolType, TableCell, TableCellRole, TableContent, TextRange,
-        WindowFragment,
+        SourcePath, SourceRange, TableCell, TableCellRole, TableContent, TextRange, WindowFragment,
     },
 };
 
-const VERSION: u16 = 6;
+const VERSION: u16 = 7;
 // Nested tables add several JSON containers; keep records below serde's recursion limit.
 const MAX_TABLE_DEPTH: usize = 16;
 
@@ -38,10 +37,13 @@ pub(crate) fn encode_fragment(fragment: &EntityFragment) -> EngineResult<String>
     encode(FragmentRecord::from(fragment), "fragment")
 }
 
-pub(crate) fn decode_fragment(json: &str) -> EngineResult<EntityFragment> {
+pub(crate) fn decode_fragment(
+    json: &str,
+    metadata: Option<&EntityMetadata>,
+) -> EngineResult<EntityFragment> {
     let record: FragmentRecord<'static> = decode(json, "fragment")?;
     let fragment = record
-        .into_fragment()
+        .into_fragment(metadata)
         .map_err(|error| invalid_record("fragment", &error))?;
     validate_fragment(&fragment).map_err(|error| invalid_record("fragment", &error))?;
     Ok(fragment)
@@ -81,7 +83,7 @@ struct Record<T> {
 
 #[derive(Serialize, Deserialize)]
 struct FilePayload<'a> {
-    id: u64,
+    id: u32,
     relative_path: PathRecord,
     formats: Vec<u16>,
     snapshot: SnapshotRecord<'a>,
@@ -263,10 +265,9 @@ enum FragmentRecord<'a> {
 #[derive(Serialize, Deserialize)]
 struct EntityRecord<'a> {
     id: Cow<'a, str>,
-    file_id: u64,
+    file_id: u32,
     range: RangeRecord,
     content: EntityContentRecord<'a>,
-    metadata: Option<MetadataRecord<'a>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -280,10 +281,9 @@ enum EntityContentRecord<'a> {
 struct WindowRecord<'a> {
     id: Cow<'a, str>,
     entity_id: Cow<'a, str>,
-    file_id: u64,
+    file_id: u32,
     range: RangeRecord,
     contents: Vec<ContentRecord<'a>>,
-    metadata: Option<MetadataRecord<'a>>,
 }
 
 impl<'a> From<&'a EntityFragment> for FragmentRecord<'a> {
@@ -297,24 +297,24 @@ impl<'a> From<&'a EntityFragment> for FragmentRecord<'a> {
                 file_id: window.file_id.get(),
                 range: window.range.into(),
                 contents: encode_contents(&window.contents),
-                metadata: window.metadata.as_ref().map(Into::into),
             }),
         }
     }
 }
 
 impl FragmentRecord<'_> {
-    fn into_fragment(self) -> EngineResult<EntityFragment> {
+    fn into_fragment(self, metadata: Option<&EntityMetadata>) -> EngineResult<EntityFragment> {
         Ok(match self {
-            Self::Standalone(entity) => EntityFragment::Standalone(entity.into_entity()?),
-            Self::Representative(entity) => EntityFragment::Representative(entity.into_entity()?),
+            Self::Standalone(entity) => EntityFragment::Standalone(entity.into_entity(metadata)?),
+            Self::Representative(entity) => {
+                EntityFragment::Representative(entity.into_entity(metadata)?)
+            }
             Self::Window(window) => EntityFragment::Window(WindowFragment {
                 id: FragmentId::new(window.id.into_owned())?,
                 entity_id: EntityId::new(window.entity_id.into_owned())?,
                 file_id: FileId::new(window.file_id),
                 range: window.range.try_into()?,
                 contents: decode_contents(window.contents)?,
-                metadata: window.metadata.map(Into::into),
             }),
         })
     }
@@ -334,13 +334,12 @@ impl<'a> From<&'a Entity> for EntityRecord<'a> {
                     EntityContentRecord::Outline(outline.as_str().into())
                 }
             },
-            metadata: entity.metadata.as_ref().map(Into::into),
         }
     }
 }
 
 impl EntityRecord<'_> {
-    fn into_entity(self) -> EngineResult<Entity> {
+    fn into_entity(self, metadata: Option<&EntityMetadata>) -> EngineResult<Entity> {
         Ok(Entity {
             id: EntityId::new(self.id.into_owned())?,
             file_id: FileId::new(self.file_id),
@@ -353,7 +352,7 @@ impl EntityRecord<'_> {
                     EntityContent::Outline(outline.into_owned())
                 }
             },
-            metadata: self.metadata.map(Into::into),
+            metadata: metadata.cloned(),
         })
     }
 }
@@ -574,119 +573,6 @@ impl TryFrom<RangeRecord> for SourceRange {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum MetadataRecord<'a> {
-    Code {
-        symbol_type: SymbolRecord,
-        symbol_name: Option<Cow<'a, str>>,
-        scope: Option<Cow<'a, str>>,
-        node_type: Option<Cow<'a, str>>,
-        signature: Option<Cow<'a, str>>,
-        documentation: Option<Cow<'a, str>>,
-        modifiers: Vec<Cow<'a, str>>,
-    },
-    Markdown {
-        heading: Option<Cow<'a, str>>,
-        level: Option<usize>,
-        scope: Option<Cow<'a, str>>,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SymbolRecord {
-    Module,
-    Class,
-    Interface,
-    Function,
-    Value,
-    Alias,
-}
-
-impl<'a> From<&'a EntityMetadata> for MetadataRecord<'a> {
-    fn from(metadata: &'a EntityMetadata) -> Self {
-        match metadata {
-            EntityMetadata::Code {
-                symbol_type,
-                symbol_name,
-                scope,
-                node_type,
-                signature,
-                documentation,
-                modifiers,
-            } => Self::Code {
-                symbol_type: match symbol_type {
-                    SymbolType::Module => SymbolRecord::Module,
-                    SymbolType::Class => SymbolRecord::Class,
-                    SymbolType::Interface => SymbolRecord::Interface,
-                    SymbolType::Function => SymbolRecord::Function,
-                    SymbolType::Value => SymbolRecord::Value,
-                    SymbolType::Alias => SymbolRecord::Alias,
-                },
-                symbol_name: symbol_name.as_deref().map(Cow::Borrowed),
-                scope: scope.as_deref().map(Cow::Borrowed),
-                node_type: node_type.as_deref().map(Cow::Borrowed),
-                signature: signature.as_deref().map(Cow::Borrowed),
-                documentation: documentation.as_deref().map(Cow::Borrowed),
-                modifiers: modifiers
-                    .iter()
-                    .map(|value| Cow::Borrowed(value.as_str()))
-                    .collect(),
-            },
-            EntityMetadata::Markdown {
-                heading,
-                level,
-                scope,
-            } => Self::Markdown {
-                heading: heading.as_deref().map(Cow::Borrowed),
-                level: *level,
-                scope: scope.as_deref().map(Cow::Borrowed),
-            },
-        }
-    }
-}
-
-impl From<MetadataRecord<'_>> for EntityMetadata {
-    fn from(metadata: MetadataRecord<'_>) -> Self {
-        match metadata {
-            MetadataRecord::Code {
-                symbol_type,
-                symbol_name,
-                scope,
-                node_type,
-                signature,
-                documentation,
-                modifiers,
-            } => Self::Code {
-                symbol_type: match symbol_type {
-                    SymbolRecord::Module => SymbolType::Module,
-                    SymbolRecord::Class => SymbolType::Class,
-                    SymbolRecord::Interface => SymbolType::Interface,
-                    SymbolRecord::Function => SymbolType::Function,
-                    SymbolRecord::Value => SymbolType::Value,
-                    SymbolRecord::Alias => SymbolType::Alias,
-                },
-                symbol_name: symbol_name.map(Cow::into_owned),
-                scope: scope.map(Cow::into_owned),
-                node_type: node_type.map(Cow::into_owned),
-                signature: signature.map(Cow::into_owned),
-                documentation: documentation.map(Cow::into_owned),
-                modifiers: modifiers.into_iter().map(Cow::into_owned).collect(),
-            },
-            MetadataRecord::Markdown {
-                heading,
-                level,
-                scope,
-            } => Self::Markdown {
-                heading: heading.map(Cow::into_owned),
-                level,
-                scope: scope.map(Cow::into_owned),
-            },
-        }
-    }
-}
-
 pub(super) fn validate_fragment(fragment: &EntityFragment) -> EngineResult<()> {
     fragment.range().validate()?;
     if let Some(EntityContent::Outline(outline)) =
@@ -774,6 +660,7 @@ fn validate_table(table: &TableContent) -> EngineResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::{CodeMetadata, MarkdownMetadata, SymbolType};
     use serde_json::{Value, json};
 
     use super::*;
@@ -849,13 +736,20 @@ mod tests {
     fn round_trip(fragment: &EntityFragment) {
         let encoded = encode_fragment(fragment).expect("encode fragment");
         assert_eq!(
-            decode_fragment(&encoded).expect("decode fragment"),
+            decode_fragment(
+                &encoded,
+                fragment
+                    .as_entity()
+                    .and_then(|entity| entity.metadata.as_ref())
+            )
+            .expect("decode fragment"),
             *fragment
         );
     }
 
     fn assert_corrupt_fragment(record: &Value) {
-        let error = decode_fragment(&record.to_string()).expect_err("invalid stored fragment");
+        let error =
+            decode_fragment(&record.to_string(), None).expect_err("invalid stored fragment");
         assert_eq!(error.code(), EngineError::STORAGE_FAILURE, "{error}");
     }
 
@@ -901,8 +795,8 @@ mod tests {
     }
 
     #[test]
-    fn source_identities_round_trip_the_full_u64_range() {
-        for id in [0, u64::MAX] {
+    fn source_identities_round_trip_the_full_u32_range() {
+        for id in [0, u32::MAX] {
             let mut source = file();
             source.id = FileId::new(id);
             assert_eq!(
@@ -914,7 +808,7 @@ mod tests {
                 entity.file_id = source.id;
             }
             assert_eq!(
-                decode_fragment(&encode_fragment(&fragment).expect("encode fragment"))
+                decode_fragment(&encode_fragment(&fragment).expect("encode fragment"), None)
                     .expect("decode fragment"),
                 fragment
             );
@@ -922,12 +816,12 @@ mod tests {
     }
 
     #[test]
-    fn stored_file_identities_reject_values_outside_u64() {
+    fn stored_file_identities_reject_values_outside_u32() {
         let mut record: Value =
             serde_json::from_str(&encode_file(&file()).expect("source")).expect("JSON");
         let mut fragment: Value =
             serde_json::from_str(&encode_fragment(&fragment()).expect("fragment")).expect("JSON");
-        for invalid in [json!(-1), json!(1e20)] {
+        for invalid in [json!(-1), json!(u64::from(u32::MAX) + 1), json!(1e20)] {
             record["value"]["id"] = invalid.clone();
             assert!(decode_file(&record.to_string()).is_err());
             fragment["value"]["value"]["file_id"] = invalid;
@@ -980,8 +874,11 @@ mod tests {
     #[test]
     fn fragment_records_preserve_compound_content_ranges_metadata_and_ownership() {
         round_trip(&fragment());
-        let restored = decode_fragment(&encode_fragment(&fragment()).expect("encode fragment"))
-            .expect("decode fragment");
+        let restored = decode_fragment(
+            &encode_fragment(&fragment()).expect("encode fragment"),
+            None,
+        )
+        .expect("decode fragment");
         let SourceRange::Text(range) = restored.range() else {
             panic!("text range");
         };
@@ -1023,46 +920,55 @@ mod tests {
             ),
         ];
         let symbols = [
-            SymbolType::Module,
-            SymbolType::Class,
-            SymbolType::Interface,
-            SymbolType::Function,
-            SymbolType::Value,
             SymbolType::Alias,
+            SymbolType::Class,
+            SymbolType::Enum,
+            SymbolType::Function,
+            SymbolType::Interface,
+            SymbolType::Module,
+            SymbolType::Value,
         ];
         for ((range, stored_range), symbol_type) in ranges.iter().cycle().zip(symbols) {
             let EntityFragment::Standalone(mut entity) = fragment() else {
                 unreachable!()
             };
             entity.range = *range;
-            entity.metadata = Some(EntityMetadata::Code {
-                symbol_type,
+            entity.metadata = Some(EntityMetadata::Code(CodeMetadata {
+                symbol_type: Some(symbol_type),
                 symbol_name: Some("symbol".to_owned()),
                 scope: Some("module".to_owned()),
-                node_type: Some("node".to_owned()),
-                signature: Some("fn symbol()".to_owned()),
+                signature: Some("pub async fn symbol()".to_owned()),
                 documentation: Some("documentation".to_owned()),
-                modifiers: vec!["public".to_owned(), "async".to_owned()],
-            });
+            }));
             let fragment = EntityFragment::Standalone(entity);
             let encoded = encode_fragment(&fragment).expect("encode fragment");
             let record: Value = serde_json::from_str(&encoded).expect("fragment JSON");
             assert_eq!(&record["value"]["value"]["range"], stored_range);
             assert_eq!(
-                decode_fragment(&encoded).expect("decode fragment"),
+                decode_fragment(
+                    &encoded,
+                    fragment
+                        .as_entity()
+                        .and_then(|entity| entity.metadata.as_ref())
+                )
+                .expect("decode fragment"),
                 fragment
             );
         }
+    }
+
+    #[test]
+    fn fragment_records_preserve_representative_and_window_ownership() {
         let representative = EntityFragment::Representative(Entity {
             id: EntityId::new("group").expect("entity ID"),
             file_id: file().id,
             range: SourceRange::File,
             content: EntityContent::Outline("section outline".to_owned()),
-            metadata: Some(EntityMetadata::Markdown {
+            metadata: Some(EntityMetadata::Markdown(MarkdownMetadata {
                 heading: Some("heading".to_owned()),
                 level: Some(2),
                 scope: Some("parent".to_owned()),
-            }),
+            })),
         });
         let window = EntityFragment::Window(WindowFragment {
             id: FragmentId::new("window").expect("window ID"),
@@ -1070,7 +976,6 @@ mod tests {
             file_id: file().id,
             range: text_range(),
             contents: vec![Content::Text("window text".to_owned())],
-            metadata: representative.metadata().cloned(),
         });
         for fragment in [&representative, &window] {
             round_trip(fragment);
@@ -1147,7 +1052,7 @@ mod tests {
                 let error = if kind == "source file" {
                     decode_file(&json).expect_err("legacy source record")
                 } else {
-                    decode_fragment(&json).expect_err("legacy text range")
+                    decode_fragment(&json, None).expect_err("legacy text range")
                 };
                 assert!(
                     error
@@ -1186,7 +1091,7 @@ mod tests {
         let mut record = original;
         record["value"]["value"]["content"] = json!({"kind":"outline", "value":" "});
         assert_corrupt_fragment(&record);
-        assert!(decode_fragment("not JSON").is_err());
+        assert!(decode_fragment("not JSON", None).is_err());
     }
 
     #[test]

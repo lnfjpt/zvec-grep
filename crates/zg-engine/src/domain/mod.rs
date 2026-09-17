@@ -1,5 +1,6 @@
 mod content;
 mod entity;
+mod metadata;
 mod source;
 mod workspace;
 
@@ -19,12 +20,15 @@ pub(crate) use source::{ByteRange, SourceRange, TextRange};
 pub(crate) use content::{Content, ImageContent, TableCell, TableCellRole, TableContent};
 
 // Entities.
-pub(crate) use entity::{Entity, EntityContent, EntityId, EntityMetadata};
+pub(crate) use entity::{Entity, EntityContent, EntityId};
+
+// Metadata.
+pub(crate) use metadata::IndexField;
+pub use metadata::{CodeMetadata, EntityMetadata, MarkdownMetadata, SymbolType};
 
 // Fragments.
 pub(crate) use entity::{EntityFragment, FragmentId, WindowFragment, validate_fragments};
 
-pub use entity::SymbolType;
 pub use workspace::FileSelection;
 pub(crate) use workspace::{
     EmbeddingMetric, EmbeddingSchema, IndexPolicy, Workspace, WorkspaceIndex, WorkspaceName,

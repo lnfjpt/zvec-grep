@@ -1,12 +1,15 @@
 //! Storage interfaces consumed by indexing, search, and workspace lifecycle services.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
 
 use crate::{
     EngineError,
-    domain::{DirectoryId, Entity, EntityFragment, EntityId, FileId, FileRecord, SymbolType},
+    domain::{Entity, EntityFragment, EntityId, FileId, FileRecord, SourcePath, SymbolType},
     models::EmbeddingMetric,
 };
 
@@ -24,13 +27,9 @@ pub(crate) struct WorkspaceIndexEmbeddingSchema {
 pub(crate) enum WorkspaceIndexStorageOptions {
     ReadOnly {
         storage_path: PathBuf,
-        /// Resolved workspace home for the shared identity catalog, not the source root.
-        workspace_path: PathBuf,
     },
     ReadWrite {
         storage_path: PathBuf,
-        /// Resolved workspace home for the shared identity catalog, not the source root.
-        workspace_path: PathBuf,
         embedding: WorkspaceIndexEmbeddingSchema,
     },
 }
@@ -40,14 +39,6 @@ impl WorkspaceIndexStorageOptions {
         match self {
             Self::ReadOnly { storage_path, .. } | Self::ReadWrite { storage_path, .. } => {
                 storage_path
-            }
-        }
-    }
-
-    pub(crate) fn workspace_path(&self) -> &Path {
-        match self {
-            Self::ReadOnly { workspace_path, .. } | Self::ReadWrite { workspace_path, .. } => {
-                workspace_path
             }
         }
     }
@@ -83,7 +74,7 @@ pub(crate) struct StorageSearchFilter {
 pub(crate) enum StoragePathFilter {
     All,
     None,
-    Directory(DirectoryId),
+    Directory(SourcePath),
     FileNameExact(String),
     FileNamePrefix(String),
     FileNameSuffix(String),
@@ -100,10 +91,17 @@ pub(crate) enum StorageSearchPath {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StorageSearchHit {
-    pub fragment: EntityFragment,
-    pub file: FileRecord,
+    pub document_id: String,
+    pub entity_id: EntityId,
+    pub file_id: FileId,
     pub path: StorageSearchPath,
     pub score: f64,
+}
+
+#[derive(Default)]
+pub(crate) struct StoredSearchData {
+    pub entities: HashMap<EntityId, StoredEntity>,
+    pub fragments: HashMap<String, EntityFragment>,
 }
 
 /// Opens and manages concrete workspace-index storage instances.
@@ -135,7 +133,7 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
             .collect())
     }
 
-    /// Durably reserves workspace identities before extraction or index writes.
+    /// Reserves index-local IDs in memory. File write intent makes them durable.
     fn resolve_file_ids(&self, _paths: &[PathBuf]) -> StorageResult<Vec<FileId>> {
         Err(EngineError::storage_failure(
             "file identity allocation is unsupported",
@@ -146,15 +144,15 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
         false
     }
 
-    fn directory_id(&self, _path: &Path) -> StorageResult<Option<DirectoryId>> {
-        Ok(None)
-    }
-
     fn has_non_unicode_file_names(&self) -> StorageResult<bool> {
         Ok(true)
     }
 
-    fn get_entity(&self, entity_id: &EntityId) -> StorageResult<Option<StoredEntity>>;
+    fn load_search_hits(&self, _hits: &[StorageSearchHit]) -> StorageResult<StoredSearchData> {
+        Err(EngineError::storage_failure(
+            "search result loading is unsupported",
+        ))
+    }
 
     fn search_fts(
         &self,
@@ -206,7 +204,6 @@ mod tests {
         let path = PathBuf::from("workspace-index");
         let options = WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: path.clone(),
-            workspace_path: path.clone(),
         };
 
         assert!(options.is_read_only());

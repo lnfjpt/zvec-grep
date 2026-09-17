@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
-
 use crate::{EngineError, EngineResult};
 
-use super::{Content, FileId, SourceRange};
+use super::{Content, EntityMetadata, FileId, SourceRange};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct EntityId(String);
@@ -76,7 +74,6 @@ pub(crate) struct WindowFragment {
     pub file_id: FileId,
     pub range: SourceRange,
     pub contents: Vec<Content>,
-    pub metadata: Option<EntityMetadata>,
 }
 
 impl EntityFragment {
@@ -109,13 +106,6 @@ impl EntityFragment {
         }
     }
 
-    pub(crate) fn metadata(&self) -> Option<&EntityMetadata> {
-        match self {
-            Self::Standalone(entity) | Self::Representative(entity) => entity.metadata.as_ref(),
-            Self::Window(window) => window.metadata.as_ref(),
-        }
-    }
-
     /// Original content in reading order; outlines have no recorded source content.
     pub(crate) fn contents(&self) -> &[Content] {
         match self {
@@ -133,36 +123,6 @@ impl EntityFragment {
             Self::Window(_) => None,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SymbolType {
-    Module,
-    Class,
-    Interface,
-    Function,
-    Value,
-    Alias,
-}
-
-/// Descriptive attributes attached to an entity or fragment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum EntityMetadata {
-    Code {
-        symbol_type: SymbolType,
-        symbol_name: Option<String>,
-        scope: Option<String>,
-        node_type: Option<String>,
-        signature: Option<String>,
-        documentation: Option<String>,
-        modifiers: Vec<String>,
-    },
-    Markdown {
-        heading: Option<String>,
-        level: Option<usize>,
-        scope: Option<String>,
-    },
 }
 
 /// Checks identities, ownership, and ranges for the fragments of one source file.
@@ -261,7 +221,6 @@ mod tests {
             file_id: file_id(),
             range: range(5, 15),
             contents: vec![Content::Text("fghijklmno".to_owned())],
-            metadata: None,
         }
     }
 

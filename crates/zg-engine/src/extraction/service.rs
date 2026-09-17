@@ -9,8 +9,8 @@ use super::{
 use crate::{
     EngineError,
     domain::{
-        Content, EntityContent, EntityMetadata, FileCategory, FileFormat, SourceRange, SymbolType,
-        TableCellRole,
+        CodeMetadata, Content, EntityContent, EntityMetadata, FileCategory, FileFormat,
+        MarkdownMetadata, SourceRange, TableCellRole,
     },
     utils::{collapse_whitespace, take_utf16, utf16_len},
 };
@@ -108,6 +108,7 @@ fn has_category(formats: &[FileFormat], category: FileCategory) -> bool {
 
 pub(super) fn vector_content_for_fragment(
     fragment: &ExtractedFragment,
+    metadata: Option<&EntityMetadata>,
     embedding_content: Option<&[Content]>,
     max_chars: Option<usize>,
 ) -> Vec<Content> {
@@ -130,7 +131,7 @@ pub(super) fn vector_content_for_fragment(
         }
         contents = projected;
     }
-    let metadata = vector_metadata_text(fragment.metadata(), metadata_budget(max_chars));
+    let metadata = vector_metadata_text(metadata, metadata_budget(max_chars));
     if !metadata.is_empty() {
         if let Some(Content::Text(text)) = contents.first_mut() {
             *text = format!("{metadata}\n{text}");
@@ -208,33 +209,32 @@ fn vector_metadata_text(metadata: Option<&EntityMetadata>, max_chars: Option<usi
     };
 
     let lines = match metadata {
-        EntityMetadata::Code {
+        EntityMetadata::Code(CodeMetadata {
             symbol_type,
             symbol_name,
             scope,
             signature,
             documentation,
-            modifiers,
-            ..
-        } => vec![
-            Some(match symbol_name {
-                Some(name) => format!("symbol: {} {name}", symbol_type_name(*symbol_type)),
-                None => format!("symbol: {}", symbol_type_name(*symbol_type)),
-            }),
+        }) => vec![
+            match (symbol_type, symbol_name) {
+                (Some(kind), Some(name)) => Some(format!("symbol: {} {name}", kind.as_str())),
+                (Some(kind), None) => Some(format!("symbol: {}", kind.as_str())),
+                (None, Some(name)) => Some(format!("symbol: {name}")),
+                (None, None) => None,
+            },
             scope.as_ref().map(|value| format!("scope: {value}")),
             signature
                 .as_ref()
                 .map(|value| format!("signature: {}", collapse_whitespace(value))),
-            (!modifiers.is_empty()).then(|| format!("modifiers: {}", modifiers.join(" "))),
             documentation
                 .as_ref()
                 .map(|value| format!("doc: {}", collapse_whitespace(value))),
         ],
-        EntityMetadata::Markdown {
+        EntityMetadata::Markdown(MarkdownMetadata {
             heading,
             level,
             scope,
-        } => vec![
+        }) => vec![
             heading.as_ref().map(|value| format!("heading: {value}")),
             level.map(|value| format!("heading_level: {value}")),
             scope.as_ref().map(|value| format!("scope: {value}")),
@@ -249,17 +249,6 @@ fn metadata_budget(max_chars: Option<usize>) -> Option<usize> {
     max_chars.map(|value| value / 4)
 }
 
-pub(super) fn symbol_type_name(symbol_type: SymbolType) -> &'static str {
-    match symbol_type {
-        SymbolType::Module => "module",
-        SymbolType::Class => "class",
-        SymbolType::Interface => "interface",
-        SymbolType::Function => "function",
-        SymbolType::Value => "value",
-        SymbolType::Alias => "alias",
-    }
-}
-
 #[cfg(test)]
 pub(super) fn test_source(format: FileFormat, relative_path: &str, text: &str) -> TextSource {
     TextSource {
@@ -267,6 +256,13 @@ pub(super) fn test_source(format: FileFormat, relative_path: &str, text: &str) -
         formats: vec![format],
         text: text.to_owned(),
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_metadata(fragment: &ExtractedFragment) -> Option<&EntityMetadata> {
+    fragment
+        .as_entity()
+        .and_then(|entity| entity.metadata.as_ref())
 }
 
 #[cfg(test)]
@@ -319,7 +315,7 @@ mod tests {
         let fragments = extract(&source, ChunkOptions::default()).expect("data extraction");
         assert_eq!(fragments.len(), 1);
         assert_eq!(test_content(&fragments[0]), Content::Text(source.text));
-        assert!(fragments[0].metadata().is_none());
+        assert!(test_metadata(&fragments[0]).is_none());
     }
 
     #[test]
@@ -349,7 +345,7 @@ mod tests {
             metadata: None,
         });
         assert_eq!(
-            vector_content_for_fragment(&fragment, None, None),
+            vector_content_for_fragment(&fragment, None, None, None),
             vec![
                 Content::Text("before".to_owned()),
                 Content::Text("cell 0,0 (1x1):".to_owned()),

@@ -255,23 +255,25 @@ impl From<DeviceArg> for Device {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SymbolTypeArg {
-    Module,
-    Class,
-    Interface,
-    Function,
-    Value,
     Alias,
+    Class,
+    Enum,
+    Function,
+    Interface,
+    Module,
+    Value,
 }
 
 impl From<SymbolTypeArg> for SymbolType {
     fn from(value: SymbolTypeArg) -> Self {
         match value {
-            SymbolTypeArg::Module => Self::Module,
-            SymbolTypeArg::Class => Self::Class,
-            SymbolTypeArg::Interface => Self::Interface,
-            SymbolTypeArg::Function => Self::Function,
-            SymbolTypeArg::Value => Self::Value,
             SymbolTypeArg::Alias => Self::Alias,
+            SymbolTypeArg::Class => Self::Class,
+            SymbolTypeArg::Enum => Self::Enum,
+            SymbolTypeArg::Function => Self::Function,
+            SymbolTypeArg::Interface => Self::Interface,
+            SymbolTypeArg::Module => Self::Module,
+            SymbolTypeArg::Value => Self::Value,
         }
     }
 }
@@ -1528,6 +1530,34 @@ mod tests {
         assert_eq!(request.limit, Some(7));
         assert!(output.human);
         assert!(output.trace);
+    }
+
+    #[test]
+    fn parses_all_symbol_type_filters() {
+        let types = [
+            "alias",
+            "class",
+            "enum",
+            "function",
+            "interface",
+            "module",
+            "value",
+        ];
+        let mut args = vec!["zg", "query", "needle"];
+        for symbol_type in types {
+            args.extend(["--symbol-type", symbol_type]);
+        }
+        let CliPlan::Query { request, .. } = Cli::try_parse_from(args)
+            .expect("all symbol types should parse")
+            .into_plan(PathBuf::from("/workspace"))
+            .expect("query plan")
+        else {
+            panic!("query")
+        };
+        assert_eq!(
+            serde_json::json!(request.symbol_types),
+            serde_json::json!(types)
+        );
     }
 
     #[test]

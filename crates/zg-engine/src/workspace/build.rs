@@ -252,7 +252,8 @@ fn cleanup_previous(
             previous.storage_generation = Some(id.clone());
             remove_generation(home, &previous, factory)
         }
-    }
+    }?;
+    crate::storage::delete_workspace_identities(home)
 }
 
 fn remove_generation(
@@ -455,6 +456,8 @@ mod tests {
         let mut active = manifest(directory.path());
         active.storage_generation = Some(Uuid::new_v4().to_string());
         write_active(&active);
+        fs::create_dir(active.path.join("catalog")).expect("legacy catalog");
+        fs::write(active.path.join("identity.json"), b"legacy").expect("legacy identities");
         let factory = TestFactory::default();
         let build = prepare_build(active.clone(), Some(&active), None, &factory).expect("stage");
         fs::create_dir(build.target.storage_home().join("storage")).expect("completed new storage");
@@ -477,6 +480,7 @@ mod tests {
         );
         assert!(active.storage_home().exists());
         assert!(has_build(&active.path));
+        assert!(active.path.join("catalog").exists());
         committed.workspace.name = WorkspaceName::new("renamed").expect("new workspace name");
         write_workspace_manifest(&active.path, &committed).expect("rename after publication");
         factory.fail_delete.store(false, Ordering::Relaxed);
@@ -486,6 +490,8 @@ mod tests {
         assert!(!active.storage_home().exists());
         assert!(committed.storage_home().join("storage").is_dir());
         assert!(!has_build(&active.path));
+        assert!(!active.path.join("catalog").exists());
+        assert!(!active.path.join("identity.json").exists());
         assert_eq!(
             read_workspace_manifest(&active.path).expect("active manifest"),
             Some(committed)

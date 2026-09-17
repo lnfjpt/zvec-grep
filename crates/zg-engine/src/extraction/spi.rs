@@ -75,7 +75,6 @@ pub(crate) struct ExtractedWindow {
     pub entity_index: usize,
     pub range: SourceRange,
     pub contents: Vec<Content>,
-    pub metadata: Option<EntityMetadata>,
 }
 
 impl ExtractedFragment {
@@ -97,13 +96,6 @@ impl ExtractedFragment {
         match self {
             Self::Standalone(entity) | Self::Representative(entity) => &entity.range,
             Self::Window(window) => &window.range,
-        }
-    }
-
-    pub(crate) fn metadata(&self) -> Option<&EntityMetadata> {
-        match self {
-            Self::Standalone(entity) | Self::Representative(entity) => entity.metadata.as_ref(),
-            Self::Window(window) => window.metadata.as_ref(),
         }
     }
 

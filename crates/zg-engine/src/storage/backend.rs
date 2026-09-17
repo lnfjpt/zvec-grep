@@ -11,24 +11,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EngineError, EngineResult,
-    domain::{DirectoryId, EntityId, FileId, FileIndexStatus, FileRecord, validate_fragments},
+    domain::{FileId, FileIndexStatus, FileRecord, validate_fragments},
     models::EmbeddingMetric,
     utils::{atomic_write as write_record, sync_directory},
 };
 
 use super::{
-    catalog::Catalog,
     codec,
+    file_ids::FileIds,
     pending::{self, PendingChange, PendingChanges},
     spi::{
-        IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit, StoredEntity,
+        IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit, StoredSearchData,
         WorkspaceIndexEmbeddingSchema, WorkspaceIndexStorage, WorkspaceIndexStorageFactory,
         WorkspaceIndexStorageOptions,
     },
     zvec::NativeStore,
 };
 
-const VERSION: u32 = 8;
+const VERSION: u32 = 10;
 const CHECKPOINT_OPERATIONS: usize = 64;
 const CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 type StoreRegistry = Mutex<HashMap<PathBuf, Weak<SharedStore>>>;
@@ -47,7 +47,6 @@ struct SharedStore {
     state: Mutex<StoreState>,
     path: PathBuf,
     schema: WorkspaceIndexEmbeddingSchema,
-    catalog: Mutex<Catalog>,
     read_only: bool,
     // The native handles must close before the operating-system lock is released.
     _lock: File,
@@ -55,6 +54,7 @@ struct SharedStore {
 
 struct StoreState {
     native: NativeStore,
+    file_ids: FileIds,
     pending: PendingChanges,
     pending_operations: usize,
     pending_bytes: u64,
@@ -131,9 +131,9 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
     ) -> StorageResult<Box<dyn WorkspaceIndexStorage>> {
         initialize()?;
         let home = options.storage_path();
-        if !home.is_absolute() || !options.workspace_path().is_absolute() {
+        if !home.is_absolute() {
             return Err(EngineError::invalid_argument(
-                "storage and workspace paths must be absolute",
+                "storage path must be absolute",
             ));
         }
         let read_only = options.is_read_only();
@@ -167,8 +167,14 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
                 "workspace storage is already open",
             ));
         }
-        let (lock, schema, catalog) = prepare_storage(&home, &path, &options)?;
+        let (lock, schema) = prepare_storage(&home, &path, &options)?;
         let native = NativeStore::open(&path, &schema, read_only)?;
+        // Readers do not need an allocation map or an O(files) startup scan.
+        let file_ids = if read_only {
+            FileIds::from_paths([])?
+        } else {
+            native.load_file_ids()?
+        };
         if !read_only {
             // Repeat the same range after failures that leave directories in place.
             sync_directory(&path)?;
@@ -180,6 +186,7 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
         let shared = Arc::new(SharedStore {
             state: Mutex::new(StoreState {
                 native,
+                file_ids,
                 pending: PendingChanges::new(),
                 pending_operations: 0,
                 pending_bytes: 0,
@@ -187,7 +194,6 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
                 closed: false,
             }),
             path: path.clone(),
-            catalog: Mutex::new(catalog),
             schema,
             read_only,
             _lock: lock,
@@ -230,27 +236,6 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
 }
 
 impl ZvecStorage {
-    fn with_catalog<T>(
-        &self,
-        operation: impl FnOnce(&mut Catalog) -> EngineResult<T>,
-    ) -> EngineResult<T> {
-        let shared = self.shared()?;
-        let state = lock_state(&shared)?;
-        assert_usable(&state)?;
-        let mut catalog = shared
-            .catalog
-            .lock()
-            .map_err(|_| EngineError::internal("identity catalog lock was poisoned"))?;
-        operation(&mut catalog)
-    }
-
-    fn file_directories(&self, file: &FileRecord) -> EngineResult<Vec<DirectoryId>> {
-        self.with_catalog(|catalog| {
-            catalog.validate_file(file)?;
-            catalog.ancestor_directory_ids(&file.relative_path)
-        })
-    }
-
     fn shared(&self) -> EngineResult<Arc<SharedStore>> {
         self.shared
             .lock()
@@ -281,6 +266,13 @@ impl ZvecStorage {
         let shared = self.shared()?;
         let mut state = lock_state(&shared)?;
         assert_usable(&state)?;
+        if let PendingChange::Reindex(file) = &change {
+            state.file_ids.validate(file)?;
+        }
+        let deleted = match &change {
+            PendingChange::Delete(id) => Some(*id),
+            PendingChange::Reindex(_) => None,
+        };
         // Keep every file changed since the last checkpoint. A crash may require
         // reindexing even files whose native writes already completed in memory.
         state.needs_recovery = true;
@@ -291,6 +283,9 @@ impl ZvecStorage {
             pending::write(&shared.path, &state.pending)?;
         }
         operation(&state.native)?;
+        if let Some(id) = deleted {
+            state.file_ids.remove(id);
+        }
         state.pending_operations = state.pending_operations.saturating_add(1);
         state.pending_bytes = state.pending_bytes.saturating_add(bytes);
         if state.pending_operations >= CHECKPOINT_OPERATIONS
@@ -350,23 +345,28 @@ impl WorkspaceIndexStorage for ZvecStorage {
                 "cannot allocate file identities in read-only storage",
             ));
         }
-        self.with_catalog(|catalog| catalog.resolve_file_ids(paths))
+        let shared = self.shared()?;
+        let mut state = lock_state(&shared)?;
+        assert_usable(&state)?;
+        state.file_ids.resolve(paths)
     }
 
     fn supports_path_filters(&self) -> bool {
         true
     }
 
-    fn directory_id(&self, path: &Path) -> StorageResult<Option<DirectoryId>> {
-        self.with_catalog(|catalog| catalog.directory_id(path))
-    }
-
     fn has_non_unicode_file_names(&self) -> StorageResult<bool> {
-        self.with_catalog(|catalog| Ok(catalog.has_non_unicode_file_names()))
+        if self.read_only {
+            return self.read(NativeStore::has_non_unicode_file_names);
+        }
+        let shared = self.shared()?;
+        let state = lock_state(&shared)?;
+        assert_usable(&state)?;
+        Ok(state.file_ids.has_non_unicode_file_names())
     }
 
-    fn get_entity(&self, id: &EntityId) -> StorageResult<Option<StoredEntity>> {
-        self.read(|native| native.get_entity(id))
+    fn load_search_hits(&self, hits: &[StorageSearchHit]) -> StorageResult<StoredSearchData> {
+        self.read(|native| native.load_search_hits(hits))
     }
 
     fn search_fts(
@@ -404,11 +404,10 @@ impl WorkspaceIndexStorage for ZvecStorage {
             .map_err(|_| EngineError::invalid_argument("entity count exceeds u64"))?,
         };
         file.validate()?;
-        let directories = self.file_directories(&file)?;
         self.apply(
             PendingChange::reindex(&file),
             estimated_write_bytes(&file, entries),
-            |native| native.apply_replace(&file, entries, &directories),
+            |native| native.apply_replace(&file, entries),
         )
     }
 
@@ -424,6 +423,9 @@ impl WorkspaceIndexStorage for ZvecStorage {
         let shared = self.shared()?;
         let mut state = lock_state(&shared)?;
         assert_usable(&state)?;
+        for file in files {
+            state.file_ids.validate(file)?;
+        }
         let changes = files
             .iter()
             .map(|file| PendingChange::reindex(file))
@@ -450,9 +452,8 @@ impl WorkspaceIndexStorage for ZvecStorage {
             error: error.to_owned(),
         };
         file.validate()?;
-        let directories = self.file_directories(&file)?;
         self.apply(PendingChange::reindex(&file), 0, |native| {
-            native.apply_replace(&file, &[], &directories)
+            native.apply_replace(&file, &[])
         })
     }
 
@@ -510,17 +511,12 @@ fn estimated_write_bytes(file: &FileRecord, entries: &[IndexedFragment]) -> u64 
         })
 }
 
-fn recover_pending(
-    native: &NativeStore,
-    catalog: &Catalog,
-    changes: PendingChanges,
-) -> EngineResult<()> {
+fn recover_pending(native: &NativeStore, changes: PendingChanges) -> EngineResult<()> {
     for change in changes.into_values() {
         match change {
             PendingChange::Reindex(mut file) => {
                 file.index_status = FileIndexStatus::NotIndexed;
-                let directories = catalog.ancestor_directory_ids(&file.relative_path)?;
-                native.apply_replace(&file, &[], &directories)?;
+                native.apply_replace(&file, &[])?;
             }
             PendingChange::Delete(id) => native.apply_delete(id)?,
         }
@@ -639,13 +635,13 @@ fn prepare_storage(
     home: &Path,
     path: &Path,
     options: &WorkspaceIndexStorageOptions,
-) -> EngineResult<(File, WorkspaceIndexEmbeddingSchema, Catalog)> {
+) -> EngineResult<(File, WorkspaceIndexEmbeddingSchema)> {
     let read_only = options.is_read_only();
     let mut shared = read_only;
     loop {
         let lock = acquire_storage_lock(home, shared)?;
         let marker = path.join(pending::NAME);
-        if shared && (marker.exists() || Catalog::needs_recovery(options.workspace_path())?) {
+        if shared && marker.exists() {
             // Release before changing lock modes; Windows does not convert held locks.
             shared = false;
             continue;
@@ -664,39 +660,27 @@ fn prepare_storage(
                 return Err(io_error("create storage directory", path, &error));
             }
         }
-        let existing_schema = path.join("schema.json").exists();
-        // Validate old schemas first; for a fresh store, publish its catalog
-        // before its schema so interruption cannot leave a schema without IDs.
-        let schema = existing_schema
-            .then(|| load_schema(path, options))
-            .transpose()?;
-        if existing_schema && !Catalog::exists(options.workspace_path())? {
-            return Err(EngineError::storage_failure(
-                "workspace identity catalog is missing; rebuild the index",
-            ));
-        }
-        if read_only && Catalog::needs_recovery(options.workspace_path())? {
-            // Recovery and legacy migration require the catalog's exclusive
-            // lock. Release that writer before reopening the read-only handle.
-            drop(Catalog::open(options.workspace_path(), false)?);
-        }
-        let catalog = Catalog::open(options.workspace_path(), read_only)?;
-        let schema = match schema {
-            Some(schema) => schema,
-            None => load_schema(path, options)?,
-        };
+        let schema = load_schema(path, options)?;
         if marker.exists() {
             // Decode the entire batch before touching native data. Recovery
             // needs writable handles even when the caller only wants to search.
             let changes = pending::read(path)?;
-            // Validate every owner before mutating any collection in the batch.
+            let native = NativeStore::open(path, &schema, false)?;
+            let mut file_ids = native.load_file_ids()?;
+            // The journal may contain new source records absent from native storage.
+            // Remove deleted owners first, then reject every conflicting mapping
+            // before touching any collection.
             for change in changes.values() {
-                if let PendingChange::Reindex(file) = change {
-                    catalog.validate_file(file)?;
+                if let PendingChange::Delete(id) = change {
+                    file_ids.remove(*id);
                 }
             }
-            let native = NativeStore::open(path, &schema, false)?;
-            recover_pending(&native, &catalog, changes)?;
+            for change in changes.values() {
+                if let PendingChange::Reindex(file) = change {
+                    file_ids.claim(file.id, file.relative_path.clone())?;
+                }
+            }
+            recover_pending(&native, changes)?;
             native.flush()?;
             pending::clear(path)?;
         }
@@ -705,7 +689,7 @@ fn prepare_storage(
             shared = true;
             continue;
         }
-        return Ok((lock, schema, catalog));
+        return Ok((lock, schema));
     }
 }
 

@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 use zvec_rust::{
@@ -10,18 +11,20 @@ use zvec_rust::{
 };
 
 use super::{
-    catalog::path::{decode_path, encode_path, path_key, query_path},
     codec,
+    directories::DirectoryIds,
+    file_ids::FileIds,
+    path::{decode_path, encode_path, path_key, query_path},
     spi::{
         IndexedFragment, StoragePathFilter, StorageSearchFilter, StorageSearchHit,
-        StorageSearchPath, StoredEntity, WorkspaceIndexEmbeddingSchema,
+        StorageSearchPath, StoredEntity, StoredSearchData, WorkspaceIndexEmbeddingSchema,
     },
 };
 use crate::{
     EngineError, EngineResult,
     domain::{
-        Content, DirectoryId, EntityContent, EntityFragment, EntityId, EntityMetadata, FileId,
-        FileRecord, SymbolType, validate_fragments,
+        CodeMetadata, Content, DirectoryId, EntityContent, EntityFragment, EntityId,
+        EntityMetadata, FileId, FileRecord, IndexField, SourcePath, validate_fragments,
     },
     models::EmbeddingMetric,
     utils::sha256_hex_parts,
@@ -32,11 +35,29 @@ const MAX_TOP_K: usize = 100_000;
 
 pub(super) struct NativeStore {
     files: Collection,
+    directory_ids: Mutex<Option<DirectoryIds>>,
+    path: PathBuf,
     entities: Collection,
     fragments: Collection,
     vectors: Collection,
     dimension: usize,
     read_only: bool,
+}
+
+struct EncodedMetadata {
+    json: String,
+    fields: Vec<(IndexField, String)>,
+}
+
+impl EncodedMetadata {
+    fn new(metadata: &EntityMetadata) -> EngineResult<Self> {
+        let value = serde_json::to_value(metadata)
+            .map_err(|error| corrupt(format!("encode entity metadata: {error}")))?;
+        let fields = encode_metadata_fields(&value)?;
+        let json = serde_json::to_string(&value)
+            .map_err(|error| corrupt(format!("encode entity metadata: {error}")))?;
+        Ok(Self { json, fields })
+    }
 }
 
 impl NativeStore {
@@ -68,6 +89,8 @@ impl NativeStore {
             read_only,
         )?;
         Ok(Self {
+            directory_ids: Mutex::new(None),
+            path: path.to_path_buf(),
             files,
             entities,
             fragments,
@@ -105,32 +128,70 @@ impl NativeStore {
             .collect()
     }
 
-    pub(super) fn get_file(&self, id: FileId) -> EngineResult<Option<FileRecord>> {
-        let key = file_key(id);
-        fetch_one(&self.files, &key)?
-            .as_ref()
-            .map(decode_file_doc)
-            .transpose()
+    /// One writer startup scan derives both caches from source ownership.
+    pub(super) fn load_file_ids(&self) -> EngineResult<FileIds> {
+        let (paths, directories) = self.source_identities()?;
+        let ids = FileIds::from_paths(paths)?;
+        *self
+            .directory_ids
+            .lock()
+            .map_err(|_| corrupt("directory cache lock poisoned"))? = Some(directories);
+        Ok(ids)
     }
 
-    pub(super) fn get_entity(&self, id: &EntityId) -> EngineResult<Option<StoredEntity>> {
-        let key = primary_key("fragment", id.as_str());
-        let Some(doc) = fetch_one(&self.entities, &key)? else {
-            return Ok(None);
-        };
-        let fragment = decode_fragment_doc(&doc)?;
-        let entity = fragment
-            .as_entity()
-            .ok_or_else(|| corrupt("window found in entity collection"))?
-            .clone();
-        if entity.id != *id {
-            return Err(corrupt("entity ID does not match its primary key"));
+    fn source_identities(&self) -> EngineResult<(Vec<(FileId, PathBuf)>, DirectoryIds)> {
+        let iterator = native(
+            self.files
+                .iter_with_options(Some(&["file_id", "path", "ancestor_directory_ids"]), false),
+            "iterate source identities",
+        )?;
+        let mut paths = Vec::new();
+        let mut directories = DirectoryIds::default();
+        for doc in iterator {
+            let doc = native(doc, "read source identity")?;
+            let (id, path) = decode_file_path_doc(&doc)?;
+            let ids = native(
+                doc.get_array_u32("ancestor_directory_ids"),
+                "read directory membership",
+            )?
+            .unwrap_or_default();
+            directories.add_source(&SourcePath::new(&path)?, &ids)?;
+            paths.push((id, path));
         }
-        let file = self
-            .get_file(entity.file_id)?
-            .ok_or_else(|| corrupt("entity references a missing file"))?;
-        validate_indexed_owner(&file, entity.file_id)?;
-        Ok(Some(StoredEntity { entity, file }))
+        Ok((paths, directories))
+    }
+
+    fn directories(&self) -> EngineResult<MutexGuard<'_, Option<DirectoryIds>>> {
+        let mut directories = self
+            .directory_ids
+            .lock()
+            .map_err(|_| corrupt("directory cache lock poisoned"))?;
+        if directories.is_none() {
+            *directories = Some(if self.read_only {
+                match DirectoryIds::read_cache(&self.path)? {
+                    Some(cache) => cache,
+                    None => self.source_identities()?.1,
+                }
+            } else {
+                self.source_identities()?.1
+            });
+        }
+        Ok(directories)
+    }
+
+    /// Non-Unicode basenames use an empty, non-null indexed projection.
+    pub(super) fn has_non_unicode_file_names(&self) -> EngineResult<bool> {
+        let mut query = native(SearchQuery::scalar(1), "check native file names")?;
+        native(
+            query.set_filter("file_name = ''"),
+            "filter native file names",
+        )?;
+        native(
+            query.set_output_fields(&["file_id"]),
+            "project file identity",
+        )?;
+        native(query.set_include_vector(false), "omit vectors")?;
+        Ok(!native(self.files.query(&query), "query native file names")?.is_empty())
     }
 
     pub(super) fn search_fts(
@@ -151,17 +212,16 @@ impl NativeStore {
             SearchQuery::fts("text", &fts, top_k(limit)?),
             "create full-text query",
         )?;
-        configure_query(&mut request, filter, &["payload", "file_id", "entity_id"])?;
-        let docs = native(self.fragments.query(&request), "search full-text index")?;
-        self.hydrate(
-            docs.into_iter()
-                .map(|doc| {
-                    let score = f64::from(doc.get_score());
-                    (doc, score)
-                })
-                .collect(),
-            StorageSearchPath::Fts,
-        )
+        configure_query(
+            self,
+            &mut request,
+            filter,
+            &["document_id", "entity_id", "file_id"],
+        )?;
+        native(self.fragments.query(&request), "search full-text index")?
+            .into_iter()
+            .map(|doc| decode_search_hit(&doc, StorageSearchPath::Fts))
+            .collect()
     }
 
     pub(super) fn search_vector(
@@ -178,75 +238,116 @@ impl NativeStore {
             SearchQuery::new("embedding", vector, top_k(limit)?),
             "create vector query",
         )?;
-        configure_query(&mut request, filter, &["fragment_id"])?;
-        let ranked = native(self.vectors.query(&request), "search vector index")?
-            .into_iter()
-            .map(|doc| {
-                Ok((
-                    string_field(&doc, "fragment_id")?,
-                    f64::from(doc.get_score()),
-                ))
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let mut docs = fetch_map(
-            &self.fragments,
-            &ranked.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        configure_query(
+            self,
+            &mut request,
+            filter,
+            &["document_id", "entity_id", "file_id"],
         )?;
-        let fragments = ranked
+        native(self.vectors.query(&request), "search vector index")?
             .into_iter()
-            .map(|(key, score)| {
-                Ok((
-                    docs.remove(&key)
-                        .ok_or_else(|| corrupt("vector references a missing fragment"))?,
-                    score,
-                ))
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        self.hydrate(fragments, StorageSearchPath::Vector)
+            .map(|doc| decode_search_hit(&doc, StorageSearchPath::Vector))
+            .collect()
     }
 
-    fn hydrate(
+    pub(super) fn load_search_hits(
         &self,
-        docs: Vec<(Doc, f64)>,
-        path: StorageSearchPath,
-    ) -> EngineResult<Vec<StorageSearchHit>> {
-        let fragments = docs
-            .into_iter()
-            .map(|(doc, score)| Ok((decode_fragment_doc(&doc)?, score)))
-            .collect::<EngineResult<Vec<_>>>()?;
-        let keys = fragments
-            .iter()
-            .map(|(fragment, _)| file_key(*fragment.file_id()))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let files = fetch_map(&self.files, &keys)?
-            .into_iter()
-            .map(|(key, doc)| Ok((key, decode_file_doc(&doc)?)))
+        hits: &[StorageSearchHit],
+    ) -> EngineResult<StoredSearchData> {
+        let keys = |values: Vec<String>| {
+            values
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let entity_keys = keys(
+            hits.iter()
+                .map(|hit| primary_key("fragment", hit.entity_id.as_str()))
+                .collect(),
+        );
+        let fragment_keys = keys(
+            hits.iter()
+                .map(|hit| primary_key("fragment", &hit.document_id))
+                .collect(),
+        );
+        let file_keys = keys(hits.iter().map(|hit| file_key(hit.file_id)).collect());
+        let entity_docs = fetch_map(&self.entities, &entity_keys)?;
+        let fragment_docs = fetch_map(&self.fragments, &fragment_keys)?;
+        let files = fetch_map(&self.files, &file_keys)?
+            .into_values()
+            .map(|doc| decode_file_doc(&doc).map(|file| (file.id, file)))
             .collect::<EngineResult<HashMap<_, _>>>()?;
-        fragments
-            .into_iter()
-            .map(|(fragment, score)| {
-                let file = files
-                    .get(&file_key(*fragment.file_id()))
-                    .ok_or_else(|| corrupt("fragment references a missing file"))?
-                    .clone();
-                validate_indexed_owner(&file, *fragment.file_id())?;
-                Ok(StorageSearchHit {
-                    fragment,
-                    file,
-                    path,
-                    score,
-                })
-            })
-            .collect()
+        let mut entities = HashMap::new();
+        let mut representatives = HashSet::new();
+        for doc in entity_docs.into_values() {
+            let metadata = decode_metadata(&doc)?;
+            let fragment = decode_fragment_doc(&doc, metadata.as_ref())?;
+            if let EntityFragment::Representative(entity) = &fragment {
+                representatives.insert(entity.id.clone());
+            }
+            let entity = match fragment {
+                EntityFragment::Standalone(entity) | EntityFragment::Representative(entity) => {
+                    entity
+                }
+                EntityFragment::Window(_) => {
+                    return Err(corrupt("window found in entity collection"));
+                }
+            };
+            let file = files
+                .get(&entity.file_id)
+                .ok_or_else(|| corrupt("entity references a missing file"))?;
+            validate_indexed_owner(file, entity.file_id)?;
+            entities.insert(
+                entity.id.clone(),
+                StoredEntity {
+                    entity,
+                    file: file.clone(),
+                },
+            );
+        }
+        let mut fragments = HashMap::new();
+        for doc in fragment_docs.into_values() {
+            let id = EntityId::new(decode_id(&string_field(&doc, "entity_id")?)?)
+                .map_err(|error| corrupt(error.to_string()))?;
+            let owner = entities
+                .get(&id)
+                .ok_or_else(|| corrupt("fragment references a missing entity"))?;
+            let fragment = decode_fragment_doc(&doc, owner.entity.metadata.as_ref())?;
+            if *fragment.file_id() != owner.file.id
+                || !owner.entity.range.contains(fragment.range())
+                || (matches!(fragment, EntityFragment::Window(_)) && !representatives.contains(&id))
+            {
+                return Err(corrupt("fragment lies outside its entity or source file"));
+            }
+            if fragment
+                .as_entity()
+                .is_some_and(|entity| entity != &owner.entity)
+            {
+                return Err(corrupt("fragment differs from its stored entity"));
+            }
+            fragments.insert(fragment.document_id().to_owned(), fragment);
+        }
+        for hit in hits {
+            let fragment = fragments
+                .get(&hit.document_id)
+                .ok_or_else(|| corrupt("search references a missing fragment"))?;
+            if fragment.entity_id() != &hit.entity_id || *fragment.file_id() != hit.file_id {
+                return Err(corrupt(
+                    "search identities differ from their stored fragment",
+                ));
+            }
+        }
+        Ok(StoredSearchData {
+            entities,
+            fragments,
+        })
     }
 
     pub(super) fn apply_replace(
         &self,
         file: &FileRecord,
         entries: &[IndexedFragment],
-        directories: &[DirectoryId],
     ) -> EngineResult<()> {
         self.assert_writable()?;
         validate_fragments(file.id, entries.iter().map(|entry| &entry.fragment))?;
@@ -264,20 +365,42 @@ impl NativeStore {
                 "file index status does not match its fragments",
             ));
         }
+        let directories = self
+            .directories()?
+            .as_mut()
+            .expect("loaded directories")
+            .resolve(&file.relative_path)?;
+        let directories = directories.as_slice();
         let file_doc = encode_file_doc(file, directories)?;
         let mut fragments = Vec::with_capacity(entries.len());
         let mut entities = Vec::new();
         let mut vectors = Vec::with_capacity(entries.len());
+        let owners = entries
+            .iter()
+            .filter_map(|entry| entry.fragment.as_entity())
+            .map(|entity| {
+                let metadata = entity
+                    .metadata
+                    .as_ref()
+                    .map(EncodedMetadata::new)
+                    .transpose()?;
+                Ok((&entity.id, (entity, metadata)))
+            })
+            .collect::<EngineResult<HashMap<_, _>>>()?;
         for entry in entries {
             self.validate_vector(&entry.vector)?;
+            let (owner, metadata) = &owners[entry.fragment.entity_id()];
             let payload = codec::encode_fragment(&entry.fragment)?;
-            let mut fragment = fragment_doc(&entry.fragment, file, directories)?;
+            let mut fragment = fragment_doc(&entry.fragment, file, directories, metadata.as_ref())?;
             native(
                 fragment.add_string("payload", &payload),
                 "encode fragment payload",
             )?;
             native(
-                fragment.add_string("text", &lexical_text(&entry.fragment)),
+                fragment.add_string(
+                    "text",
+                    &lexical_text(&entry.fragment, owner.metadata.as_ref()),
+                ),
                 "encode searchable text",
             )?;
             fragments.push(fragment);
@@ -287,16 +410,15 @@ impl NativeStore {
                     entity.add_string("payload", &payload),
                     "encode entity payload",
                 )?;
+                if let Some(metadata) = metadata {
+                    native(
+                        entity.add_string("metadata", &metadata.json),
+                        "encode entity metadata",
+                    )?;
+                }
                 entities.push(entity);
             }
-            let mut vector = fragment_doc(&entry.fragment, file, directories)?;
-            native(
-                vector.add_string(
-                    "fragment_id",
-                    &primary_key("fragment", entry.fragment.document_id()),
-                ),
-                "encode vector owner",
-            )?;
+            let mut vector = fragment_doc(&entry.fragment, file, directories, metadata.as_ref())?;
             native(
                 vector.add_vector_f32("embedding", &entry.vector),
                 "encode embedding vector",
@@ -336,6 +458,14 @@ impl NativeStore {
         self.assert_writable()?;
         for collection in [&self.entities, &self.fragments, &self.vectors, &self.files] {
             native(collection.flush(), "flush storage collection")?;
+        }
+        if let Some(directories) = self
+            .directory_ids
+            .lock()
+            .map_err(|_| corrupt("directory cache lock poisoned"))?
+            .as_mut()
+        {
+            directories.write_cache(&self.path)?;
         }
         Ok(())
     }
@@ -432,7 +562,7 @@ fn scalar(
         native(
             field.set_index_params(&native(
                 IndexParams::invert(
-                    !matches!(data_type, DataType::Uint64 | DataType::ArrayUint64),
+                    !matches!(data_type, DataType::Uint32 | DataType::ArrayUint32),
                     false,
                 ),
                 "define scalar index",
@@ -445,16 +575,22 @@ fn scalar(
 
 fn identity_schema(name: &str) -> EngineResult<CollectionSchema> {
     let mut schema = native(CollectionSchema::new(name), "create collection schema")?;
-    scalar(&mut schema, "file_id", DataType::Uint64, false, true)?;
+    scalar(&mut schema, "file_id", DataType::Uint32, false, true)?;
     scalar(&mut schema, "entity_id", DataType::String, false, true)?;
+    scalar(&mut schema, "document_id", DataType::String, false, false)?;
     Ok(schema)
 }
 
 fn retrieval_schema(name: &str) -> EngineResult<CollectionSchema> {
     let mut schema = identity_schema(name)?;
     file_membership_schema(&mut schema)?;
-    scalar(&mut schema, "symbol_name", DataType::String, true, true)?;
-    scalar(&mut schema, "symbol_type", DataType::String, true, true)?;
+    for field in EntityMetadata::index_schema() {
+        match field {
+            IndexField::String(name) => {
+                scalar(&mut schema, name, DataType::String, true, true)?;
+            }
+        }
+    }
     Ok(schema)
 }
 
@@ -462,7 +598,7 @@ fn file_membership_schema(schema: &mut CollectionSchema) -> EngineResult<()> {
     scalar(
         schema,
         "ancestor_directory_ids",
-        DataType::ArrayUint64,
+        DataType::ArrayUint32,
         false,
         true,
     )?;
@@ -486,7 +622,7 @@ fn wildcard_string(schema: &mut CollectionSchema, name: &str, nullable: bool) ->
 
 fn files_schema() -> EngineResult<CollectionSchema> {
     let mut schema = native(CollectionSchema::new("files"), "create files schema")?;
-    scalar(&mut schema, "file_id", DataType::Uint64, false, true)?;
+    scalar(&mut schema, "file_id", DataType::Uint32, false, true)?;
     scalar(&mut schema, "path_key", DataType::String, false, true)?;
     // Native paths are stored separately from their optional Unicode projection.
     scalar(&mut schema, "path", DataType::String, false, false)?;
@@ -499,6 +635,7 @@ fn files_schema() -> EngineResult<CollectionSchema> {
 fn entities_schema() -> EngineResult<CollectionSchema> {
     let mut schema = identity_schema("entities")?;
     scalar(&mut schema, "payload", DataType::String, false, false)?;
+    scalar(&mut schema, "metadata", DataType::String, true, false)?;
     Ok(schema)
 }
 
@@ -522,7 +659,6 @@ fn fragments_schema() -> EngineResult<CollectionSchema> {
 
 fn vectors_schema(dimension: u32, metric: MetricType) -> EngineResult<CollectionSchema> {
     let mut schema = retrieval_schema("vectors")?;
-    scalar(&mut schema, "fragment_id", DataType::String, false, false)?;
     let mut vector = native(
         FieldSchema::new("embedding", DataType::VectorFp32, false, dimension),
         "define vector field",
@@ -555,7 +691,7 @@ fn encode_file_doc(file: &FileRecord, directories: &[DirectoryId]) -> EngineResu
     let key = file_key(file.id);
     doc.set_pk(&key);
     native(
-        doc.add_u64("file_id", file.id.get()),
+        doc.add_u32("file_id", file.id.get()),
         "encode file identity",
     )?;
     native(
@@ -593,7 +729,7 @@ fn decode_file_doc(doc: &Doc) -> EngineResult<FileRecord> {
 }
 
 fn decode_file_path_doc(doc: &Doc) -> EngineResult<(FileId, PathBuf)> {
-    let id = FileId::new(u64_field(doc, "file_id")?);
+    let id = FileId::new(u32_field(doc, "file_id")?);
     if doc_key(doc)? != file_key(id) {
         return Err(corrupt("file identity differs from its primary key"));
     }
@@ -607,15 +743,16 @@ fn identity_doc(fragment: &EntityFragment) -> EngineResult<Doc> {
     let mut doc = native(Doc::new(), "create fragment record")?;
     doc.set_pk(&primary_key("fragment", fragment.document_id()));
     native(
-        doc.add_u64("file_id", fragment.file_id().get()),
+        doc.add_u32("file_id", fragment.file_id().get()),
         "encode source identity",
     )?;
     native(
-        doc.add_string(
-            "entity_id",
-            &primary_key("fragment", fragment.entity_id().as_str()),
-        ),
+        doc.add_string("entity_id", &hex::encode(fragment.entity_id().as_str())),
         "encode entity identity",
+    )?;
+    native(
+        doc.add_string("document_id", &hex::encode(fragment.document_id())),
+        "encode document identity",
     )?;
     Ok(doc)
 }
@@ -624,23 +761,15 @@ fn fragment_doc(
     fragment: &EntityFragment,
     file: &FileRecord,
     directories: &[DirectoryId],
+    metadata: Option<&EncodedMetadata>,
 ) -> EngineResult<Doc> {
     let mut doc = identity_doc(fragment)?;
     file_membership_doc(&mut doc, file, directories)?;
-    if let Some(EntityMetadata::Code {
-        symbol_type,
-        symbol_name,
-        ..
-    }) = fragment.metadata()
-    {
-        native(
-            doc.add_string("symbol_type", symbol_type_name(*symbol_type)),
-            "encode symbol type",
-        )?;
-        if let Some(name) = symbol_name {
+    if let Some(metadata) = metadata {
+        for (field, value) in &metadata.fields {
             native(
-                doc.add_string("symbol_name", &primary_key("symbol", name)),
-                "encode symbol name",
+                doc.add_string(field.name(), value),
+                "encode metadata index field",
             )?;
         }
     }
@@ -653,13 +782,13 @@ fn file_membership_doc(
     directories: &[DirectoryId],
 ) -> EngineResult<()> {
     native(
-        doc.add_array_u64(
+        doc.add_array_u32(
             "ancestor_directory_ids",
             &directories.iter().map(|id| id.get()).collect::<Vec<_>>(),
         ),
         "encode ancestor directories",
     )?;
-    // Non-Unicode names have no STRING representation. The catalog disables name
+    // Non-Unicode names have no STRING representation. The source-path cache disables name
     // pushdown in this workspace; exact native paths remain in FileRecord.
     let name = file
         .relative_path
@@ -670,26 +799,53 @@ fn file_membership_doc(
     Ok(())
 }
 
-fn decode_fragment_doc(doc: &Doc) -> EngineResult<EntityFragment> {
-    let fragment = codec::decode_fragment(&string_field(doc, "payload")?)?;
+fn decode_id(encoded: &str) -> EngineResult<String> {
+    let bytes = hex::decode(encoded)
+        .map_err(|error| corrupt(format!("invalid encoded identity: {error}")))?;
+    String::from_utf8(bytes).map_err(|error| corrupt(format!("invalid identity text: {error}")))
+}
+
+fn decode_search_hit(doc: &Doc, path: StorageSearchPath) -> EngineResult<StorageSearchHit> {
+    let document_id = decode_id(&string_field(doc, "document_id")?)?;
+    let entity_id = EntityId::new(decode_id(&string_field(doc, "entity_id")?)?)
+        .map_err(|error| corrupt(error.to_string()))?;
+    if document_id.trim().is_empty() || doc_key(doc)? != primary_key("fragment", &document_id) {
+        return Err(corrupt(
+            "search document identity differs from its primary key",
+        ));
+    }
+    Ok(StorageSearchHit {
+        document_id,
+        entity_id,
+        file_id: FileId::new(u32_field(doc, "file_id")?),
+        path,
+        score: f64::from(doc.get_score()),
+    })
+}
+
+fn decode_metadata(doc: &Doc) -> EngineResult<Option<EntityMetadata>> {
+    if !doc.has_field("metadata") || doc.is_field_null("metadata") {
+        return Ok(None);
+    }
+    let json = string_field(doc, "metadata")?;
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|error| corrupt(format!("invalid entity metadata: {error}")))
+}
+
+fn decode_fragment_doc(
+    doc: &Doc,
+    metadata: Option<&EntityMetadata>,
+) -> EngineResult<EntityFragment> {
+    let fragment = codec::decode_fragment(&string_field(doc, "payload")?, metadata)?;
     if doc_key(doc)? != primary_key("fragment", fragment.document_id())
-        || u64_field(doc, "file_id")? != fragment.file_id().get()
-        || string_field(doc, "entity_id")? != primary_key("fragment", fragment.entity_id().as_str())
+        || u32_field(doc, "file_id")? != fragment.file_id().get()
+        || string_field(doc, "entity_id")? != hex::encode(fragment.entity_id().as_str())
+        || string_field(doc, "document_id")? != hex::encode(fragment.document_id())
     {
         return Err(corrupt("fragment identity differs from its index fields"));
     }
     Ok(fragment)
-}
-
-fn fetch_one(collection: &Collection, key: &str) -> EngineResult<Option<Doc>> {
-    let mut docs = native(
-        collection.fetch_with_options(&[key], None, false),
-        "fetch stored record",
-    )?;
-    if docs.len() > 1 {
-        return Err(corrupt("primary key returned multiple records"));
-    }
-    Ok(docs.pop())
 }
 
 fn fetch_map(collection: &Collection, keys: &[String]) -> EngineResult<HashMap<String, Doc>> {
@@ -732,6 +888,7 @@ fn write_docs(collection: &Collection, docs: &[Doc], operation: &str) -> EngineR
 }
 
 fn configure_query(
+    store: &NativeStore,
     query: &mut SearchQuery,
     filter: Option<&StorageSearchFilter>,
     fields: &[&str],
@@ -744,13 +901,16 @@ fn configure_query(
         query.set_output_fields(fields),
         "select search output fields",
     )?;
-    if let Some(filter) = build_filter(filter)? {
+    if let Some(filter) = build_filter(store, filter)? {
         native(query.set_filter(&filter), "set search filter")?;
     }
     Ok(())
 }
 
-fn build_filter(filter: Option<&StorageSearchFilter>) -> EngineResult<Option<String>> {
+fn build_filter(
+    store: &NativeStore,
+    filter: Option<&StorageSearchFilter>,
+) -> EngineResult<Option<String>> {
     let Some(filter) = filter else {
         return Ok(None);
     };
@@ -758,7 +918,7 @@ fn build_filter(filter: Option<&StorageSearchFilter>) -> EngineResult<Option<Str
     if let Some(path) = &filter.path
         && !matches!(path, StoragePathFilter::All)
     {
-        clauses.push(path_filter(path, false)?);
+        clauses.push(path_filter(store, path, false)?);
     }
     if let Some(ids) = &filter.file_ids {
         clauses.push(if ids.is_empty() {
@@ -776,40 +936,85 @@ fn build_filter(filter: Option<&StorageSearchFilter>) -> EngineResult<Option<Str
     if let Some(ids) = &filter.entity_ids {
         clauses.push(in_filter(
             "entity_id",
-            ids.iter().map(|id| primary_key("fragment", id.as_str())),
+            ids.iter().map(|id| hex::encode(id.as_str())),
         ));
     }
     if let Some(names) = &filter.symbol_names {
-        clauses.push(in_filter(
-            "symbol_name",
-            names.iter().map(|name| primary_key("symbol", name)),
+        clauses.push(metadata_in_filter(
+            CodeMetadata::SYMBOL_NAME,
+            names.iter().map(String::as_str),
         ));
     }
     if let Some(types) = &filter.symbol_types {
-        clauses.push(in_filter(
-            "symbol_type",
-            types.iter().map(|kind| symbol_type_name(*kind).to_owned()),
+        clauses.push(metadata_in_filter(
+            CodeMetadata::SYMBOL_TYPE,
+            types.iter().map(|kind| kind.as_str()),
         ));
     }
     Ok((!clauses.is_empty()).then(|| clauses.join(" AND ")))
 }
 
-fn in_filter(field: &str, values: impl Iterator<Item = String>) -> String {
+fn encode_metadata_fields(metadata: &serde_json::Value) -> EngineResult<Vec<(IndexField, String)>> {
+    let mut fields = Vec::new();
+    for field in EntityMetadata::index_schema() {
+        let Some(value) = metadata.get(field.name()).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        match field {
+            IndexField::String(name) => {
+                let value = value.as_str().ok_or_else(|| {
+                    corrupt(format!("metadata index field {name:?} must be a string"))
+                })?;
+                fields.push((field, encode_metadata_value(field, value).into_owned()));
+            }
+        }
+    }
+    Ok(fields)
+}
+
+fn encode_metadata_value(field: IndexField, value: &str) -> Cow<'_, str> {
+    if field == CodeMetadata::SYMBOL_NAME {
+        Cow::Owned(primary_key("symbol", value))
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
+fn metadata_in_filter<'a>(field: IndexField, values: impl Iterator<Item = &'a str>) -> String {
+    in_filter(
+        field.name(),
+        values.map(|value| encode_metadata_value(field, value)),
+    )
+}
+
+fn in_filter(field: &str, values: impl Iterator<Item = impl AsRef<str>>) -> String {
     format!(
         "{field} IN ({})",
         values
-            .map(|value| quote(&value))
+            .map(|value| quote(value.as_ref()))
             .collect::<Vec<_>>()
             .join(", ")
     )
 }
 
 /// Push negation to leaves: native SQL supports `NOT CONTAIN_ANY`, but no unary `NOT`.
-fn path_filter(filter: &StoragePathFilter, negated: bool) -> EngineResult<String> {
+fn path_filter(
+    store: &NativeStore,
+    filter: &StoragePathFilter,
+    negated: bool,
+) -> EngineResult<String> {
     Ok(match filter {
         StoragePathFilter::All => constant_filter(!negated),
         StoragePathFilter::None => constant_filter(negated),
-        StoragePathFilter::Directory(id) => {
+        StoragePathFilter::Directory(path) => {
+            let Some(id) = store
+                .directories()?
+                .as_ref()
+                .expect("loaded directories")
+                .get(path)
+            else {
+                return Ok(constant_filter(negated));
+            };
             if negated {
                 // Native NOT CONTAIN_ANY omits empty arrays; root files have
                 // no ancestors and must remain in the complement.
@@ -823,7 +1028,7 @@ fn path_filter(filter: &StoragePathFilter, negated: bool) -> EngineResult<String
         StoragePathFilter::FileNameExact(name) => {
             if name.contains(['\\', '\0']) {
                 return Err(EngineError::invalid_argument(
-                    "this file name requires catalog matching",
+                    "this file name requires path matching",
                 ));
             }
             format!(
@@ -834,7 +1039,7 @@ fn path_filter(filter: &StoragePathFilter, negated: bool) -> EngineResult<String
         }
         StoragePathFilter::FileNamePrefix(_) | StoragePathFilter::FileNameSuffix(_) if negated => {
             return Err(EngineError::invalid_argument(
-                "negated filename wildcards require catalog matching",
+                "negated filename wildcards require path matching",
             ));
         }
         StoragePathFilter::FileNamePrefix(prefix) => {
@@ -858,9 +1063,9 @@ fn path_filter(filter: &StoragePathFilter, negated: bool) -> EngineResult<String
                 quote(&format!("%%{}", like_literal(suffix)))
             )
         }
-        StoragePathFilter::And(filters) => boolean_filter(filters, !negated, negated)?,
-        StoragePathFilter::Or(filters) => boolean_filter(filters, negated, negated)?,
-        StoragePathFilter::Not(filter) => path_filter(filter, !negated)?,
+        StoragePathFilter::And(filters) => boolean_filter(store, filters, !negated, negated)?,
+        StoragePathFilter::Or(filters) => boolean_filter(store, filters, negated, negated)?,
+        StoragePathFilter::Not(filter) => path_filter(store, filter, !negated)?,
     })
 }
 
@@ -870,6 +1075,7 @@ fn constant_filter(value: bool) -> String {
 }
 
 fn boolean_filter(
+    store: &NativeStore,
     filters: &[StoragePathFilter],
     conjunction: bool,
     negated: bool,
@@ -882,7 +1088,7 @@ fn boolean_filter(
         "({})",
         filters
             .iter()
-            .map(|filter| path_filter(filter, negated))
+            .map(|filter| path_filter(store, filter, negated))
             .collect::<EngineResult<Vec<_>>>()?
             .join(operator)
     ))
@@ -918,27 +1124,26 @@ fn top_k(limit: usize) -> EngineResult<i32> {
         .map_err(|_| EngineError::invalid_argument("storage query limit is too large"))
 }
 
-fn lexical_text(fragment: &EntityFragment) -> String {
+fn lexical_text(fragment: &EntityFragment, metadata: Option<&EntityMetadata>) -> String {
     let mut output = String::new();
-    if let Some(metadata) = fragment.metadata() {
+    if let Some(metadata) = metadata {
         match metadata {
-            EntityMetadata::Code {
-                symbol_name,
-                scope,
-                signature,
-                documentation,
-                ..
-            } => {
-                for value in [symbol_name, scope, signature, documentation]
-                    .into_iter()
-                    .flatten()
+            EntityMetadata::Code(code) => {
+                for value in [
+                    &code.symbol_name,
+                    &code.scope,
+                    &code.signature,
+                    &code.documentation,
+                ]
+                .into_iter()
+                .flatten()
                 {
                     output.push_str(value);
                     output.push('\n');
                 }
             }
-            EntityMetadata::Markdown { heading, scope, .. } => {
-                for value in [heading, scope].into_iter().flatten() {
+            EntityMetadata::Markdown(markdown) => {
+                for value in [&markdown.heading, &markdown.scope].into_iter().flatten() {
                     output.push_str(value);
                     output.push('\n');
                 }
@@ -989,23 +1194,12 @@ fn append_contents(output: &mut String, contents: &[Content]) {
     }
 }
 
-fn symbol_type_name(value: SymbolType) -> &'static str {
-    match value {
-        SymbolType::Module => "module",
-        SymbolType::Class => "class",
-        SymbolType::Interface => "interface",
-        SymbolType::Function => "function",
-        SymbolType::Value => "value",
-        SymbolType::Alias => "alias",
-    }
-}
-
 fn file_key(id: FileId) -> String {
     format!("f{}", id.get())
 }
 
-fn u64_field(doc: &Doc, name: &str) -> EngineResult<u64> {
-    native(doc.get_u64(name), "read numeric field")?.ok_or_else(|| corrupt("missing numeric field"))
+fn u32_field(doc: &Doc, name: &str) -> EngineResult<u32> {
+    native(doc.get_u32(name), "read numeric field")?.ok_or_else(|| corrupt("missing numeric field"))
 }
 
 fn primary_key(namespace: &str, value: &str) -> String {
@@ -1018,10 +1212,10 @@ fn doc_key(doc: &Doc) -> EngineResult<&str> {
 }
 fn string_field(doc: &Doc, field: &str) -> EngineResult<String> {
     native(doc.get_string(field), "read stored field")?
-        .ok_or_else(|| corrupt(&format!("stored field {field} is missing")))
+        .ok_or_else(|| corrupt(format!("stored field {field} is missing")))
 }
-fn corrupt(message: &str) -> EngineError {
-    EngineError::storage_failure(message)
+fn corrupt(message: impl std::fmt::Display) -> EngineError {
+    EngineError::storage_failure(message.to_string())
 }
 #[track_caller]
 fn native<T>(result: zvec_rust::Result<T>, operation: &str) -> EngineResult<T> {

@@ -1,9 +1,6 @@
 use tree_sitter::Node;
 
-use crate::{
-    domain::{FileFormat, SymbolType},
-    utils::collapse_whitespace,
-};
+use crate::domain::{FileFormat, SymbolType};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdapterKind {
@@ -47,6 +44,7 @@ const CPP: LanguageAdapter = LanguageAdapter {
         "function_definition",
         "macro_type_specifier",
         "class_specifier",
+        "namespace_definition",
         "struct_specifier",
         "union_specifier",
         "enum_specifier",
@@ -76,7 +74,9 @@ const JAVA: LanguageAdapter = LanguageAdapter {
         "annotation_type_declaration",
         "class_declaration",
         "constructor_declaration",
+        "constant_declaration",
         "enum_declaration",
+        "field_declaration",
         "interface_declaration",
         "method_declaration",
         "record_declaration",
@@ -115,9 +115,12 @@ const RUST: LanguageAdapter = LanguageAdapter {
     kind: AdapterKind::Rust,
     entity_types: &[
         "enum_item",
+        "const_item",
         "function_item",
         "function_signature_item",
         "impl_item",
+        "mod_item",
+        "static_item",
         "struct_item",
         "trait_item",
         "type_item",
@@ -134,11 +137,15 @@ const TYPESCRIPT: LanguageAdapter = LanguageAdapter {
         "enum_declaration",
         "field_definition",
         "function_declaration",
+        "function_signature",
         "generator_function_declaration",
         "interface_declaration",
+        "internal_module",
         "method_signature",
         "method_definition",
+        "module",
         "pair",
+        "property_signature",
         "public_field_definition",
         "type_alias_declaration",
         "variable_declarator",
@@ -148,8 +155,7 @@ const TYPESCRIPT: LanguageAdapter = LanguageAdapter {
         "class_declaration",
         "internal_module",
         "interface_declaration",
-        "module_declaration",
-        "namespace_declaration",
+        "module",
     ],
 };
 
@@ -208,6 +214,12 @@ impl LanguageAdapter {
         match self.kind {
             AdapterKind::C | AdapterKind::Cpp => extract_c_family_name(node, source),
             AdapterKind::Go => field_text(node, "name", source),
+            AdapterKind::Java
+                if matches!(node.kind(), "field_declaration" | "constant_declaration") =>
+            {
+                node.child_by_field_name("declarator")
+                    .and_then(|declarator| field_text(declarator, "name", source))
+            }
             AdapterKind::Java => name_field(node, source),
             AdapterKind::JavaScript | AdapterKind::TypeScript => {
                 extract_javascript_typescript_name(node, source)
@@ -281,38 +293,49 @@ impl LanguageAdapter {
         }
     }
 
-    pub(super) fn classify(
-        self,
-        node: Node<'_>,
-        source: &[u8],
-        breadcrumb: &[String],
-    ) -> SymbolType {
-        let specialized = match self.kind {
+    pub(super) fn classify(self, node: Node<'_>) -> Option<SymbolType> {
+        match self.kind {
             AdapterKind::C | AdapterKind::Cpp => classify_c_family(node),
             AdapterKind::Go => classify_go(node),
+            AdapterKind::Java if node.kind() == "field_declaration" => Some(SymbolType::Value),
             AdapterKind::JavaScript | AdapterKind::TypeScript => {
-                classify_javascript_typescript(node, source)
+                classify_javascript_typescript(node)
             }
-            _ => None,
-        };
-        specialized.unwrap_or_else(|| classify_code_node(node, breadcrumb))
+            _ => classify_code_node(node),
+        }
     }
 
     pub(super) fn extract_signature(self, node: Node<'_>, source: &[u8]) -> Option<String> {
         match self.kind {
-            AdapterKind::JavaScript | AdapterKind::TypeScript if node.kind() == "pair" => {
-                let key = extract_javascript_typescript_name(node, source);
-                let value = node.child_by_field_name("value");
-                match (
-                    key,
-                    value.and_then(|item| extract_generic_signature(item, source)),
-                ) {
-                    (Some(key), Some(signature)) => Some(format!("{key}: {signature}")),
-                    _ => extract_generic_signature(node, source),
-                }
+            AdapterKind::JavaScript | AdapterKind::TypeScript => {
+                extract_javascript_signature(node, source)
             }
             AdapterKind::Python => {
-                extract_generic_signature(inner_python_definition(node).unwrap_or(node), source)
+                let definition = inner_python_definition(node).unwrap_or(node);
+                let signature = extract_generic_signature(definition, source)?;
+                let mut lines = named_children(node)
+                    .into_iter()
+                    .filter(|child| child.kind() == "decorator")
+                    .map(|decorator| text(decorator, source).trim().to_owned())
+                    .collect::<Vec<_>>();
+                lines.push(signature);
+                Some(lines.join("\n"))
+            }
+            AdapterKind::Rust => {
+                let signature = extract_generic_signature(node, source)?;
+                let mut attributes = Vec::new();
+                let mut sibling = node.prev_named_sibling();
+                while let Some(item) = sibling {
+                    match item.kind() {
+                        "attribute_item" => attributes.push(text(item, source).trim().to_owned()),
+                        "line_comment" | "block_comment" => {}
+                        _ => break,
+                    }
+                    sibling = item.prev_named_sibling();
+                }
+                attributes.reverse();
+                attributes.push(signature);
+                Some(attributes.join("\n"))
             }
             _ => extract_generic_signature(node, source),
         }
@@ -320,32 +343,6 @@ impl LanguageAdapter {
 
     pub(super) fn extract_doc(node: Node<'_>, source: &[u8]) -> Option<String> {
         extract_preceding_doc(node, source)
-    }
-
-    pub(super) fn extract_modifiers(self, node: Node<'_>, source: &[u8]) -> Vec<String> {
-        match self.kind {
-            AdapterKind::Go => field_text(node, "name", source)
-                .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
-                .map_or_else(Vec::new, |_| vec!["exported".to_owned()]),
-            AdapterKind::Python => {
-                let mut modifiers = extract_common_modifiers(node, source);
-                let node_text = text(node, source);
-                if node_text
-                    .lines()
-                    .any(|line| line.trim_start().starts_with("async def "))
-                {
-                    push_unique(&mut modifiers, "async");
-                }
-                if node_text
-                    .lines()
-                    .any(|line| line.trim_start().starts_with("@staticmethod"))
-                {
-                    push_unique(&mut modifiers, "static");
-                }
-                modifiers
-            }
-            _ => extract_common_modifiers(node, source),
-        }
     }
 
     fn should_index_entity(self, node: Node<'_>) -> bool {
@@ -363,6 +360,16 @@ impl LanguageAdapter {
             }
             AdapterKind::JavaScript | AdapterKind::TypeScript => {
                 should_index_javascript_typescript_entity(node)
+            }
+            AdapterKind::Java
+                if matches!(node.kind(), "field_declaration" | "constant_declaration") =>
+            {
+                named_children(node)
+                    .into_iter()
+                    .filter(|child| child.kind() == "variable_declarator")
+                    .count()
+                    == 1
+                    && find_descendant_by_kind(node, "class_body").is_none()
             }
             _ => true,
         }
@@ -508,39 +515,37 @@ fn is_simple_c_identifier(value: &str) -> bool {
 
 fn classify_c_family(node: Node<'_>) -> Option<SymbolType> {
     match node.kind() {
-        "type_definition" => Some(
-            if ["struct_specifier", "union_specifier", "enum_specifier"]
-                .into_iter()
-                .any(|kind| {
-                    find_descendant_by_kind(node, kind)
-                        .is_some_and(|item| item.child_by_field_name("body").is_some())
-                })
-            {
-                SymbolType::Class
-            } else {
-                SymbolType::Alias
-            },
-        ),
+        "type_definition" => {
+            let definition = node
+                .child_by_field_name("type")
+                .filter(|item| item.child_by_field_name("body").is_some());
+            match definition.map(|item| item.kind()) {
+                Some("struct_specifier") => Some(SymbolType::Class),
+                Some("enum_specifier") => Some(SymbolType::Enum),
+                Some("union_specifier") => None,
+                _ => Some(SymbolType::Alias),
+            }
+        }
         "alias_declaration" => Some(SymbolType::Alias),
-        "field_declaration" if find_descendant_by_kind(node, "function_declarator").is_some() => {
+        "declaration" | "field_declaration"
+            if find_descendant_by_kind(node, "function_declarator").is_some() =>
+        {
             Some(SymbolType::Function)
         }
-        _ => None,
+        _ => classify_code_node(node),
     }
 }
 
 fn classify_go(node: Node<'_>) -> Option<SymbolType> {
     match node.kind() {
         "type_alias" => Some(SymbolType::Alias),
-        "type_spec" => Some(
-            match node.child_by_field_name("type").map(|item| item.kind()) {
-                Some("interface_type") => SymbolType::Interface,
-                Some("struct_type") => SymbolType::Class,
-                _ => SymbolType::Alias,
-            },
-        ),
+        "type_spec" => match node.child_by_field_name("type").map(|item| item.kind()) {
+            Some("interface_type") => Some(SymbolType::Interface),
+            Some("struct_type") => Some(SymbolType::Class),
+            _ => None,
+        },
         "method_elem" | "method_spec" => Some(SymbolType::Function),
-        _ => None,
+        _ => classify_code_node(node),
     }
 }
 
@@ -566,11 +571,15 @@ fn should_index_javascript_typescript_entity(node: Node<'_>) -> bool {
     {
         return true;
     }
-    has_function_value(node)
-}
-
-fn has_javascript_typescript_function_value(node: Node<'_>) -> bool {
-    has_function_value(node)
+    if !has_function_value(node) && find_descendant_by_kind(node, "class_body").is_some() {
+        return false;
+    }
+    if node.kind() == "variable_declarator" {
+        return node
+            .child_by_field_name("name")
+            .is_some_and(|name| name.kind() == "identifier");
+    }
+    true
 }
 
 fn has_function_value(node: Node<'_>) -> bool {
@@ -636,16 +645,20 @@ fn extract_javascript_typescript_name(node: Node<'_>, source: &[u8]) -> Option<S
     name_field(node, source)
 }
 
-fn classify_javascript_typescript(node: Node<'_>, _source: &[u8]) -> Option<SymbolType> {
+fn classify_javascript_typescript(node: Node<'_>) -> Option<SymbolType> {
     if node.kind() == "pair"
         || matches!(
             node.kind(),
             "field_definition" | "public_field_definition" | "variable_declarator"
         )
     {
-        return has_function_value(node).then_some(SymbolType::Function);
+        return Some(if has_function_value(node) {
+            SymbolType::Function
+        } else {
+            SymbolType::Value
+        });
     }
-    None
+    classify_code_node(node)
 }
 
 fn inner_python_definition(node: Node<'_>) -> Option<Node<'_>> {
@@ -657,7 +670,57 @@ fn inner_python_definition(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| matches!(child.kind(), "function_definition" | "class_definition"))
 }
 
+fn extract_javascript_signature(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut signature = if let Some(value) = node.child_by_field_name("value").filter(|value| {
+        matches!(
+            value.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        )
+    }) {
+        let prefix = std::str::from_utf8(&source[node.start_byte()..value.start_byte()]).ok()?;
+        format!(
+            "{} {}",
+            prefix.trim(),
+            extract_generic_signature(value, source)?
+        )
+    } else {
+        extract_generic_signature(node, source)?
+    };
+    let mut declaration = node;
+    if let Some(parent) = node.parent().filter(|parent| {
+        node.kind() == "variable_declarator"
+            && matches!(
+                parent.kind(),
+                "lexical_declaration" | "variable_declaration"
+            )
+    }) {
+        let keyword = parent
+            .child_by_field_name("kind")
+            .or_else(|| parent.child(0))?;
+        signature = format!("{} {signature}", text(keyword, source));
+        declaration = parent;
+    }
+    while let Some(wrapper) = declaration
+        .parent()
+        .filter(|parent| matches!(parent.kind(), "ambient_declaration" | "export_statement"))
+    {
+        let prefix =
+            std::str::from_utf8(&source[wrapper.start_byte()..declaration.start_byte()]).ok()?;
+        signature = format!("{} {signature}", prefix.trim());
+        declaration = wrapper;
+    }
+    Some(signature)
+}
+
 fn extract_generic_signature(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut raw = String::new();
+    append_signature(node, source, false, &mut raw);
+    let signature = raw.trim().trim_end_matches(['{', ';']).trim();
+    (!signature.is_empty()).then(|| signature.to_owned())
+}
+
+// Empty nested bodies preserve declaration suffixes, such as a C typedef's alias.
+fn append_signature(node: Node<'_>, source: &[u8], nested: bool, out: &mut String) {
     let body = node.child_by_field_name("body").or_else(|| {
         named_children(node).into_iter().find(|child| {
             matches!(
@@ -671,23 +734,38 @@ fn extract_generic_signature(node: Node<'_>, source: &[u8]) -> Option<String> {
             )
         })
     });
-    let node_text = text(node, source);
-    let raw = body.map_or_else(
-        || first_non_empty_line(node_text).to_owned(),
-        |body| {
-            let relative = body.start_byte().saturating_sub(node.start_byte());
-            node_text[..relative].trim_end().to_owned()
-        },
-    );
-    let normalized = collapse_whitespace(&raw);
-    let normalized = normalized.trim_end_matches(['{', ';']).trim();
-    (!normalized.is_empty()).then(|| normalized.to_owned())
+    let mut offset = node.start_byte();
+    for child in named_children(node) {
+        out.push_str(std::str::from_utf8(&source[offset..child.start_byte()]).unwrap_or_default());
+        if Some(child) == body {
+            if !nested {
+                return;
+            }
+            out.push_str("{}");
+        } else if matches!(child.kind(), "object" | "object_expression")
+            && matches!(
+                node.kind(),
+                "field_definition" | "public_field_definition" | "variable_declarator"
+            )
+            && node.child_by_field_name("value") == Some(child)
+        {
+            out.push_str("{}");
+        } else {
+            append_signature(child, source, true, out);
+        }
+        offset = child.end_byte();
+    }
+    out.push_str(std::str::from_utf8(&source[offset..node.end_byte()]).unwrap_or_default());
 }
 
 fn extract_preceding_doc(node: Node<'_>, source: &[u8]) -> Option<String> {
     let mut comments = Vec::new();
     let mut sibling = node.prev_named_sibling();
     while let Some(item) = sibling {
+        if item.kind() == "attribute_item" {
+            sibling = item.prev_named_sibling();
+            continue;
+        }
         if !matches!(
             item.kind(),
             "comment" | "line_comment" | "block_comment" | "documentation_comment"
@@ -728,40 +806,6 @@ fn clean_comment_text(value: &str) -> String {
         .to_owned()
 }
 
-fn extract_common_modifiers(node: Node<'_>, source: &[u8]) -> Vec<String> {
-    let mut modifiers = Vec::new();
-    if closest_ancestor(node, "export_statement").is_some() {
-        push_unique(&mut modifiers, "exported");
-    }
-    let signature = extract_generic_signature(node, source)
-        .unwrap_or_else(|| first_non_empty_line(text(node, source)).to_owned());
-    for token in
-        signature.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-    {
-        match token {
-            "public" | "private" | "protected" | "internal" | "static" | "async" => {
-                push_unique(&mut modifiers, token);
-            }
-            "pub" => push_unique(&mut modifiers, "public"),
-            _ => {}
-        }
-    }
-    modifiers
-}
-
-fn push_unique(values: &mut Vec<String>, value: &str) {
-    if !values.iter().any(|existing| existing == value) {
-        values.push(value.to_owned());
-    }
-}
-
-fn first_non_empty_line(value: &str) -> &str {
-    value
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map_or("", str::trim)
-}
-
 fn closest_ancestor<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
     while let Some(parent) = node.parent() {
         if parent.kind() == kind {
@@ -781,51 +825,45 @@ fn find_descendant_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<
         .find_map(|child| find_descendant_by_kind(child, kind))
 }
 
-fn classify_code_node(node: Node<'_>, breadcrumb: &[String]) -> SymbolType {
-    let kind = node.kind();
-    if kind == "decorated_definition" {
-        return inner_python_definition(node).map_or(SymbolType::Value, |inner| {
-            classify_code_node(inner, breadcrumb)
-        });
-    }
-    if matches!(
-        kind,
-        "field_definition" | "public_field_definition" | "variable_declarator"
-    ) && has_javascript_typescript_function_value(node)
-    {
-        return SymbolType::Function;
-    }
-    if kind.contains("method") || kind.contains("constructor") {
-        return SymbolType::Function;
-    }
-    if !breadcrumb.is_empty()
-        && (kind.contains("function") || kind == "declaration" || kind == "function_item")
-    {
-        return SymbolType::Function;
-    }
-    if kind.contains("function") || matches!(kind, "declaration" | "macro_type_specifier") {
-        return SymbolType::Function;
-    }
-    if kind.contains("class")
-        || kind.contains("struct")
-        || kind.contains("impl")
-        || kind.contains("enum")
-        || kind.contains("union")
-        || kind.contains("record")
-    {
-        return SymbolType::Class;
-    }
-    if kind.contains("interface") || kind.contains("protocol") || kind.contains("trait") {
-        return SymbolType::Interface;
-    }
-    if kind.contains("module") || kind.contains("namespace") || kind == "mod_item" {
-        return SymbolType::Module;
-    }
-    if kind.contains("alias")
-        || kind.contains("typedef")
-        || matches!(kind, "type_definition" | "type_item")
-    {
-        return SymbolType::Alias;
-    }
-    SymbolType::Value
+// Nodes without a matching symbol category remain unclassified.
+fn classify_code_node(node: Node<'_>) -> Option<SymbolType> {
+    Some(match node.kind() {
+        "decorated_definition" => {
+            return inner_python_definition(node).and_then(classify_code_node);
+        }
+        "alias_declaration" | "type_alias" | "type_alias_declaration" | "type_item" => {
+            SymbolType::Alias
+        }
+        "abstract_class_declaration"
+        | "class_declaration"
+        | "class_definition"
+        | "class_specifier"
+        | "impl_item"
+        | "record_declaration"
+        | "struct_item"
+        | "struct_specifier" => SymbolType::Class,
+        "enum_declaration" | "enum_item" | "enum_specifier" => SymbolType::Enum,
+        "abstract_method_signature"
+        | "constructor_declaration"
+        | "function_declaration"
+        | "function_definition"
+        | "function_item"
+        | "function_signature"
+        | "function_signature_item"
+        | "generator_function_declaration"
+        | "macro_type_specifier"
+        | "method_declaration"
+        | "method_definition"
+        | "method_elem"
+        | "method_signature"
+        | "method_spec" => SymbolType::Function,
+        "annotation_type_declaration" | "interface_declaration" | "trait_item" => {
+            SymbolType::Interface
+        }
+        "internal_module" | "mod_item" | "module" | "namespace_definition" => SymbolType::Module,
+        "const_item" | "constant_declaration" | "property_signature" | "static_item" => {
+            SymbolType::Value
+        }
+        _ => return None,
+    })
 }
