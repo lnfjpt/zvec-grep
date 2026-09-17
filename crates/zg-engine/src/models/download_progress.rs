@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use super::spi::EmbeddingModelProgress;
+use crate::domain::model::ModelProgress;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArtifactDownloadProgress {
@@ -18,14 +18,14 @@ pub(crate) struct ModelDownloadProgressReporter {
 
 struct Inner {
     model: String,
-    on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+    on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     artifacts: Mutex<HashMap<String, ArtifactDownloadProgress>>,
 }
 
 impl ModelDownloadProgressReporter {
     pub(crate) fn new(
         model: impl Into<String>,
-        on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+        on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
         expected_artifacts: impl IntoIterator<Item = String>,
     ) -> Self {
         Self {
@@ -51,7 +51,7 @@ impl ModelDownloadProgressReporter {
     }
 
     pub(crate) fn start(&self) {
-        self.emit(EmbeddingModelProgress::Preparing {
+        self.emit(ModelProgress::Preparing {
             model: self.inner.model.clone(),
         });
     }
@@ -75,7 +75,7 @@ impl ModelDownloadProgressReporter {
             });
             (downloaded_bytes, total_bytes)
         };
-        self.emit(EmbeddingModelProgress::Downloading {
+        self.emit(ModelProgress::Downloading {
             model: self.inner.model.clone(),
             downloaded_bytes: Some(downloaded_bytes),
             total_bytes,
@@ -86,7 +86,7 @@ impl ModelDownloadProgressReporter {
         if self.inner.on_progress.is_none() {
             return false;
         }
-        self.emit(EmbeddingModelProgress::Warning {
+        self.emit(ModelProgress::Warning {
             model: self.inner.model.clone(),
             message: message.into(),
         });
@@ -94,12 +94,12 @@ impl ModelDownloadProgressReporter {
     }
 
     pub(crate) fn finish(&self) {
-        self.emit(EmbeddingModelProgress::Ready {
+        self.emit(ModelProgress::Ready {
             model: self.inner.model.clone(),
         });
     }
 
-    fn emit(&self, event: EmbeddingModelProgress) {
+    fn emit(&self, event: ModelProgress) {
         if let Some(on_progress) = &self.inner.on_progress {
             on_progress(event);
         }
@@ -118,7 +118,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{ArtifactDownloadProgress, ModelDownloadProgressReporter};
-    use crate::models::spi::EmbeddingModelProgress;
+    use crate::domain::model::ModelProgress;
 
     #[test]
     fn aggregates_progress_like_typescript() {
@@ -128,8 +128,7 @@ mod tests {
             "local/test",
             Some(Arc::new(move |event| {
                 captured.lock().expect("event lock").push(event);
-            })
-                as Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>),
+            }) as Arc<dyn Fn(ModelProgress) + Send + Sync>),
             ["model".to_owned(), "tokenizer".to_owned()],
         );
         reporter.start();
@@ -151,20 +150,20 @@ mod tests {
         assert_eq!(
             *events.lock().expect("event lock"),
             [
-                EmbeddingModelProgress::Preparing {
+                ModelProgress::Preparing {
                     model: "local/test".to_owned(),
                 },
-                EmbeddingModelProgress::Downloading {
+                ModelProgress::Downloading {
                     model: "local/test".to_owned(),
                     downloaded_bytes: Some(4),
                     total_bytes: None,
                 },
-                EmbeddingModelProgress::Downloading {
+                ModelProgress::Downloading {
                     model: "local/test".to_owned(),
                     downloaded_bytes: Some(8),
                     total_bytes: Some(16),
                 },
-                EmbeddingModelProgress::Ready {
+                ModelProgress::Ready {
                     model: "local/test".to_owned(),
                 },
             ]

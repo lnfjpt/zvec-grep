@@ -29,23 +29,13 @@ pub(crate) type ModelRuntimeLease = runtime::ModelRuntimeLease;
 pub(crate) type ModelRuntimeRequest = runtime::ModelRuntimeRequest;
 pub(crate) type ModelRuntimeSnapshot = runtime::ModelRuntimeSnapshot;
 
-// Model configuration and capabilities. Backend traits, factories, and
-// validation helpers remain private to `models`.
-pub use spi::Device;
-pub(crate) use spi::{EmbeddingModelProgress, ModelProgressReporter};
-pub(crate) type CreateEmbeddingModelOptions = spi::CreateEmbeddingModelOptions;
-pub(crate) type EmbeddingMetric = spi::EmbeddingMetric;
-pub(crate) type EmbeddingModelInfo = spi::EmbeddingModelInfo;
-#[cfg(test)]
-pub(crate) type EmbeddingModelLimits = spi::EmbeddingModelLimits;
-
-// Embedding requests, results, and errors.
-pub(crate) type EmbeddingInput = spi::EmbeddingInput;
-pub(crate) type EmbeddingInputKind = spi::EmbeddingInputKind;
-pub(crate) type EmbeddingOptions = spi::EmbeddingOptions;
-pub(crate) type EmbeddingPurpose = spi::EmbeddingPurpose;
-pub(crate) type EmbeddingResult = spi::EmbeddingResult;
-pub(crate) type ModelError = spi::ModelError;
+// Shared values live in domain; execution controls remain in models.
+use crate::domain::{
+    Content,
+    model::{EmbeddingModelInfo, EmbeddingResult, ModelConfig},
+};
+pub(crate) use error::ModelError;
+pub(crate) use spi::{EmbeddingConcurrencyDefaults, EmbeddingOptions, ModelProgressReporter};
 
 impl runtime::ModelRuntimeManager {
     pub(crate) fn new() -> Self {
@@ -73,7 +63,7 @@ impl runtime::ModelRuntimeManager {
 impl runtime::ModelRuntimeRequest {
     pub(crate) fn new(
         reference: impl Into<String>,
-        options: CreateEmbeddingModelOptions,
+        options: ModelConfig,
         embedding_concurrency: Option<usize>,
     ) -> Self {
         Self::new_impl(reference, options, embedding_concurrency)
@@ -81,13 +71,17 @@ impl runtime::ModelRuntimeRequest {
 }
 
 impl runtime::ModelRuntimeLease {
+    pub(crate) fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
+        self.concurrency_defaults_impl()
+    }
+
     pub(crate) fn info(&self) -> &EmbeddingModelInfo {
         self.info_impl()
     }
 
     pub(crate) async fn embed(
         &self,
-        inputs: &[EmbeddingInput],
+        inputs: &[Vec<Content>],
         options: EmbeddingOptions,
         progress: Option<ModelProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError> {

@@ -1,3 +1,4 @@
+use crate::domain::Content;
 use std::{
     env,
     ffi::OsString,
@@ -15,18 +16,23 @@ use tokenizers::Tokenizer;
 use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::models::{
-    artifacts::publish_downloaded_file,
-    catalog::Model2VecConfig,
-    compute::ModelComputeRuntime,
-    download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
-    spi::{
-        CreateEmbeddingModelOptions, EmbeddingInput, EmbeddingInputKind, EmbeddingModel,
-        EmbeddingModelInfo, EmbeddingModelLimits, EmbeddingModelProgress, EmbeddingOptions,
-        EmbeddingPurpose, EmbeddingResult, ModelError, validate_inputs, validate_result,
+use crate::utils::atomic_write;
+use crate::{
+    domain::model::{
+        EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult, ModelConfig, ModelInfo,
+        ModelProgress,
+    },
+    models::{
+        artifacts::publish_downloaded_file,
+        catalog::Model2VecConfig,
+        compute::ModelComputeRuntime,
+        download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
+        spi::{
+            EmbeddingConcurrencyDefaults, EmbeddingModel, EmbeddingOptions, ModelError, input_text,
+            validate_inputs, validate_result,
+        },
     },
 };
-use crate::utils::atomic_write;
 
 use super::safetensors::{StaticEmbeddingTable, load_static_embedding_table};
 
@@ -52,40 +58,42 @@ struct LoadedModel {
 }
 
 impl Model2VecEmbeddingModel {
-    pub(crate) fn new(entry: Model2VecConfig, options: CreateEmbeddingModelOptions) -> Self {
+    pub(crate) fn new(
+        entry: Model2VecConfig,
+        options: ModelConfig,
+        compute_runtime: ModelComputeRuntime,
+    ) -> Self {
         Self::with_dependencies(
             entry,
             options,
             Arc::new(DefaultModel2VecDependencies::new()),
+            compute_runtime,
         )
     }
 
     fn with_dependencies(
         entry: Model2VecConfig,
-        options: CreateEmbeddingModelOptions,
+        options: ModelConfig,
         dependencies: Arc<dyn Model2VecDependencies>,
+        compute_runtime: ModelComputeRuntime,
     ) -> Self {
         let model_cache_dir = options
-            .model_cache_dir
+            .cache_dir
             .or_else(|| env::var_os("ZVEC_GREP_MODEL_CACHE").map(PathBuf::from))
             .unwrap_or_else(default_model_cache_dir);
-        let compute_runtime = options.compute_runtime.unwrap_or_default();
         Self {
             entry,
             info: EmbeddingModelInfo {
-                reference: entry.reference.to_owned(),
-                provider: entry.provider.to_owned(),
-                name: entry.model.to_owned(),
+                model: ModelInfo {
+                    provider: entry.provider.to_owned(),
+                    name: entry.model.to_owned(),
+                    endpoint: None,
+                },
                 dimension: entry.dimension,
                 metric: entry.metric,
-                endpoint: None,
-                default_concurrency: Some(entry.default_concurrency),
-                input_kinds: vec![EmbeddingInputKind::Text],
-                limits: EmbeddingModelLimits {
-                    max_batch_size: entry.max_batch_size,
-                    max_input_tokens: Some(entry.max_input_tokens),
-                    max_image_bytes: None,
-                },
+                max_batch_size: entry.max_batch_size,
+                max_input_tokens: Some(entry.max_input_tokens),
+                max_image_bytes: None,
             },
             model_cache_dir,
             compute_runtime,
@@ -96,7 +104,7 @@ impl Model2VecEmbeddingModel {
 
     async fn ensure_loaded(
         &self,
-        on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+        on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     ) -> Result<Arc<LoadedModel>, ModelError> {
         let mut state = self.state.lock().await;
         if let Some(loaded) = &state.loaded {
@@ -109,7 +117,7 @@ impl Model2VecEmbeddingModel {
 
     async fn load_model(
         &self,
-        on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+        on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     ) -> Result<LoadedModel, ModelError> {
         let reporter = ModelDownloadProgressReporter::new(
             self.entry.reference,
@@ -278,14 +286,23 @@ impl EmbeddingModel for Model2VecEmbeddingModel {
         &self.info
     }
 
+    fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
+        EmbeddingConcurrencyDefaults {
+            initial: self.entry.default_concurrency.max(1),
+            maximum: self.entry.default_concurrency.max(1),
+        }
+    }
+
     async fn embed(
         &self,
-        inputs: &[EmbeddingInput],
+        inputs: &[Vec<Content>],
         options: EmbeddingOptions,
     ) -> Result<EmbeddingResult, ModelError> {
-        validate_inputs(&self.info, inputs)?;
+        validate_inputs(&self.info, inputs, |content| {
+            matches!(content, Content::Text(_))
+        })?;
         let loaded = self.ensure_loaded(options.on_progress).await?;
-        let purpose = options.purpose.unwrap_or_default();
+        let purpose = options.purpose;
         let prefix = match purpose {
             EmbeddingPurpose::Document => self.entry.document_prefix,
             EmbeddingPurpose::Query => self.entry.query_prefix,
@@ -293,7 +310,7 @@ impl EmbeddingModel for Model2VecEmbeddingModel {
         let texts = inputs
             .iter()
             .map(|input| {
-                let text = input.to_text()?;
+                let text = input_text(input)?;
                 Ok(match prefix {
                     Some(prefix) => format!("{prefix}{text}"),
                     None => text.into_owned(),
@@ -616,12 +633,12 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::TempDir;
 
-    use crate::models::spi::{EmbeddingInput, EmbeddingMetric};
-    use crate::models::{
-        catalog::Model2VecConfig,
-        spi::{
-            CreateEmbeddingModelOptions, EmbeddingModel, EmbeddingModelProgress, EmbeddingOptions,
-            EmbeddingPurpose,
+    use crate::domain::{Content, model::EmbeddingMetric};
+    use crate::{
+        domain::model::{EmbeddingPurpose, ModelConfig, ModelProgress},
+        models::{
+            catalog::Model2VecConfig,
+            spi::{EmbeddingModel, EmbeddingOptions},
         },
     };
 
@@ -637,25 +654,26 @@ mod tests {
         let dependencies = Arc::new(FixtureDependencies::new(FixtureTokenizerMode::Oracle));
         let model = Model2VecEmbeddingModel::with_dependencies(
             fixture_entry(),
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(root.path().to_path_buf()),
-                ..CreateEmbeddingModelOptions::default()
+            ModelConfig {
+                cache_dir: Some(root.path().to_path_buf()),
+                ..ModelConfig::default()
             },
             dependencies.clone(),
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
-        assert_eq!(model.info().default_concurrency, Some(2));
+        assert_eq!(model.concurrency_defaults().initial, 2);
 
         let progress = Arc::new(StdMutex::new(Vec::new()));
         let captured = Arc::clone(&progress);
         let result = model
             .embed(
                 &[
-                    EmbeddingInput::text("both tokens".to_owned()),
-                    EmbeddingInput::text("unknown-only".to_owned()),
-                    EmbeddingInput::text("third token".to_owned()),
+                    vec![Content::Text("both tokens".to_owned())],
+                    vec![Content::Text("unknown-only".to_owned())],
+                    vec![Content::Text("third token".to_owned())],
                 ],
                 EmbeddingOptions {
-                    purpose: Some(EmbeddingPurpose::Query),
+                    purpose: EmbeddingPurpose::Query,
                     on_progress: Some(Arc::new(move |event| {
                         captured
                             .lock()
@@ -692,20 +710,20 @@ mod tests {
                 .lock()
                 .expect("progress lock should not be poisoned"),
             [
-                EmbeddingModelProgress::Preparing {
+                ModelProgress::Preparing {
                     model: "local/test-potion".to_owned(),
                 },
-                EmbeddingModelProgress::Downloading {
+                ModelProgress::Downloading {
                     model: "local/test-potion".to_owned(),
                     downloaded_bytes: Some(4),
                     total_bytes: None,
                 },
-                EmbeddingModelProgress::Downloading {
+                ModelProgress::Downloading {
                     model: "local/test-potion".to_owned(),
                     downloaded_bytes: Some(8),
                     total_bytes: Some(16),
                 },
-                EmbeddingModelProgress::Ready {
+                ModelProgress::Ready {
                     model: "local/test-potion".to_owned(),
                 },
             ]
@@ -716,7 +734,7 @@ mod tests {
 
         model
             .embed(
-                &[EmbeddingInput::text("cached".to_owned())],
+                &[vec![Content::Text("cached".to_owned())]],
                 EmbeddingOptions::default(),
             )
             .await
@@ -745,11 +763,12 @@ mod tests {
             .expect("conflicting destination directory");
         let model = Model2VecEmbeddingModel::with_dependencies(
             fixture_entry(),
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(root.path().to_path_buf()),
-                ..CreateEmbeddingModelOptions::default()
+            ModelConfig {
+                cache_dir: Some(root.path().to_path_buf()),
+                ..ModelConfig::default()
             },
             Arc::new(FixtureDependencies::new(FixtureTokenizerMode::Oracle)),
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
         let reporter = ModelDownloadProgressReporter::new(
             model.entry.reference,
@@ -783,14 +802,15 @@ mod tests {
         let dependencies = Arc::new(FixtureDependencies::new_concurrent());
         let model = Model2VecEmbeddingModel::with_dependencies(
             fixture_entry(),
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(root.path().to_path_buf()),
-                ..CreateEmbeddingModelOptions::default()
+            ModelConfig {
+                cache_dir: Some(root.path().to_path_buf()),
+                ..ModelConfig::default()
             },
             dependencies.clone(),
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
-        let first = [EmbeddingInput::text("first".to_owned())];
-        let second = [EmbeddingInput::text("second".to_owned())];
+        let first = [vec![Content::Text("first".to_owned())]];
+        let second = [vec![Content::Text("second".to_owned())]];
 
         let (first_result, second_result) = tokio::join!(
             model.embed(&first, EmbeddingOptions::default()),
@@ -831,15 +851,16 @@ mod tests {
         entry.max_input_tokens = 2;
         let model = Model2VecEmbeddingModel::with_dependencies(
             entry,
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(root.path().to_path_buf()),
-                ..CreateEmbeddingModelOptions::default()
+            ModelConfig {
+                cache_dir: Some(root.path().to_path_buf()),
+                ..ModelConfig::default()
             },
             dependencies,
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
         let result = model
             .embed(
-                &[EmbeddingInput::text("too many tokens".to_owned())],
+                &[vec![Content::Text("too many tokens".to_owned())]],
                 EmbeddingOptions::default(),
             )
             .await
@@ -856,7 +877,7 @@ mod tests {
         assert_eq!(empty.code(), crate::EngineError::INVALID_ARGUMENT);
         let blank = model
             .embed(
-                &[EmbeddingInput::text("  ".to_owned())],
+                &[vec![Content::Text("  ".to_owned())]],
                 EmbeddingOptions::default(),
             )
             .await
@@ -888,18 +909,19 @@ mod tests {
         let dependencies = Arc::new(FixtureDependencies::new(FixtureTokenizerMode::Oracle));
         let model = Model2VecEmbeddingModel::with_dependencies(
             fixture_entry(),
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(root.path().to_path_buf()),
-                ..CreateEmbeddingModelOptions::default()
+            ModelConfig {
+                cache_dir: Some(root.path().to_path_buf()),
+                ..ModelConfig::default()
             },
             dependencies.clone(),
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
         let progress = Arc::new(StdMutex::new(Vec::new()));
         let captured = Arc::clone(&progress);
 
         model
             .embed(
-                &[EmbeddingInput::text("cached tokenizer".to_owned())],
+                &[vec![Content::Text("cached tokenizer".to_owned())]],
                 EmbeddingOptions {
                     on_progress: Some(Arc::new(move |event| {
                         captured
@@ -919,15 +941,15 @@ mod tests {
                 .lock()
                 .expect("progress lock should not be poisoned"),
             [
-                EmbeddingModelProgress::Preparing {
+                ModelProgress::Preparing {
                     model: "local/test-potion".to_owned(),
                 },
-                EmbeddingModelProgress::Downloading {
+                ModelProgress::Downloading {
                     model: "local/test-potion".to_owned(),
                     downloaded_bytes: Some(4),
                     total_bytes: Some(8),
                 },
-                EmbeddingModelProgress::Ready {
+                ModelProgress::Ready {
                     model: "local/test-potion".to_owned(),
                 },
             ]
@@ -940,16 +962,17 @@ mod tests {
         let dependencies = Arc::new(FixtureDependencies::new(FixtureTokenizerMode::OutOfRange));
         let model = Model2VecEmbeddingModel::with_dependencies(
             fixture_entry(),
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(root.path().to_path_buf()),
-                ..CreateEmbeddingModelOptions::default()
+            ModelConfig {
+                cache_dir: Some(root.path().to_path_buf()),
+                ..ModelConfig::default()
             },
             dependencies,
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
 
         let error = model
             .embed(
-                &[EmbeddingInput::text("invalid token".to_owned())],
+                &[vec![Content::Text("invalid token".to_owned())]],
                 EmbeddingOptions::default(),
             )
             .await
@@ -969,18 +992,19 @@ mod tests {
         let dependencies = Arc::new(FixtureDependencies::new(FixtureTokenizerMode::Oracle));
         let model = Model2VecEmbeddingModel::with_dependencies(
             fixture_entry(),
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(root.path().to_path_buf()),
-                ..CreateEmbeddingModelOptions::default()
+            ModelConfig {
+                cache_dir: Some(root.path().to_path_buf()),
+                ..ModelConfig::default()
             },
             dependencies.clone(),
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
         let signal = tokio_util::sync::CancellationToken::new();
         signal.cancel();
 
         let error = model
             .embed(
-                &[EmbeddingInput::text("cancelled".to_owned())],
+                &[vec![Content::Text("cancelled".to_owned())]],
                 EmbeddingOptions {
                     signal: Some(signal),
                     ..EmbeddingOptions::default()
@@ -997,7 +1021,7 @@ mod tests {
         );
         model
             .embed(
-                &[EmbeddingInput::text("after cancellation".to_owned())],
+                &[vec![Content::Text("after cancellation".to_owned())]],
                 EmbeddingOptions::default(),
             )
             .await

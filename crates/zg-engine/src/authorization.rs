@@ -299,9 +299,7 @@ pub(crate) fn remote_endpoint(
     reference: &str,
     endpoint: Option<&str>,
 ) -> Result<String, EngineError> {
-    let Some(EmbeddingCatalogEntry::Qwen {
-        default_endpoint, ..
-    }) = get_embedding_model_catalog_entry(reference)
+    let Some(EmbeddingCatalogEntry::Qwen(entry)) = get_embedding_model_catalog_entry(reference)
     else {
         return Err(EngineError::invalid_argument(
             "Authorization requires a supported remote embedding model",
@@ -312,7 +310,7 @@ pub(crate) fn remote_endpoint(
         .map(str::to_owned)
         .or_else(|| crate::config::string(&config, &["models", reference, "endpoint"]))
         .or_else(|| env::var("ZVEC_GREP_ENDPOINT").ok())
-        .unwrap_or_else(|| default_endpoint.to_string());
+        .unwrap_or_else(|| entry.default_endpoint.to_string());
     let url = reqwest::Url::parse(endpoint.trim())
         .map_err(|_| EngineError::invalid_argument("Invalid remote embedding endpoint"))?;
     if !matches!(url.scheme(), "http" | "https")
@@ -502,9 +500,9 @@ pub(crate) fn require(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::index::{
-        IndexOptions,
-        options::{Device, EmbeddingModelSpec},
+    use crate::{
+        api::index::{IndexOptions, options::EmbeddingModelSpec},
+        domain::model::Device,
     };
 
     #[tokio::test]
@@ -591,13 +589,10 @@ mod tests {
         use crate::{
             api::context::{ContextOptions, options::RefreshPolicy},
             domain::{
-                EmbeddingMetric, EmbeddingSchema, FileSelection, IndexDescriptor, IndexState,
-                Workspace,
+                FileSelection, IndexDescriptor, IndexState, Workspace,
+                model::{EmbeddingMetric, EmbeddingSchema, ModelConfig},
             },
-            workspace::{
-                build::prepare_build,
-                manifest::{EmbeddingRuntimeConfig, write_workspace_manifest},
-            },
+            workspace::{build::prepare_build, manifest::write_workspace_manifest},
         };
         let directory = tempfile::tempdir().expect("workspace");
         let home = directory.path().join(".zvec-grep");
@@ -620,9 +615,9 @@ mod tests {
             },
             home.clone(),
             Some(5),
-            EmbeddingRuntimeConfig {
+            ModelConfig {
                 endpoint: Some("https://active.test/embeddings".into()),
-                ..EmbeddingRuntimeConfig::default()
+                ..ModelConfig::default()
             },
         )
         .expect("manifest");

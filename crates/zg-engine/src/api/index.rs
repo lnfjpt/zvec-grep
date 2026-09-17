@@ -71,7 +71,7 @@ pub mod options {
         Rescan,
     }
 
-    pub use crate::models::Device;
+    pub use crate::domain::model::Device;
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub struct EmbeddingModelSpec {

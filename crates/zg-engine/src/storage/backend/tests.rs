@@ -296,8 +296,8 @@ fn recovery_validates_source_record_owners_before_mutating_any_collection() {
     assert_eq!(native.list_files().expect("no mutation").len(), 2);
     assert!(home.join("storage").join(pending::NAME).exists());
 }
-fn schema() -> WorkspaceIndexEmbeddingSchema {
-    WorkspaceIndexEmbeddingSchema {
+fn schema() -> EmbeddingSchema {
+    EmbeddingSchema {
         provider: "fixture".to_owned(),
         model: "fixture-model".to_owned(),
         dimension: 3,

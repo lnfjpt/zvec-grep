@@ -10,11 +10,11 @@ use ignore::types::{Types, TypesBuilder};
 
 use crate::{
     EngineError,
-    domain::{Entity, EntityFragment, EntityId, FileId, FileRecord, SymbolType},
-    models::{
-        EmbeddingInput, EmbeddingModelInfo, EmbeddingOptions, EmbeddingPurpose, ModelError,
-        ModelRuntimeLease,
+    domain::{
+        Content, Entity, EntityFragment, EntityId, FileId, FileRecord, SymbolType,
+        model::{EmbeddingModelInfo, EmbeddingPurpose},
     },
+    models::{EmbeddingOptions, ModelError, ModelRuntimeLease},
     storage::spi::{
         StoragePathFilter, StorageSearchFilter, StorageSearchHit, StoredSearchData,
         WorkspaceIndexStorage,
@@ -102,10 +102,10 @@ impl SearchEmbeddingRuntime for ModelRuntimeLease {
             &queries
                 .iter()
                 .cloned()
-                .map(EmbeddingInput::text)
+                .map(|text| vec![Content::Text(text)])
                 .collect::<Vec<_>>(),
             EmbeddingOptions {
-                purpose: Some(EmbeddingPurpose::Query),
+                purpose: EmbeddingPurpose::Query,
                 ..EmbeddingOptions::default()
             },
             None,
@@ -132,10 +132,10 @@ impl SearchEmbeddingRuntime for RequestEmbeddingRuntime<'_> {
                 &queries
                     .iter()
                     .cloned()
-                    .map(EmbeddingInput::text)
+                    .map(|text| vec![Content::Text(text)])
                     .collect::<Vec<_>>(),
                 EmbeddingOptions {
-                    purpose: Some(EmbeddingPurpose::Query),
+                    purpose: EmbeddingPurpose::Query,
                     signal: self.signal.clone(),
                     ..EmbeddingOptions::default()
                 },
@@ -304,7 +304,7 @@ async fn embed_vector_routes(
         .iter()
         .filter(|route| route.mode == SearchRouteMode::Vector)
         .collect::<Vec<_>>();
-    let maximum = model.info().limits.max_batch_size;
+    let maximum = model.info().max_batch_size;
     if maximum == 0 {
         return Err(EngineError::internal(
             "embedding model has a zero query batch limit",
@@ -934,11 +934,9 @@ mod tests {
             Content, Entity, EntityContent, EntityFragment, EntityId, FileFormat, FileId,
             FileIndexStatus, FileRecord, FileSnapshot, FragmentId, SourceRange, TextRange,
             WindowFragment,
+            model::{EmbeddingMetric, EmbeddingModelInfo},
         },
-        models::{
-            EmbeddingInputKind, EmbeddingMetric, EmbeddingModelInfo, EmbeddingModelLimits,
-            ModelError,
-        },
+        models::ModelError,
         storage::spi::{
             IndexedFragment, StoragePathFilter, StorageResult, StorageSearchFilter,
             StorageSearchHit, StorageSearchPath, StoredEntity, StoredSearchData,
@@ -970,19 +968,16 @@ mod tests {
         fn new() -> Self {
             Self {
                 info: EmbeddingModelInfo {
-                    reference: "local/fixture".to_owned(),
-                    provider: "local".to_owned(),
-                    name: "fixture".to_owned(),
+                    model: crate::domain::model::ModelInfo {
+                        provider: "local".to_owned(),
+                        name: "fixture".to_owned(),
+                        endpoint: None,
+                    },
                     dimension: 2,
                     metric: EmbeddingMetric::Cosine,
-                    endpoint: None,
-                    default_concurrency: Some(1),
-                    input_kinds: vec![EmbeddingInputKind::Text],
-                    limits: EmbeddingModelLimits {
-                        max_batch_size: 8,
-                        max_input_tokens: None,
-                        max_image_bytes: None,
-                    },
+                    max_batch_size: 8,
+                    max_input_tokens: None,
+                    max_image_bytes: None,
                 },
                 calls: Arc::new(Mutex::new(Vec::new())),
             }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{EngineError, EngineResult};
 
-use super::SourcePath;
+use super::{SourcePath, model::EmbeddingSchema};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Workspace {
@@ -33,6 +33,7 @@ impl Workspace {
         Ok(())
     }
 
+    #[allow(clippy::unnecessary_debug_formatting)] // Keep control characters in paths escaped.
     pub(crate) fn validate(&self) -> EngineResult<()> {
         Self::validate_name(&self.name)?;
         if !self.root.is_absolute() {
@@ -86,42 +87,6 @@ impl IndexState {
             Self::Enabled(index) => Some(index),
             Self::Uninitialized | Self::Disabled => None,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum EmbeddingMetric {
-    Cosine,
-    DotProduct,
-    Euclidean,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EmbeddingSchema {
-    pub provider: String,
-    pub model: String,
-    pub dimension: usize,
-    pub metric: EmbeddingMetric,
-}
-
-impl EmbeddingSchema {
-    pub(crate) fn validate(&self) -> EngineResult<()> {
-        if self.provider.trim().is_empty() || self.model.trim().is_empty() || self.dimension == 0 {
-            return Err(EngineError::invalid_argument(
-                "workspace embedding schema requires a provider, model, and nonzero dimension",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn ensure_compatible(&self, other: &Self) -> EngineResult<()> {
-        if self != other {
-            return Err(EngineError::invalid_argument(
-                "existing index uses a different embedding model; rebuild the index",
-            ));
-        }
-        Ok(())
     }
 }
 

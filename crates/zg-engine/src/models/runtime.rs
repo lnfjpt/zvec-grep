@@ -14,16 +14,17 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Device, ModelProgressReporter,
+    ModelProgressReporter,
     compute::ModelComputeRuntime,
     factory::create_embedding_model,
-    spi::{
-        CreateEmbeddingModelOptions, EmbeddingInput, EmbeddingInputKind, EmbeddingModel,
-        EmbeddingModelInfo, EmbeddingOptions, EmbeddingResult, ModelError,
-    },
+    spi::{EmbeddingConcurrencyDefaults, EmbeddingModel, EmbeddingOptions, ModelError},
+};
+use crate::domain::{
+    Content,
+    model::{Device, EmbeddingModelInfo, EmbeddingResult, ModelConfig},
 };
 
-type ModelFactory = dyn Fn(&str, CreateEmbeddingModelOptions) -> Result<Arc<dyn EmbeddingModel>, ModelError>
+type ModelFactory = dyn Fn(&str, ModelConfig, ModelComputeRuntime) -> Result<Arc<dyn EmbeddingModel>, ModelError>
     + Send
     + Sync;
 
@@ -58,14 +59,14 @@ struct ModelRuntime {
 /// Configuration that determines whether two callers may share one model.
 pub(crate) struct ModelRuntimeRequest {
     reference: String,
-    options: CreateEmbeddingModelOptions,
+    options: ModelConfig,
     embedding_concurrency: Option<usize>,
 }
 
 impl ModelRuntimeRequest {
     pub(super) fn new_impl(
         reference: impl Into<String>,
-        options: CreateEmbeddingModelOptions,
+        options: ModelConfig,
         embedding_concurrency: Option<usize>,
     ) -> Self {
         Self {
@@ -82,28 +83,7 @@ struct ModelRuntimeKey {
     api_key_fingerprint: Option<u64>,
     endpoint: Option<String>,
     model_cache_dir: Option<PathBuf>,
-    device: Option<RuntimeDevice>,
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-enum RuntimeDevice {
-    Auto,
-    Cpu,
-    Metal,
-    Vulkan,
-    Cuda,
-}
-
-impl From<Device> for RuntimeDevice {
-    fn from(device: Device) -> Self {
-        match device {
-            Device::Auto => Self::Auto,
-            Device::Cpu => Self::Cpu,
-            Device::Metal => Self::Metal,
-            Device::Vulkan => Self::Vulkan,
-            Device::Cuda => Self::Cuda,
-        }
-    }
+    device: Option<Device>,
 }
 
 /// A counted handle to a shared model runtime.
@@ -128,13 +108,16 @@ pub(crate) struct ModelRuntimeSnapshot {
 
 impl ModelRuntimeManager {
     pub(super) fn new_impl() -> Self {
-        Self::with_factory(|reference, options| create_embedding_model(reference, Some(options)))
+        Self::with_factory(|reference, options, compute| {
+            create_embedding_model(reference, Some(options), compute)
+        })
     }
 
     fn with_factory(
         factory: impl Fn(
             &str,
-            CreateEmbeddingModelOptions,
+            ModelConfig,
+            ModelComputeRuntime,
         ) -> Result<Arc<dyn EmbeddingModel>, ModelError>
         + Send
         + Sync
@@ -157,7 +140,7 @@ impl ModelRuntimeManager {
     ) -> Result<ModelRuntimeLease, ModelError> {
         let ModelRuntimeRequest {
             reference,
-            mut options,
+            options,
             embedding_concurrency,
         } = request;
         validate_embedding_concurrency(embedding_concurrency)?;
@@ -173,8 +156,8 @@ impl ModelRuntimeManager {
             // Model construction is intentionally performed while holding the
             // short-lived manager lock. Backends load heavy resources lazily,
             // so this guarantees a single instance without blocking on I/O.
-            options.compute_runtime = Some(self.inner.compute_runtime.clone());
-            let model = (self.inner.factory)(&reference, options)?;
+            let model =
+                (self.inner.factory)(&reference, options, self.inner.compute_runtime.clone())?;
             let entry = Arc::new(ModelRuntimeEntry {
                 runtime: Arc::new(ModelRuntime {
                     model,
@@ -185,8 +168,10 @@ impl ModelRuntimeManager {
             state.entries.insert(key.clone(), Arc::clone(&entry));
             entry
         };
-        let concurrency =
-            resolve_embedding_concurrency(embedding_concurrency, entry.runtime.model.info());
+        let concurrency = resolve_embedding_concurrency(
+            embedding_concurrency,
+            entry.runtime.model.concurrency_defaults(),
+        );
         entry.leases.fetch_add(1, Ordering::AcqRel);
         Ok(ModelRuntimeLease {
             key,
@@ -249,13 +234,17 @@ impl fmt::Debug for ModelRuntimeManager {
 }
 
 impl ModelRuntimeLease {
+    pub(super) fn concurrency_defaults_impl(&self) -> EmbeddingConcurrencyDefaults {
+        self.entry.runtime.model.concurrency_defaults()
+    }
+
     pub(super) fn info_impl(&self) -> &EmbeddingModelInfo {
         self.entry.runtime.model.info()
     }
 
     pub(super) async fn embed_impl(
         &self,
-        inputs: &[EmbeddingInput],
+        inputs: &[Vec<Content>],
         mut options: EmbeddingOptions,
         progress: Option<ModelProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError> {
@@ -349,13 +338,13 @@ impl Drop for ActiveEmbeddingGuard<'_> {
 }
 
 impl ModelRuntimeKey {
-    fn new(reference: &str, options: &CreateEmbeddingModelOptions) -> Self {
+    fn new(reference: &str, options: &ModelConfig) -> Self {
         Self {
             reference: reference.to_owned(),
             api_key_fingerprint: options.api_key.as_deref().map(secret_fingerprint),
             endpoint: options.endpoint.clone(),
-            model_cache_dir: options.model_cache_dir.clone(),
-            device: options.device.map(Into::into),
+            model_cache_dir: options.cache_dir.clone(),
+            device: options.device,
         }
     }
 }
@@ -378,21 +367,11 @@ fn validate_embedding_concurrency(concurrency: Option<usize>) -> Result<(), Mode
     Ok(())
 }
 
-fn resolve_embedding_concurrency(requested: Option<usize>, info: &EmbeddingModelInfo) -> usize {
-    requested
-        .or(info.default_concurrency)
-        .unwrap_or_else(|| {
-            if info.provider == "qwen" {
-                if info.input_kinds.contains(&EmbeddingInputKind::Image) {
-                    4
-                } else {
-                    8
-                }
-            } else {
-                1
-            }
-        })
-        .max(1)
+fn resolve_embedding_concurrency(
+    requested: Option<usize>,
+    defaults: EmbeddingConcurrencyDefaults,
+) -> usize {
+    requested.unwrap_or(defaults.initial).max(1)
 }
 
 fn manager_closed() -> ModelError {
@@ -413,10 +392,10 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::{Barrier, Semaphore as TokioSemaphore};
 
-    use crate::models::spi::{EmbeddingInputKind, EmbeddingMetric};
+    use crate::domain::model::EmbeddingMetric;
 
     use super::*;
-    use crate::models::spi::{EmbeddingModelLimits, EmbeddingPurpose};
+    use crate::domain::model::EmbeddingPurpose;
 
     struct ConcurrentFixtureModel {
         info: EmbeddingModelInfo,
@@ -429,19 +408,16 @@ mod tests {
         fn new() -> Self {
             Self {
                 info: EmbeddingModelInfo {
-                    reference: "local/fixture".to_owned(),
-                    provider: "local".to_owned(),
-                    name: "fixture".to_owned(),
+                    model: crate::domain::model::ModelInfo {
+                        provider: "local".to_owned(),
+                        name: "fixture".to_owned(),
+                        endpoint: None,
+                    },
                     dimension: 1,
                     metric: EmbeddingMetric::Cosine,
-                    endpoint: None,
-                    default_concurrency: Some(2),
-                    input_kinds: vec![EmbeddingInputKind::Text],
-                    limits: EmbeddingModelLimits {
-                        max_batch_size: 8,
-                        max_input_tokens: Some(32),
-                        max_image_bytes: None,
-                    },
+                    max_batch_size: 8,
+                    max_input_tokens: Some(32),
+                    max_image_bytes: None,
                 },
                 barrier: Barrier::new(2),
                 active: AtomicUsize::new(0),
@@ -456,9 +432,16 @@ mod tests {
             &self.info
         }
 
+        fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
+            EmbeddingConcurrencyDefaults {
+                initial: 2,
+                maximum: 2,
+            }
+        }
+
         async fn embed(
             &self,
-            inputs: &[EmbeddingInput],
+            inputs: &[Vec<Content>],
             _options: EmbeddingOptions,
         ) -> Result<EmbeddingResult, ModelError> {
             let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -505,7 +488,7 @@ mod tests {
 
         async fn embed(
             &self,
-            inputs: &[EmbeddingInput],
+            inputs: &[Vec<Content>],
             _options: EmbeddingOptions,
         ) -> Result<EmbeddingResult, ModelError> {
             let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -540,24 +523,24 @@ mod tests {
 
         async fn embed(
             &self,
-            inputs: &[EmbeddingInput],
+            inputs: &[Vec<Content>],
             options: EmbeddingOptions,
         ) -> Result<EmbeddingResult, ModelError> {
             if let Some(on_progress) = options.on_progress {
-                on_progress(super::super::spi::EmbeddingModelProgress::Preparing {
-                    model: self.info.reference.clone(),
+                on_progress(crate::domain::model::ModelProgress::Preparing {
+                    model: self.info.model.reference(),
                 });
-                on_progress(super::super::spi::EmbeddingModelProgress::Downloading {
-                    model: self.info.reference.clone(),
+                on_progress(crate::domain::model::ModelProgress::Downloading {
+                    model: self.info.model.reference(),
                     downloaded_bytes: Some(4),
                     total_bytes: Some(8),
                 });
-                on_progress(super::super::spi::EmbeddingModelProgress::Warning {
-                    model: self.info.reference.clone(),
+                on_progress(crate::domain::model::ModelProgress::Warning {
+                    model: self.info.model.reference(),
                     message: "fixture warning".to_owned(),
                 });
-                on_progress(super::super::spi::EmbeddingModelProgress::Ready {
-                    model: self.info.reference.clone(),
+                on_progress(crate::domain::model::ModelProgress::Ready {
+                    model: self.info.model.reference(),
                 });
             }
             Ok(EmbeddingResult {
@@ -574,7 +557,7 @@ mod tests {
         let manager = ModelRuntimeManager::with_factory({
             let creations = Arc::clone(&creations);
             let fixture = Arc::clone(&fixture);
-            move |_reference, _options| {
+            move |_reference, _options, _compute| {
                 creations.fetch_add(1, Ordering::AcqRel);
                 Ok(Arc::clone(&fixture) as Arc<dyn EmbeddingModel>)
             }
@@ -586,14 +569,14 @@ mod tests {
             let first = scope.spawn(move || {
                 first_manager.acquire(ModelRuntimeRequest::new(
                     "local/fixture",
-                    CreateEmbeddingModelOptions::default(),
+                    ModelConfig::default(),
                     None,
                 ))
             });
             let second = scope.spawn(move || {
                 second_manager.acquire(ModelRuntimeRequest::new(
                     "local/fixture",
-                    CreateEmbeddingModelOptions::default(),
+                    ModelConfig::default(),
                     None,
                 ))
             });
@@ -607,7 +590,7 @@ mod tests {
 
         assert_eq!(creations.load(Ordering::Acquire), 1);
         assert!(Arc::ptr_eq(&first.entry.runtime, &second.entry.runtime));
-        assert_eq!(first.info().reference, "local/fixture");
+        assert_eq!(first.info().model.reference(), "local/fixture");
         assert_eq!(
             manager.snapshot(),
             ModelRuntimeSnapshot {
@@ -617,12 +600,12 @@ mod tests {
             }
         );
 
-        let first_contents = vec![EmbeddingInput::text("first".to_owned())];
-        let second_contents = vec![EmbeddingInput::text("second".to_owned())];
+        let first_contents = vec![vec![Content::Text("first".to_owned())]];
+        let second_contents = vec![vec![Content::Text("second".to_owned())]];
         let first_embedding = first.embed(
             &first_contents,
             EmbeddingOptions {
-                purpose: Some(EmbeddingPurpose::Query),
+                purpose: EmbeddingPurpose::Query,
                 ..EmbeddingOptions::default()
             },
             None,
@@ -657,7 +640,7 @@ mod tests {
         let error = manager
             .acquire(ModelRuntimeRequest::new(
                 "local/fixture",
-                CreateEmbeddingModelOptions::default(),
+                ModelConfig::default(),
                 None,
             ))
             .err()
@@ -667,16 +650,16 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_model_progress_to_both_callbacks_with_effective_concurrency() {
-        use super::super::EmbeddingModelProgress;
+        use crate::domain::model::ModelProgress;
 
         let fixture = Arc::new(ProgressFixtureModel::new());
-        let manager = ModelRuntimeManager::with_factory(move |_reference, _options| {
+        let manager = ModelRuntimeManager::with_factory(move |_reference, _options, _compute| {
             Ok(Arc::clone(&fixture) as Arc<dyn EmbeddingModel>)
         });
         let lease = manager
             .acquire(ModelRuntimeRequest::new(
                 "local/fixture",
-                CreateEmbeddingModelOptions::default(),
+                ModelConfig::default(),
                 Some(1),
             ))
             .expect("fixture runtime should be acquired");
@@ -684,7 +667,7 @@ mod tests {
         let captured_model_events = Arc::clone(&model_events);
         let reported_events = Arc::new(StdMutex::new(Vec::new()));
         let captured_reported_events = Arc::clone(&reported_events);
-        let inputs = [EmbeddingInput::text("fixture".to_owned())];
+        let inputs = [vec![Content::Text("fixture".to_owned())]];
 
         lease
             .embed(
@@ -714,19 +697,19 @@ mod tests {
         assert_eq!(
             *model_events,
             [
-                EmbeddingModelProgress::Preparing {
+                ModelProgress::Preparing {
                     model: "local/fixture".to_owned(),
                 },
-                EmbeddingModelProgress::Downloading {
+                ModelProgress::Downloading {
                     model: "local/fixture".to_owned(),
                     downloaded_bytes: Some(4),
                     total_bytes: Some(8),
                 },
-                EmbeddingModelProgress::Warning {
+                ModelProgress::Warning {
                     model: "local/fixture".to_owned(),
                     message: "fixture warning".to_owned(),
                 },
-                EmbeddingModelProgress::Ready {
+                ModelProgress::Ready {
                     model: "local/fixture".to_owned(),
                 },
             ]
@@ -749,16 +732,16 @@ mod tests {
         let fixture = Arc::new(GatedFixtureModel::new());
         let manager = ModelRuntimeManager::with_factory({
             let fixture = Arc::clone(&fixture);
-            move |_reference, _options| Ok(Arc::clone(&fixture) as Arc<dyn EmbeddingModel>)
+            move |_reference, _options, _compute| Ok(Arc::clone(&fixture) as Arc<dyn EmbeddingModel>)
         });
         let lease = manager
             .acquire(ModelRuntimeRequest::new(
                 "local/fixture",
-                CreateEmbeddingModelOptions::default(),
+                ModelConfig::default(),
                 Some(2),
             ))
             .expect("fixture runtime should be acquired");
-        let inputs = [EmbeddingInput::text("fixture".to_owned())];
+        let inputs = [vec![Content::Text("fixture".to_owned())]];
 
         let embeddings = async {
             futures_util::future::join_all(
@@ -790,16 +773,16 @@ mod tests {
         let fixture = Arc::new(GatedFixtureModel::new());
         let manager = ModelRuntimeManager::with_factory({
             let fixture = Arc::clone(&fixture);
-            move |_reference, _options| Ok(Arc::clone(&fixture) as Arc<dyn EmbeddingModel>)
+            move |_reference, _options, _compute| Ok(Arc::clone(&fixture) as Arc<dyn EmbeddingModel>)
         });
         let lease = manager
             .acquire(ModelRuntimeRequest::new(
                 "local/fixture",
-                CreateEmbeddingModelOptions::default(),
+                ModelConfig::default(),
                 Some(1),
             ))
             .expect("fixture runtime should be acquired");
-        let inputs = [EmbeddingInput::text("fixture".to_owned())];
+        let inputs = [vec![Content::Text("fixture".to_owned())]];
         let signal = CancellationToken::new();
 
         let first = lease.embed(&inputs, EmbeddingOptions::default(), None);
@@ -830,25 +813,37 @@ mod tests {
     }
 
     #[test]
-    fn concurrency_policy_prefers_user_and_matches_main_remote_defaults() {
-        let mut info = ConcurrentFixtureModel::new().info;
-        assert_eq!(resolve_embedding_concurrency(Some(4), &info), 4);
-        assert_eq!(resolve_embedding_concurrency(None, &info), 2);
-        info.default_concurrency = None;
-        assert_eq!(resolve_embedding_concurrency(None, &info), 1);
-        assert_eq!(resolve_embedding_concurrency(Some(24), &info), 24);
-
-        info.provider = "qwen".to_owned();
-        assert_eq!(resolve_embedding_concurrency(None, &info), 8);
-        info.input_kinds.push(EmbeddingInputKind::Image);
-        assert_eq!(resolve_embedding_concurrency(None, &info), 4);
+    fn concurrency_policy_prefers_user_and_preserves_catalog_backend_defaults() {
+        let manager = ModelRuntimeManager::new();
+        for (reference, initial, maximum) in [
+            ("local/potion-code-16m-v2", 2, 2),
+            ("local/embeddinggemma-300m", 1, 1),
+            ("local/all-minilm-l6-v2", 1, 1),
+            ("qwen/text-embedding-v4", 8, 12),
+            ("qwen/qwen3-vl-embedding", 4, 8),
+        ] {
+            let config = ModelConfig {
+                api_key: Some("fixture".into()),
+                ..ModelConfig::default()
+            };
+            let lease = manager
+                .acquire(ModelRuntimeRequest::new(reference, config.clone(), None))
+                .expect("catalog model should be created without loading resources");
+            assert_eq!(lease.operation.limit, initial, "{reference}");
+            assert_eq!(lease.concurrency_defaults().maximum, maximum, "{reference}");
+            let explicit = manager
+                .acquire(ModelRuntimeRequest::new(reference, config, Some(24)))
+                .expect("explicit concurrency");
+            assert_eq!(explicit.operation.limit, 24, "{reference}");
+            assert!(Arc::ptr_eq(&lease.entry, &explicit.entry));
+        }
     }
 
     #[test]
     fn rejects_zero_user_concurrency_before_constructing_a_runtime() {
         let creations = Arc::new(AtomicUsize::new(0));
         let captured = Arc::clone(&creations);
-        let manager = ModelRuntimeManager::with_factory(move |_reference, _options| {
+        let manager = ModelRuntimeManager::with_factory(move |_reference, _options, _compute| {
             captured.fetch_add(1, Ordering::AcqRel);
             Ok(Arc::new(ProgressFixtureModel::new()) as Arc<dyn EmbeddingModel>)
         });
@@ -856,7 +851,7 @@ mod tests {
         let error = manager
             .acquire(ModelRuntimeRequest::new(
                 "local/fixture",
-                CreateEmbeddingModelOptions::default(),
+                ModelConfig::default(),
                 Some(0),
             ))
             .err()
@@ -870,32 +865,29 @@ mod tests {
     fn runtime_key_separates_resource_affecting_options_without_storing_api_keys() {
         let base = ModelRuntimeKey::new(
             "local/fixture",
-            &CreateEmbeddingModelOptions {
+            &ModelConfig {
                 api_key: Some("secret-a".to_owned()),
                 endpoint: Some("https://example.test/a".to_owned()),
-                model_cache_dir: Some(PathBuf::from("/cache/a")),
+                cache_dir: Some(PathBuf::from("/cache/a")),
                 device: Some(Device::Cpu),
-                compute_runtime: None,
             },
         );
         let same = ModelRuntimeKey::new(
             "local/fixture",
-            &CreateEmbeddingModelOptions {
+            &ModelConfig {
                 api_key: Some("secret-a".to_owned()),
                 endpoint: Some("https://example.test/a".to_owned()),
-                model_cache_dir: Some(PathBuf::from("/cache/a")),
+                cache_dir: Some(PathBuf::from("/cache/a")),
                 device: Some(Device::Cpu),
-                compute_runtime: None,
             },
         );
         let different = ModelRuntimeKey::new(
             "local/fixture",
-            &CreateEmbeddingModelOptions {
+            &ModelConfig {
                 api_key: Some("secret-b".to_owned()),
                 endpoint: Some("https://example.test/a".to_owned()),
-                model_cache_dir: Some(PathBuf::from("/cache/a")),
+                cache_dir: Some(PathBuf::from("/cache/a")),
                 device: Some(Device::Cpu),
-                compute_runtime: None,
             },
         );
 

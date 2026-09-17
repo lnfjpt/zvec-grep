@@ -10,8 +10,11 @@ use futures_util::future::join_all;
 use serde_json::json;
 
 use super::super::{
-    Device, ModelRuntimeLease, ModelRuntimeManager, ModelRuntimeRequest,
-    spi::{CreateEmbeddingModelOptions, EmbeddingInput, EmbeddingOptions},
+    ModelRuntimeLease, ModelRuntimeManager, ModelRuntimeRequest, spi::EmbeddingOptions,
+};
+use crate::domain::{
+    Content,
+    model::{Device, ModelConfig},
 };
 
 const DEFAULT_MODEL_REFERENCE: &str = "local/potion-code-16m-v2";
@@ -56,7 +59,7 @@ async fn model_layer_throughput() {
     let manager = ModelRuntimeManager::new();
     let model = create_benchmark_model(&manager, &model_reference, cache, device, concurrency);
     assert!(
-        batch_size <= model.info().limits.max_batch_size,
+        batch_size <= model.info().max_batch_size,
         "batch size exceeds model limit"
     );
     let batch = benchmark_batch(batch_size);
@@ -123,11 +126,11 @@ fn create_benchmark_model(
     manager
         .acquire(ModelRuntimeRequest::new(
             model_reference,
-            CreateEmbeddingModelOptions {
+            ModelConfig {
                 api_key: env::var("DASHSCOPE_API_KEY").ok(),
-                model_cache_dir: cache,
+                cache_dir: cache,
                 device,
-                ..CreateEmbeddingModelOptions::default()
+                ..ModelConfig::default()
             },
             Some(concurrency),
         ))
@@ -155,7 +158,7 @@ const fn device_name(device: Device) -> &'static str {
     }
 }
 
-async fn run_wave(model: &ModelRuntimeLease, batch: &[EmbeddingInput], concurrency: usize) -> f64 {
+async fn run_wave(model: &ModelRuntimeLease, batch: &[Vec<Content>], concurrency: usize) -> f64 {
     let results =
         join_all((0..concurrency).map(|_| model.embed(batch, EmbeddingOptions::default(), None)))
             .await;
@@ -175,12 +178,12 @@ async fn run_wave(model: &ModelRuntimeLease, batch: &[EmbeddingInput], concurren
         .sum()
 }
 
-fn benchmark_batch(batch_size: usize) -> Vec<EmbeddingInput> {
+fn benchmark_batch(batch_size: usize) -> Vec<Vec<Content>> {
     (0..batch_size)
         .map(|index| {
-            EmbeddingInput::text(format!(
+            vec![Content::Text(format!(
                 "pub fn benchmark_{index}(value: usize) -> usize {{ let adjusted = value.wrapping_mul(31).wrapping_add({index}); adjusted ^ 0x5a5a }}"
-            ))
+            ))]
         })
         .collect()
 }

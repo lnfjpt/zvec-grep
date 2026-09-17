@@ -1,3 +1,4 @@
+use crate::domain::Content;
 use std::{
     env,
     num::{NonZeroU32, NonZeroUsize},
@@ -26,16 +27,17 @@ use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Device,
     artifacts::publish_downloaded_file,
     catalog::LlamaCppConfig,
     compute::ModelComputeRuntime,
     download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
     spi::{
-        CreateEmbeddingModelOptions, EmbeddingInput, EmbeddingInputKind, EmbeddingModel,
-        EmbeddingModelInfo, EmbeddingModelLimits, EmbeddingModelProgress, EmbeddingOptions,
-        EmbeddingPurpose, EmbeddingResult, ModelError, validate_inputs, validate_result,
+        EmbeddingModel, EmbeddingOptions, ModelError, input_text, validate_inputs, validate_result,
     },
+};
+use crate::domain::model::{
+    Device, EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult, ModelConfig, ModelInfo,
+    ModelProgress,
 };
 
 static PARTIAL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -116,31 +118,32 @@ struct LlamaWorkerLease<'a> {
 }
 
 impl LlamaCppEmbeddingModel {
-    pub(crate) fn new(entry: LlamaCppConfig, options: CreateEmbeddingModelOptions) -> Self {
+    pub(crate) fn new(
+        entry: LlamaCppConfig,
+        options: ModelConfig,
+        compute_runtime: ModelComputeRuntime,
+    ) -> Self {
         let model_cache_dir = options
-            .model_cache_dir
+            .cache_dir
             .or_else(|| env::var_os("ZVEC_GREP_MODEL_CACHE").map(PathBuf::from))
             .unwrap_or_else(default_model_cache_dir);
         Self {
             entry,
             info: EmbeddingModelInfo {
-                reference: entry.reference.to_owned(),
-                provider: entry.provider.to_owned(),
-                name: entry.model.to_owned(),
+                model: ModelInfo {
+                    provider: entry.provider.to_owned(),
+                    name: entry.model.to_owned(),
+                    endpoint: None,
+                },
                 dimension: entry.dimension,
                 metric: entry.metric,
-                endpoint: None,
-                default_concurrency: None,
-                input_kinds: vec![EmbeddingInputKind::Text],
-                limits: EmbeddingModelLimits {
-                    max_batch_size: entry.max_batch_size,
-                    max_input_tokens: Some(entry.context_size),
-                    max_image_bytes: None,
-                },
+                max_batch_size: entry.max_batch_size,
+                max_input_tokens: Some(entry.context_size),
+                max_image_bytes: None,
             },
             model_cache_dir,
             device: options.device,
-            compute_runtime: options.compute_runtime.unwrap_or_default(),
+            compute_runtime,
             client: reqwest::Client::new(),
             state: Mutex::new(None),
         }
@@ -148,7 +151,7 @@ impl LlamaCppEmbeddingModel {
 
     async fn ensure_loaded(
         &self,
-        on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+        on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     ) -> Result<Arc<LoadedLlamaModel>, ModelError> {
         let mut state = self.state.lock().await;
         if let Some(model) = &*state {
@@ -161,7 +164,7 @@ impl LlamaCppEmbeddingModel {
 
     async fn load_model(
         &self,
-        on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+        on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     ) -> Result<LoadedLlamaModel, ModelError> {
         let artifact = gguf_artifact_name(self.entry.uri)?.to_owned();
         let reporter = ModelDownloadProgressReporter::new(
@@ -184,7 +187,7 @@ impl LlamaCppEmbeddingModel {
     async fn fallback_to_cpu(
         &self,
         failed: Arc<LoadedLlamaModel>,
-        on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+        on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
         cause: &ModelError,
     ) -> Result<Arc<LoadedLlamaModel>, ModelError> {
         let mut state = self.state.lock().await;
@@ -305,19 +308,21 @@ impl EmbeddingModel for LlamaCppEmbeddingModel {
 
     async fn embed(
         &self,
-        inputs: &[EmbeddingInput],
+        inputs: &[Vec<Content>],
         options: EmbeddingOptions,
     ) -> Result<EmbeddingResult, ModelError> {
-        validate_inputs(&self.info, inputs)?;
+        validate_inputs(&self.info, inputs, |content| {
+            matches!(content, Content::Text(_))
+        })?;
         let on_progress = options.on_progress.clone();
         let model = self
             .ensure_loaded(options.on_progress)
             .await
             .map_err(|error| embed_error(self.entry, error))?;
-        let purpose = options.purpose.unwrap_or_default();
+        let purpose = options.purpose;
         let texts = inputs
             .iter()
-            .map(|input| Ok(format_text(&input.to_text()?, purpose, self.entry.format)))
+            .map(|input| Ok(format_text(&input_text(input)?, purpose, self.entry.format)))
             .collect::<Result<Vec<_>, ModelError>>()?;
         let entry = self.entry;
         let signal = options.signal;
@@ -464,11 +469,11 @@ const fn requested_device_name(device: Option<Device>) -> &'static str {
 
 fn report_warning(
     model: &str,
-    on_progress: Option<&Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+    on_progress: Option<&Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     message: String,
 ) {
     if let Some(on_progress) = on_progress {
-        on_progress(EmbeddingModelProgress::Warning {
+        on_progress(ModelProgress::Warning {
             model: model.to_owned(),
             message,
         });
@@ -1068,20 +1073,21 @@ mod tests {
             .expect("ZVEC_GREP_TEST_MODEL_CACHE must point at the model cache");
         let model = LlamaCppEmbeddingModel::new(
             entry("local/embeddinggemma-300m"),
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(cache),
+            ModelConfig {
+                cache_dir: Some(cache),
                 device: Some(Device::Cpu),
-                ..CreateEmbeddingModelOptions::default()
+                ..ModelConfig::default()
             },
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
         let result = model
             .embed(
                 &[
-                    EmbeddingInput::text("find authentication middleware".to_owned()),
-                    EmbeddingInput::text("parse a configuration file".to_owned()),
+                    vec![Content::Text("find authentication middleware".to_owned())],
+                    vec![Content::Text("parse a configuration file".to_owned())],
                 ],
                 EmbeddingOptions {
-                    purpose: Some(EmbeddingPurpose::Query),
+                    purpose: EmbeddingPurpose::Query,
                     ..EmbeddingOptions::default()
                 },
             )
@@ -1151,15 +1157,16 @@ mod tests {
             .expect("ZVEC_GREP_TEST_MODEL_CACHE must point at the model cache");
         let model = LlamaCppEmbeddingModel::new(
             entry("local/embeddinggemma-300m"),
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(cache),
+            ModelConfig {
+                cache_dir: Some(cache),
                 device: Some(Device::Metal),
-                ..CreateEmbeddingModelOptions::default()
+                ..ModelConfig::default()
             },
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
         let result = model
             .embed(
-                &[EmbeddingInput::text("find relevant code".to_owned())],
+                &[vec![Content::Text("find relevant code".to_owned())]],
                 EmbeddingOptions {
                     execution_concurrency: 2,
                     ..EmbeddingOptions::default()
@@ -1168,8 +1175,8 @@ mod tests {
             .await
             .expect("Metal llama.cpp inference");
         assert_eq!(result.vectors[0].len(), 768);
-        let first_contents = [EmbeddingInput::text("authentication middleware".to_owned())];
-        let second_contents = [EmbeddingInput::text("configuration parser".to_owned())];
+        let first_contents = [vec![Content::Text("authentication middleware".to_owned())]];
+        let second_contents = [vec![Content::Text("configuration parser".to_owned())]];
         let first = model.embed(
             &first_contents,
             EmbeddingOptions {
@@ -1206,19 +1213,20 @@ mod tests {
             .expect("ZVEC_GREP_TEST_MODEL_CACHE must point at the model cache");
         let model = LlamaCppEmbeddingModel::new(
             entry("local/qwen3-embedding-0.6b"),
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(cache),
+            ModelConfig {
+                cache_dir: Some(cache),
                 device: Some(Device::Cpu),
-                ..CreateEmbeddingModelOptions::default()
+                ..ModelConfig::default()
             },
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
         let result = model
             .embed(
-                &[EmbeddingInput::text(
+                &[vec![Content::Text(
                     "find authentication middleware".to_owned(),
-                )],
+                )]],
                 EmbeddingOptions {
-                    purpose: Some(EmbeddingPurpose::Query),
+                    purpose: EmbeddingPurpose::Query,
                     ..EmbeddingOptions::default()
                 },
             )

@@ -1,8 +1,11 @@
 use serde_json::{Value, json};
 
-use crate::models::{
-    catalog::{EmbeddingCatalogEntry, list_embedding_models},
-    spi::EmbeddingMetric,
+use crate::{
+    domain::model::EmbeddingMetric,
+    models::catalog::{
+        EmbeddingCatalogEntry, LlamaCppConfig, Model2VecConfig, QwenConfig, TransformersConfig,
+        list_embedding_models,
+    },
 };
 
 #[test]
@@ -21,7 +24,7 @@ fn catalog_matches_main_typescript_field_for_field() {
 #[allow(clippy::too_many_lines)]
 fn entry_value(entry: EmbeddingCatalogEntry) -> Value {
     match entry {
-        EmbeddingCatalogEntry::LlamaCpp {
+        EmbeddingCatalogEntry::LlamaCpp(LlamaCppConfig {
             reference,
             provider,
             model,
@@ -31,7 +34,7 @@ fn entry_value(entry: EmbeddingCatalogEntry) -> Value {
             format,
             context_size,
             max_batch_size,
-        } => json!({
+        }) => json!({
             "backend": "llama-cpp",
             "reference": reference,
             "provider": provider,
@@ -43,7 +46,7 @@ fn entry_value(entry: EmbeddingCatalogEntry) -> Value {
             "contextSize": context_size,
             "maxBatchSize": max_batch_size,
         }),
-        EmbeddingCatalogEntry::Qwen {
+        EmbeddingCatalogEntry::Qwen(QwenConfig {
             kind,
             reference,
             provider,
@@ -54,7 +57,7 @@ fn entry_value(entry: EmbeddingCatalogEntry) -> Value {
             max_batch_size,
             max_input_tokens,
             max_image_bytes,
-        } => {
+        }) => {
             let mut value = json!({
                 "backend": "qwen",
                 "kind": kind,
@@ -75,7 +78,7 @@ fn entry_value(entry: EmbeddingCatalogEntry) -> Value {
             }
             value
         }
-        EmbeddingCatalogEntry::TransformersJs {
+        EmbeddingCatalogEntry::TransformersJs(TransformersConfig {
             reference,
             provider,
             model,
@@ -90,7 +93,7 @@ fn entry_value(entry: EmbeddingCatalogEntry) -> Value {
             document_prefix,
             max_input_tokens,
             max_batch_size,
-        } => {
+        }) => {
             let mut value = json!({
                 "backend": "transformers-js",
                 "reference": reference,
@@ -117,7 +120,7 @@ fn entry_value(entry: EmbeddingCatalogEntry) -> Value {
             }
             value
         }
-        EmbeddingCatalogEntry::Model2Vec {
+        EmbeddingCatalogEntry::Model2Vec(Model2VecConfig {
             reference,
             provider,
             model,
@@ -132,7 +135,8 @@ fn entry_value(entry: EmbeddingCatalogEntry) -> Value {
             max_input_tokens,
             max_batch_size,
             default_concurrency,
-        } => json!({
+            ..
+        }) => json!({
             "backend": "model2vec",
             "reference": reference,
             "provider": provider,

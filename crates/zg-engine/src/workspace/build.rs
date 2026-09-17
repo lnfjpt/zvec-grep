@@ -294,10 +294,10 @@ mod tests {
 
     use crate::{
         domain::{
-            EmbeddingMetric, EmbeddingSchema, FileSelection, IndexDescriptor, IndexState, Workspace,
+            FileSelection, IndexDescriptor, IndexState, Workspace,
+            model::{EmbeddingMetric, EmbeddingSchema, ModelConfig},
         },
         storage::spi::{StorageResult, WorkspaceIndexStorage, WorkspaceIndexStorageOptions},
-        workspace::manifest::EmbeddingRuntimeConfig,
     };
 
     use super::*;
@@ -353,7 +353,7 @@ mod tests {
             },
             root.join(".zvec-grep"),
             Some(5),
-            EmbeddingRuntimeConfig::default(),
+            ModelConfig::default(),
         )
         .expect("manifest")
     }

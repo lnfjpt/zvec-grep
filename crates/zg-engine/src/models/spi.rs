@@ -1,132 +1,57 @@
 //! Backend contract shared by the model runtime and embedding implementations.
 
-use std::{borrow::Cow, collections::HashSet, fmt, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, fmt, sync::Arc};
 
 use crate::domain::Content;
-pub(crate) use crate::domain::EmbeddingMetric;
+use crate::domain::model::{EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult, ModelProgress};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use super::compute::ModelComputeRuntime;
 pub(super) use super::error::ModelError;
 
-/// Execution device requested for a local embedding model.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Device {
-    Auto,
-    Cpu,
-    Metal,
-    Vulkan,
-    Cuda,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum EmbeddingInputKind {
-    Text,
-    Image,
-}
-
-/// One document or query that produces one embedding vector.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EmbeddingInput {
-    pub contents: Vec<Content>,
-}
-
-impl EmbeddingInput {
-    pub(crate) fn new(contents: Vec<Content>) -> Self {
-        Self { contents }
-    }
-
-    pub(crate) fn text(text: impl Into<String>) -> Self {
-        Self::new(vec![Content::Text(text.into())])
-    }
-
-    pub(super) fn to_text(&self) -> Result<Cow<'_, str>, ModelError> {
-        match self.contents.as_slice() {
-            [] => Err(ModelError::invalid_argument(
-                "Embedding input requires at least one content item",
-            )),
-            [Content::Text(text)] => Ok(Cow::Borrowed(text)),
-            contents => {
-                let mut combined = String::new();
-                for (index, content) in contents.iter().enumerate() {
-                    let Content::Text(text) = content else {
-                        return Err(ModelError::unsupported(
-                            "Text embedding requires text content",
-                        ));
-                    };
-                    if index > 0 {
-                        combined.push('\n');
-                    }
-                    combined.push_str(text);
+pub(crate) fn input_text(input: &[Content]) -> Result<Cow<'_, str>, ModelError> {
+    match input {
+        [] => Err(ModelError::invalid_argument(
+            "Embedding input requires at least one content item",
+        )),
+        [Content::Text(text)] => Ok(Cow::Borrowed(text)),
+        contents => {
+            let mut combined = String::new();
+            for (index, content) in contents.iter().enumerate() {
+                let Content::Text(text) = content else {
+                    return Err(ModelError::unsupported(
+                        "Text embedding requires text content",
+                    ));
+                };
+                if index > 0 {
+                    combined.push('\n');
                 }
-                Ok(Cow::Owned(combined))
+                combined.push_str(text);
             }
+            Ok(Cow::Owned(combined))
         }
     }
 }
 
-#[derive(Clone, Default)]
-pub struct CreateEmbeddingModelOptions {
-    pub api_key: Option<String>,
-    pub endpoint: Option<String>,
-    pub model_cache_dir: Option<PathBuf>,
-    pub device: Option<Device>,
-    pub(crate) compute_runtime: Option<ModelComputeRuntime>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum EmbeddingPurpose {
-    #[default]
-    Document,
-    Query,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EmbeddingModelProgress {
-    Preparing {
-        model: String,
-    },
-    Downloading {
-        model: String,
-        downloaded_bytes: Option<u64>,
-        total_bytes: Option<u64>,
-    },
-    Warning {
-        model: String,
-        message: String,
-    },
-    Ready {
-        model: String,
-    },
-}
-
 /// Observes model preparation together with the operation's effective concurrency.
 #[derive(Clone)]
-pub(crate) struct ModelProgressReporter(
-    Arc<dyn Fn(EmbeddingModelProgress, usize) + Send + Sync + 'static>,
-);
+pub(crate) struct ModelProgressReporter(Arc<dyn Fn(ModelProgress, usize) + Send + Sync + 'static>);
 
 impl ModelProgressReporter {
-    pub(crate) fn new(
-        reporter: impl Fn(EmbeddingModelProgress, usize) + Send + Sync + 'static,
-    ) -> Self {
+    pub(crate) fn new(reporter: impl Fn(ModelProgress, usize) + Send + Sync + 'static) -> Self {
         Self(Arc::new(reporter))
     }
 
-    pub(super) fn report(&self, progress: EmbeddingModelProgress, concurrency: usize) {
+    pub(super) fn report(&self, progress: ModelProgress, concurrency: usize) {
         (self.0)(progress, concurrency);
     }
 }
 
 #[derive(Clone, Default)]
 pub struct EmbeddingOptions {
-    pub purpose: Option<EmbeddingPurpose>,
+    pub purpose: EmbeddingPurpose,
     pub signal: Option<CancellationToken>,
-    pub on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+    pub on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     /// Runtime-owned execution budget. Backends use this to size their
     /// per-request local inference resources without exposing another public
     /// tuning knob.
@@ -155,47 +80,43 @@ impl fmt::Debug for EmbeddingOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct EmbeddingResult {
-    pub vectors: Vec<Vec<f32>>,
-    pub truncated: Vec<usize>,
+/// Backend defaults used by runtime admission and the indexing scheduler.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmbeddingConcurrencyDefaults {
+    pub initial: usize,
+    pub maximum: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(clippy::struct_field_names)]
-pub struct EmbeddingModelLimits {
-    pub max_batch_size: usize,
-    pub max_input_tokens: Option<usize>,
-    pub max_image_bytes: Option<usize>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EmbeddingModelInfo {
-    pub reference: String,
-    pub provider: String,
-    pub name: String,
-    pub dimension: usize,
-    pub metric: EmbeddingMetric,
-    pub endpoint: Option<String>,
-    pub default_concurrency: Option<usize>,
-    pub input_kinds: Vec<EmbeddingInputKind>,
-    pub limits: EmbeddingModelLimits,
+impl Default for EmbeddingConcurrencyDefaults {
+    fn default() -> Self {
+        Self {
+            initial: 1,
+            maximum: 1,
+        }
+    }
 }
 
 #[async_trait]
 pub trait EmbeddingModel: Send + Sync {
     fn info(&self) -> &EmbeddingModelInfo;
 
+    fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
+        EmbeddingConcurrencyDefaults::default()
+    }
+
+    /// Embeds a batch of inputs, producing one vector per inner content list.
+    /// Content items within an input are ordered; each backend validates supported combinations.
     async fn embed(
         &self,
-        inputs: &[EmbeddingInput],
+        inputs: &[Vec<Content>],
         options: EmbeddingOptions,
     ) -> Result<EmbeddingResult, ModelError>;
 }
 
 pub(crate) fn validate_inputs(
     info: &EmbeddingModelInfo,
-    inputs: &[EmbeddingInput],
+    inputs: &[Vec<Content>],
+    accepts: impl Fn(&Content) -> bool,
 ) -> Result<(), ModelError> {
     if inputs.is_empty() {
         return Err(ModelError::new(
@@ -204,21 +125,21 @@ pub(crate) fn validate_inputs(
             None,
         ));
     }
-    if inputs.len() > info.limits.max_batch_size {
+    if inputs.len() > info.max_batch_size {
         return Err(ModelError::new(
             crate::EngineError::INVALID_ARGUMENT,
             "Embedding batch size exceeds model limit",
             Some(format!(
                 "model={} batchSize={} maxBatchSize={}",
-                info.reference,
+                info.model.reference(),
                 inputs.len(),
-                info.limits.max_batch_size
+                info.max_batch_size
             )),
         ));
     }
 
     for (index, input) in inputs.iter().enumerate() {
-        validate_input(info, index, input)?;
+        validate_input(info, index, input, &accepts)?;
     }
     Ok(())
 }
@@ -226,38 +147,27 @@ pub(crate) fn validate_inputs(
 fn validate_input(
     info: &EmbeddingModelInfo,
     index: usize,
-    input: &EmbeddingInput,
+    input: &[Content],
+    accepts: &impl Fn(&Content) -> bool,
 ) -> Result<(), ModelError> {
-    if input.contents.is_empty() {
+    if input.is_empty() {
         return Err(ModelError::new(
             crate::EngineError::INVALID_ARGUMENT,
             "Embedding input requires at least one content item",
-            Some(format!("model={} inputIndex={index}", info.reference)),
+            Some(format!(
+                "model={} inputIndex={index}",
+                info.model.reference()
+            )),
         ));
     }
-    for (part_index, content) in input.contents.iter().enumerate() {
-        let kind = match content {
-            Content::Text(_) => EmbeddingInputKind::Text,
-            Content::Image(_) => EmbeddingInputKind::Image,
-            Content::Table(_) => {
-                return Err(ModelError::new(
-                    crate::EngineError::UNSUPPORTED,
-                    "Embedding model does not support table content",
-                    Some(format!(
-                        "model={} inputIndex={index} partIndex={part_index}",
-                        info.reference
-                    )),
-                ));
-            }
-        };
-        if !info.input_kinds.contains(&kind) {
+    for (part_index, content) in input.iter().enumerate() {
+        if !accepts(content) {
             return Err(ModelError::new(
                 crate::EngineError::UNSUPPORTED,
-                "Embedding model does not support content kind",
+                "Embedding model does not support content",
                 Some(format!(
-                    "model={} inputIndex={index} partIndex={part_index} kind={}",
-                    info.reference,
-                    kind_name(kind)
+                    "model={} inputIndex={index} partIndex={part_index}",
+                    info.model.reference()
                 )),
             ));
         }
@@ -269,23 +179,22 @@ fn validate_input(
                     "Embedding text content must not be empty",
                     Some(format!(
                         "model={} inputIndex={index} partIndex={part_index}",
-                        info.reference
+                        info.model.reference()
                     )),
                 ));
             }
             Content::Image(image)
                 if info
-                    .limits
                     .max_image_bytes
                     .is_some_and(|maximum| image.data().len() > maximum) =>
             {
-                let maximum = info.limits.max_image_bytes.unwrap_or_default();
+                let maximum = info.max_image_bytes.unwrap_or_default();
                 return Err(ModelError::new(
                     crate::EngineError::INVALID_ARGUMENT,
                     "Embedding image content exceeds model limit",
                     Some(format!(
                         "model={} inputIndex={index} partIndex={part_index} imageBytes={} maxImageBytes={maximum}",
-                        info.reference,
+                        info.model.reference(),
                         image.data().len()
                     )),
                 ));
@@ -307,7 +216,7 @@ pub(crate) fn validate_result(
             "Embedding model returned the wrong number of vectors",
             Some(format!(
                 "model={} inputCount={input_count} vectorCount={}",
-                info.reference,
+                info.model.reference(),
                 result.vectors.len()
             )),
         ));
@@ -319,7 +228,7 @@ pub(crate) fn validate_result(
                 "Embedding model returned a vector with the wrong dimension",
                 Some(format!(
                     "model={} vectorIndex={vector_index} expectedDimension={} actualDimension={}",
-                    info.reference,
+                    info.model.reference(),
                     info.dimension,
                     vector.len()
                 )),
@@ -331,7 +240,7 @@ pub(crate) fn validate_result(
                 "Embedding model returned a non-finite vector value",
                 Some(format!(
                     "model={} vectorIndex={vector_index} valueIndex={value_index}",
-                    info.reference
+                    info.model.reference()
                 )),
             ));
         }
@@ -345,7 +254,7 @@ pub(crate) fn validate_result(
                 "Embedding model returned an invalid truncated input index",
                 Some(format!(
                     "model={} index={index} inputCount={input_count}",
-                    info.reference
+                    info.model.reference()
                 )),
             ));
         }
@@ -353,22 +262,24 @@ pub(crate) fn validate_result(
     Ok(())
 }
 
-const fn kind_name(kind: EmbeddingInputKind) -> &'static str {
-    match kind {
-        EmbeddingInputKind::Text => "text",
-        EmbeddingInputKind::Image => "image",
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::domain::{Content, FileFormat, ImageContent, TableContent};
+    use crate::domain::{Content, FileFormat, ImageContent, TableContent, model::EmbeddingMetric};
 
     use super::*;
 
+    fn validate_inputs(
+        info: &EmbeddingModelInfo,
+        inputs: &[Vec<Content>],
+    ) -> Result<(), ModelError> {
+        super::validate_inputs(info, inputs, |content| {
+            matches!(content, Content::Text(_) | Content::Image(_))
+        })
+    }
+
     #[test]
     fn validates_all_representable_input_failures_from_the_typescript_base_class() {
-        let mut info = fixture_info();
+        let info = fixture_info();
 
         assert_error_code(
             validate_inputs(&info, &[]),
@@ -378,19 +289,19 @@ mod tests {
             validate_inputs(
                 &info,
                 &[
-                    EmbeddingInput::text("one".to_owned()),
-                    EmbeddingInput::text("two".to_owned()),
-                    EmbeddingInput::text("three".to_owned()),
+                    vec![Content::Text("one".to_owned())],
+                    vec![Content::Text("two".to_owned())],
+                    vec![Content::Text("three".to_owned())],
                 ],
             ),
             crate::EngineError::INVALID_ARGUMENT,
         );
         assert_error_code(
-            validate_inputs(&info, &[EmbeddingInput::text("  ".to_owned())]),
+            validate_inputs(&info, &[vec![Content::Text("  ".to_owned())]]),
             crate::EngineError::INVALID_ARGUMENT,
         );
         assert_error_code(
-            validate_inputs(&info, &[EmbeddingInput::new(Vec::new())]),
+            validate_inputs(&info, &[Vec::new()]),
             crate::EngineError::INVALID_ARGUMENT,
         );
         assert_eq!(
@@ -402,31 +313,31 @@ mod tests {
         assert_error_code(
             validate_inputs(
                 &info,
-                &[EmbeddingInput::new(vec![Content::Image(
+                &[vec![Content::Image(
                     ImageContent::new(vec![1, 2, 3, 4], FileFormat::Png).expect("image"),
-                )])],
+                )]],
             ),
             crate::EngineError::INVALID_ARGUMENT,
         );
 
-        info.input_kinds = vec![EmbeddingInputKind::Text];
         assert_error_code(
-            validate_inputs(
+            super::validate_inputs(
                 &info,
-                &[EmbeddingInput::new(vec![Content::Image(
+                &[vec![Content::Image(
                     ImageContent::new(vec![1], FileFormat::Png).expect("image"),
-                )])],
+                )]],
+                |content| matches!(content, Content::Text(_)),
             ),
             crate::EngineError::UNSUPPORTED,
         );
         assert_error_code(
             validate_inputs(
                 &info,
-                &[EmbeddingInput::new(vec![Content::Table(TableContent {
+                &[vec![Content::Table(TableContent {
                     row_count: 0,
                     column_count: 0,
                     cells: Vec::new(),
-                })])],
+                })]],
             ),
             crate::EngineError::UNSUPPORTED,
         );
@@ -435,25 +346,22 @@ mod tests {
     #[test]
     fn preserves_input_boundaries_when_combining_text_parts() {
         let mut info = fixture_info();
-        info.limits.max_batch_size = 1;
-        let input = EmbeddingInput::new(vec![
+        info.max_batch_size = 1;
+        let input = vec![
             Content::Text("first".to_owned()),
             Content::Text("second".to_owned()),
             Content::Text("third".to_owned()),
-        ]);
+        ];
         validate_inputs(&info, std::slice::from_ref(&input)).expect("one input");
-        assert_eq!(input.to_text().expect("text"), "first\nsecond\nthird");
+        assert_eq!(input_text(&input).expect("text"), "first\nsecond\nthird");
         assert!(matches!(
-            EmbeddingInput::text("one").to_text().expect("text"),
+            input_text(&[Content::Text("one".into())]).expect("text"),
             Cow::Borrowed("one")
         ));
         let image = ImageContent::new(vec![1], FileFormat::Png).expect("image");
-        let mixed = EmbeddingInput::new(vec![
-            Content::Text("first".to_owned()),
-            Content::Image(image),
-        ]);
+        let mixed = vec![Content::Text("first".to_owned()), Content::Image(image)];
         assert_eq!(
-            mixed.to_text().expect_err("non-text part").code(),
+            input_text(&mixed).expect_err("non-text part").code(),
             crate::EngineError::UNSUPPORTED,
         );
     }
@@ -512,19 +420,16 @@ mod tests {
 
     fn fixture_info() -> EmbeddingModelInfo {
         EmbeddingModelInfo {
-            reference: "test/stub".to_owned(),
-            provider: "test".to_owned(),
-            name: "stub".to_owned(),
+            model: crate::domain::model::ModelInfo {
+                provider: "test".into(),
+                name: "stub".into(),
+                endpoint: None,
+            },
             dimension: 2,
             metric: EmbeddingMetric::Cosine,
-            endpoint: None,
-            default_concurrency: Some(2),
-            input_kinds: vec![EmbeddingInputKind::Text, EmbeddingInputKind::Image],
-            limits: EmbeddingModelLimits {
-                max_batch_size: 2,
-                max_input_tokens: None,
-                max_image_bytes: Some(3),
-            },
+            max_batch_size: 2,
+            max_input_tokens: None,
+            max_image_bytes: Some(3),
         }
     }
 

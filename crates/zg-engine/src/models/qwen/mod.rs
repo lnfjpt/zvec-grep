@@ -9,11 +9,11 @@ use crate::domain::{Content, FileFormat};
 use super::{
     catalog::QwenConfig,
     spi::{
-        CreateEmbeddingModelOptions, EmbeddingInput, EmbeddingInputKind, EmbeddingModel,
-        EmbeddingModelInfo, EmbeddingModelLimits, EmbeddingOptions, EmbeddingResult,
-        EmbeddingTraceHeaders, ModelError, validate_inputs, validate_result,
+        EmbeddingConcurrencyDefaults, EmbeddingModel, EmbeddingOptions, EmbeddingTraceHeaders,
+        ModelError, input_text, validate_inputs, validate_result,
     },
 };
+use crate::domain::model::{EmbeddingModelInfo, EmbeddingResult, ModelConfig, ModelInfo};
 
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_MULTIMODAL_IMAGES: usize = 10;
@@ -27,16 +27,13 @@ pub(crate) struct QwenEmbeddingModel {
 }
 
 impl QwenEmbeddingModel {
-    pub(crate) fn new(
-        entry: QwenConfig,
-        options: CreateEmbeddingModelOptions,
-    ) -> Result<Self, ModelError> {
+    pub(crate) fn new(entry: QwenConfig, options: ModelConfig) -> Result<Self, ModelError> {
         Self::with_http(entry, options, Arc::new(ReqwestQwenHttpClient::new()?))
     }
 
     fn with_http(
         entry: QwenConfig,
-        options: CreateEmbeddingModelOptions,
+        options: ModelConfig,
         http: Arc<dyn QwenHttpClient>,
     ) -> Result<Self, ModelError> {
         let display_name = model_name(entry);
@@ -62,27 +59,19 @@ impl QwenEmbeddingModel {
                 Some(format!("model={}", entry.reference)),
             ));
         }
-        let input_kinds = if entry.kind == "multimodal" {
-            vec![EmbeddingInputKind::Text, EmbeddingInputKind::Image]
-        } else {
-            vec![EmbeddingInputKind::Text]
-        };
         Ok(Self {
             entry,
             info: EmbeddingModelInfo {
-                reference: entry.reference.to_owned(),
-                provider: entry.provider.to_owned(),
-                name: entry.model.to_owned(),
+                model: ModelInfo {
+                    provider: entry.provider.to_owned(),
+                    name: entry.model.to_owned(),
+                    endpoint: Some(endpoint.clone()),
+                },
                 dimension: entry.dimension,
                 metric: entry.metric,
-                endpoint: Some(endpoint.clone()),
-                default_concurrency: None,
-                input_kinds,
-                limits: EmbeddingModelLimits {
-                    max_batch_size: entry.max_batch_size,
-                    max_input_tokens: Some(entry.max_input_tokens),
-                    max_image_bytes: entry.max_image_bytes,
-                },
+                max_batch_size: entry.max_batch_size,
+                max_input_tokens: Some(entry.max_input_tokens),
+                max_image_bytes: entry.max_image_bytes,
             },
             api_key,
             endpoint,
@@ -92,13 +81,13 @@ impl QwenEmbeddingModel {
 
     async fn embed_text(
         &self,
-        inputs: &[EmbeddingInput],
+        inputs: &[Vec<Content>],
         signal: Option<CancellationToken>,
         trace_headers: Option<EmbeddingTraceHeaders>,
     ) -> Result<EmbeddingResult, ModelError> {
         let texts = inputs
             .iter()
-            .map(EmbeddingInput::to_text)
+            .map(|input| input_text(input))
             .collect::<Result<Vec<_>, _>>()?;
         let request = json!({
             "model": self.entry.model,
@@ -143,14 +132,14 @@ impl QwenEmbeddingModel {
 
     async fn embed_multimodal(
         &self,
-        inputs: &[EmbeddingInput],
+        inputs: &[Vec<Content>],
         signal: Option<CancellationToken>,
         trace_headers: Option<EmbeddingTraceHeaders>,
     ) -> Result<EmbeddingResult, ModelError> {
         validate_multimodal_inputs(self.entry, inputs)?;
         let request_contents = inputs
             .iter()
-            .map(|input| match input.contents.as_slice() {
+            .map(|input| match input.as_slice() {
                 [Content::Text(text)] => Ok(json!({ "text": text })),
                 [Content::Image(image)] => Ok(json!({ "image": bytes_to_base64(image.data()) })),
                 _ => Err(ModelError::unsupported(
@@ -240,12 +229,30 @@ impl EmbeddingModel for QwenEmbeddingModel {
         &self.info
     }
 
+    fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
+        if self.entry.kind == "multimodal" {
+            EmbeddingConcurrencyDefaults {
+                initial: 4,
+                maximum: 8,
+            }
+        } else {
+            EmbeddingConcurrencyDefaults {
+                initial: 8,
+                maximum: 12,
+            }
+        }
+    }
+
     async fn embed(
         &self,
-        inputs: &[EmbeddingInput],
+        inputs: &[Vec<Content>],
         options: EmbeddingOptions,
     ) -> Result<EmbeddingResult, ModelError> {
-        validate_inputs(&self.info, inputs)?;
+        validate_inputs(&self.info, inputs, |content| match content {
+            Content::Text(_) => true,
+            Content::Image(_) => self.entry.kind == "multimodal",
+            Content::Table(_) => false,
+        })?;
         let EmbeddingOptions {
             signal,
             trace_headers,
@@ -564,11 +571,11 @@ fn multimodal_index_out_of_range(
 
 fn validate_multimodal_inputs(
     entry: QwenConfig,
-    inputs: &[EmbeddingInput],
+    inputs: &[Vec<Content>],
 ) -> Result<(), ModelError> {
     let mut image_count = 0;
     for (index, input) in inputs.iter().enumerate() {
-        let [content] = input.contents.as_slice() else {
+        let [content] = input.as_slice() else {
             return Err(ModelError::new(
                 crate::EngineError::UNSUPPORTED,
                 "Qwen multimodal embedding requires one text or image content per input",
@@ -639,10 +646,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::{
-        domain::{ImageContent, TableContent},
-        models::spi::EmbeddingMetric,
-    };
+    use crate::domain::{ImageContent, TableContent, model::EmbeddingMetric};
 
     struct MockHttp {
         response: Mutex<Option<QwenHttpResponse>>,
@@ -681,11 +685,11 @@ mod tests {
         }
     }
 
-    fn options() -> CreateEmbeddingModelOptions {
-        CreateEmbeddingModelOptions {
+    fn options() -> ModelConfig {
+        ModelConfig {
             api_key: Some(" secret ".to_owned()),
             endpoint: Some(" https://example.test/embed ".to_owned()),
-            ..CreateEmbeddingModelOptions::default()
+            ..ModelConfig::default()
         }
     }
 
@@ -714,11 +718,11 @@ mod tests {
         let result = model
             .embed(
                 &[
-                    EmbeddingInput::new(vec![
+                    vec![
                         Content::Text("one".to_owned()),
                         Content::Text("part".to_owned()),
-                    ]),
-                    EmbeddingInput::text("two".to_owned()),
+                    ],
+                    vec![Content::Text("two".to_owned())],
                 ],
                 EmbeddingOptions {
                     trace_headers: Some(EmbeddingTraceHeaders {
@@ -753,6 +757,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_backend_rejects_images_before_http_dispatch() {
+        let http = Arc::new(MockHttp {
+            response: Mutex::new(None),
+            requests: Mutex::new(Vec::new()),
+        });
+        let model = QwenEmbeddingModel::with_http(
+            config("text", "text-embedding-v4", 2),
+            options(),
+            http.clone(),
+        )
+        .expect("model");
+        let image = ImageContent::new(vec![1], FileFormat::Png).expect("image");
+        let error = model
+            .embed(&[vec![Content::Image(image)]], EmbeddingOptions::default())
+            .await
+            .expect_err("text backend must reject images");
+        assert_eq!(error.code(), crate::EngineError::UNSUPPORTED);
+        assert!(http.requests.lock().expect("requests lock").is_empty());
+    }
+
+    #[tokio::test]
     async fn multimodal_request_preserves_content_and_rejects_unsupported_inputs() {
         let http = Arc::new(MockHttp {
             response: Mutex::new(Some(QwenHttpResponse {
@@ -777,10 +802,10 @@ mod tests {
         let result = model
             .embed(
                 &[
-                    EmbeddingInput::text("query".to_owned()),
-                    EmbeddingInput::new(vec![Content::Image(
+                    vec![Content::Text("query".to_owned())],
+                    vec![Content::Image(
                         ImageContent::new(vec![1, 2, 3], FileFormat::Png).expect("image"),
-                    )]),
+                    )],
                 ],
                 EmbeddingOptions::default(),
             )
@@ -803,10 +828,7 @@ mod tests {
         ] {
             let error = model
                 .embed(
-                    &[
-                        EmbeddingInput::text("query".to_owned()),
-                        EmbeddingInput::new(vec![content]),
-                    ],
+                    &[vec![Content::Text("query".to_owned())], vec![content]],
                     EmbeddingOptions::default(),
                 )
                 .await
@@ -824,7 +846,7 @@ mod tests {
             ],
         ] {
             let error = model
-                .embed(&[EmbeddingInput::new(parts)], EmbeddingOptions::default())
+                .embed(&[parts], EmbeddingOptions::default())
                 .await
                 .expect_err("composed multimodal inputs are unsupported");
             assert_eq!(error.code(), crate::EngineError::UNSUPPORTED);
@@ -850,7 +872,7 @@ mod tests {
         .expect("model");
         let error = model
             .embed(
-                &[EmbeddingInput::text("one".to_owned())],
+                &[vec![Content::Text("one".to_owned())]],
                 EmbeddingOptions::default(),
             )
             .await
@@ -892,7 +914,7 @@ mod tests {
         .expect("model");
         let error = model
             .embed(
-                &[EmbeddingInput::text("one".to_owned())],
+                &[vec![Content::Text("one".to_owned())]],
                 EmbeddingOptions::default(),
             )
             .await
@@ -927,7 +949,7 @@ mod tests {
     fn requires_api_key_and_keeps_catalog_endpoint() {
         let error = QwenEmbeddingModel::new(
             config("text", "qwen3.7-text-embedding", 3),
-            CreateEmbeddingModelOptions::default(),
+            ModelConfig::default(),
         )
         .err()
         .expect("missing API key");

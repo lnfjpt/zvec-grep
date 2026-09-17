@@ -1,6 +1,7 @@
 mod content;
 mod entity;
 mod metadata;
+pub(crate) mod model;
 mod source;
 mod workspace;
 
@@ -30,6 +31,6 @@ pub use metadata::{CodeMetadata, EntityMetadata, MarkdownMetadata, SymbolType};
 pub(crate) use entity::{EntityFragment, FragmentId, WindowFragment, validate_fragments};
 
 pub use workspace::FileSelection;
-pub(crate) use workspace::{
-    EmbeddingMetric, EmbeddingSchema, IndexDescriptor, IndexState, Workspace,
-};
+pub(crate) use workspace::{IndexDescriptor, IndexState, Workspace};
+
+pub(crate) use model::{EmbeddingMetric, EmbeddingSchema};

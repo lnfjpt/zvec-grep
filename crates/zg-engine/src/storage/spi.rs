@@ -10,18 +10,11 @@ use async_trait::async_trait;
 use crate::{
     EngineError,
     domain::{Entity, EntityFragment, EntityId, FileId, FileRecord, SourcePath, SymbolType},
-    models::EmbeddingMetric,
 };
 
 pub(crate) type StorageResult<T> = Result<T, EngineError>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WorkspaceIndexEmbeddingSchema {
-    pub provider: String,
-    pub model: String,
-    pub dimension: usize,
-    pub metric: EmbeddingMetric,
-}
+use crate::domain::model::EmbeddingSchema;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WorkspaceIndexStorageOptions {
@@ -30,7 +23,7 @@ pub(crate) enum WorkspaceIndexStorageOptions {
     },
     ReadWrite {
         storage_path: PathBuf,
-        embedding: WorkspaceIndexEmbeddingSchema,
+        embedding: EmbeddingSchema,
     },
 }
 

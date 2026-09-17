@@ -2,7 +2,7 @@
 
 use crate::{
     EngineError,
-    models::Device,
+    domain::model::Device,
     utils::{atomic_write, sync_directory},
 };
 use serde_json::{Value, json};

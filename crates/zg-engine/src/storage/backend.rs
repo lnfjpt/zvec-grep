@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EngineError, EngineResult,
-    domain::{FileId, FileIndexStatus, FileRecord, validate_fragments},
-    models::EmbeddingMetric,
+    domain::{FileId, FileIndexStatus, FileRecord, model::EmbeddingMetric, validate_fragments},
     utils::{atomic_write as write_record, sync_directory},
 };
 
@@ -22,11 +21,11 @@ use super::{
     pending::{self, PendingChange, PendingChanges},
     spi::{
         IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit, StoredSearchData,
-        WorkspaceIndexEmbeddingSchema, WorkspaceIndexStorage, WorkspaceIndexStorageFactory,
-        WorkspaceIndexStorageOptions,
+        WorkspaceIndexStorage, WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
     },
     zvec::NativeStore,
 };
+use crate::domain::model::EmbeddingSchema;
 
 const VERSION: u32 = 10;
 const CHECKPOINT_OPERATIONS: usize = 64;
@@ -46,7 +45,7 @@ impl ZvecStorageFactory {
 struct SharedStore {
     state: Mutex<StoreState>,
     path: PathBuf,
-    schema: WorkspaceIndexEmbeddingSchema,
+    schema: EmbeddingSchema,
     read_only: bool,
     // The native handles must close before the operating-system lock is released.
     _lock: File,
@@ -78,7 +77,7 @@ struct SchemaRecord {
 }
 
 impl SchemaRecord {
-    fn new(schema: &WorkspaceIndexEmbeddingSchema) -> Self {
+    fn new(schema: &EmbeddingSchema) -> Self {
         Self {
             version: VERSION,
             provider: schema.provider.clone(),
@@ -93,7 +92,7 @@ impl SchemaRecord {
         }
     }
 
-    fn schema(self) -> EngineResult<WorkspaceIndexEmbeddingSchema> {
+    fn schema(self) -> EngineResult<EmbeddingSchema> {
         if self.version != VERSION {
             return Err(EngineError::storage_failure(format!(
                 "unsupported storage schema version {}; expected {VERSION}; rebuild the index",
@@ -115,7 +114,7 @@ impl SchemaRecord {
                 ));
             }
         };
-        Ok(WorkspaceIndexEmbeddingSchema {
+        Ok(EmbeddingSchema {
             provider: self.provider,
             model: self.model,
             dimension: self.dimension,
@@ -527,7 +526,7 @@ fn recover_pending(native: &NativeStore, changes: PendingChanges) -> EngineResul
 fn validate_batch(
     file: &FileRecord,
     entries: &[IndexedFragment],
-    schema: &WorkspaceIndexEmbeddingSchema,
+    schema: &EmbeddingSchema,
 ) -> EngineResult<()> {
     file.validate()?;
     validate_fragments(file.id, entries.iter().map(|entry| &entry.fragment))?;
@@ -538,7 +537,7 @@ fn validate_batch(
     Ok(())
 }
 
-fn validate_vector(vector: &[f32], schema: &WorkspaceIndexEmbeddingSchema) -> EngineResult<()> {
+fn validate_vector(vector: &[f32], schema: &EmbeddingSchema) -> EngineResult<()> {
     if vector.len() != schema.dimension || vector.iter().any(|value| !value.is_finite()) {
         return Err(EngineError::invalid_argument(format!(
             "expected a finite {}-dimensional vector, got {} values",
@@ -585,7 +584,7 @@ fn read_schema(path: &Path) -> EngineResult<SchemaRecord> {
 fn load_schema(
     path: &Path,
     options: &WorkspaceIndexStorageOptions,
-) -> EngineResult<WorkspaceIndexEmbeddingSchema> {
+) -> EngineResult<EmbeddingSchema> {
     let descriptor = path.join("schema.json");
     if descriptor.exists() {
         let schema = read_schema(&descriptor)?.schema()?;
@@ -635,7 +634,7 @@ fn prepare_storage(
     home: &Path,
     path: &Path,
     options: &WorkspaceIndexStorageOptions,
-) -> EngineResult<(File, WorkspaceIndexEmbeddingSchema)> {
+) -> EngineResult<(File, EmbeddingSchema)> {
     let read_only = options.is_read_only();
     let mut shared = read_only;
     loop {

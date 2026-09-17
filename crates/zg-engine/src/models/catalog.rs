@@ -1,234 +1,76 @@
-use super::spi::EmbeddingMetric;
+use crate::domain::model::EmbeddingMetric;
 
 const DEFAULT_QWEN_TEXT_EMBEDDING_ENDPOINT: &str =
     "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings";
 const DEFAULT_QWEN3_VL_EMBEDDING_ENDPOINT: &str = "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EmbeddingCatalogEntry {
-    LlamaCpp {
-        reference: &'static str,
-        provider: &'static str,
-        model: &'static str,
-        uri: &'static str,
-        dimension: usize,
-        metric: EmbeddingMetric,
-        format: &'static str,
-        context_size: usize,
-        max_batch_size: usize,
-    },
-    Qwen {
-        kind: &'static str,
-        reference: &'static str,
-        provider: &'static str,
-        model: &'static str,
-        dimension: usize,
-        metric: EmbeddingMetric,
-        default_endpoint: &'static str,
-        max_batch_size: usize,
-        max_input_tokens: usize,
-        max_image_bytes: Option<usize>,
-    },
-    TransformersJs {
-        reference: &'static str,
-        provider: &'static str,
-        model: &'static str,
-        repo: &'static str,
-        revision: &'static str,
-        dtype: &'static str,
-        dimension: usize,
-        metric: EmbeddingMetric,
-        pooling: &'static str,
-        normalize: bool,
-        query_prefix: Option<&'static str>,
-        document_prefix: Option<&'static str>,
-        max_input_tokens: usize,
-        max_batch_size: usize,
-    },
-    Model2Vec {
-        reference: &'static str,
-        provider: &'static str,
-        model: &'static str,
-        repo: &'static str,
-        revision: &'static str,
-        model_file: &'static str,
-        embedding_tensor: &'static str,
-        tokenizer_file: &'static str,
-        dimension: usize,
-        metric: EmbeddingMetric,
-        normalize: bool,
-        max_input_tokens: usize,
-        max_batch_size: usize,
-        default_concurrency: usize,
-    },
+pub(crate) enum EmbeddingCatalogEntry {
+    LlamaCpp(LlamaCppConfig),
+    Qwen(QwenConfig),
+    TransformersJs(TransformersConfig),
+    Model2Vec(Model2VecConfig),
 }
 
 impl EmbeddingCatalogEntry {
-    #[must_use]
-    pub const fn backend(self) -> &'static str {
+    #[cfg(test)]
+    pub(crate) const fn backend(self) -> &'static str {
         match self {
-            Self::LlamaCpp { .. } => "llama-cpp",
-            Self::Qwen { .. } => "qwen",
-            Self::TransformersJs { .. } => "transformers-js",
-            Self::Model2Vec { .. } => "model2vec",
+            Self::LlamaCpp(_) => "llama-cpp",
+            Self::Qwen(_) => "qwen",
+            Self::TransformersJs(_) => "transformers-js",
+            Self::Model2Vec(_) => "model2vec",
         }
     }
 
-    #[must_use]
-    pub const fn reference(self) -> &'static str {
+    pub(crate) const fn reference(self) -> &'static str {
         match self {
-            Self::LlamaCpp { reference, .. }
-            | Self::Qwen { reference, .. }
-            | Self::TransformersJs { reference, .. }
-            | Self::Model2Vec { reference, .. } => reference,
+            Self::LlamaCpp(entry) => entry.reference,
+            Self::Qwen(entry) => entry.reference,
+            Self::TransformersJs(entry) => entry.reference,
+            Self::Model2Vec(entry) => entry.reference,
         }
     }
 
     #[cfg(test)]
-    #[must_use]
-    pub const fn dimension(self) -> usize {
+    pub(crate) const fn dimension(self) -> usize {
         match self {
-            Self::LlamaCpp { dimension, .. }
-            | Self::Qwen { dimension, .. }
-            | Self::TransformersJs { dimension, .. }
-            | Self::Model2Vec { dimension, .. } => dimension,
+            Self::LlamaCpp(entry) => entry.dimension,
+            Self::Qwen(entry) => entry.dimension,
+            Self::TransformersJs(entry) => entry.dimension,
+            Self::Model2Vec(entry) => entry.dimension,
         }
     }
 
-    pub(crate) const fn model2vec_config(self) -> Option<Model2VecConfig> {
-        match self {
-            Self::Model2Vec {
-                reference,
-                provider,
-                model,
-                repo,
-                revision,
-                model_file,
-                embedding_tensor,
-                tokenizer_file,
-                dimension,
-                metric,
-                normalize,
-                max_input_tokens,
-                max_batch_size,
-                default_concurrency,
-            } => Some(Model2VecConfig {
-                reference,
-                provider,
-                model,
-                repo,
-                revision,
-                model_file,
-                embedding_tensor,
-                tokenizer_file,
-                dimension,
-                metric,
-                normalize,
-                max_input_tokens,
-                max_batch_size,
-                default_concurrency,
-                query_prefix: None,
-                document_prefix: None,
-            }),
-            Self::LlamaCpp { .. } | Self::Qwen { .. } | Self::TransformersJs { .. } => None,
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) const fn llama_cpp_config(self) -> Option<LlamaCppConfig> {
-        match self {
-            Self::LlamaCpp {
-                reference,
-                provider,
-                model,
-                uri,
-                dimension,
-                metric,
-                format,
-                context_size,
-                max_batch_size,
-            } => Some(LlamaCppConfig {
-                reference,
-                provider,
-                model,
-                uri,
-                dimension,
-                metric,
-                format,
-                context_size,
-                max_batch_size,
-            }),
-            Self::Qwen { .. } | Self::TransformersJs { .. } | Self::Model2Vec { .. } => None,
+        if let Self::LlamaCpp(entry) = self {
+            Some(entry)
+        } else {
+            None
         }
     }
 
-    pub(crate) const fn qwen_config(self) -> Option<QwenConfig> {
-        match self {
-            Self::Qwen {
-                kind,
-                reference,
-                provider,
-                model,
-                dimension,
-                metric,
-                default_endpoint,
-                max_batch_size,
-                max_input_tokens,
-                max_image_bytes,
-            } => Some(QwenConfig {
-                kind,
-                reference,
-                provider,
-                model,
-                dimension,
-                metric,
-                default_endpoint,
-                max_batch_size,
-                max_input_tokens,
-                max_image_bytes,
-            }),
-            Self::LlamaCpp { .. } | Self::TransformersJs { .. } | Self::Model2Vec { .. } => None,
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) const fn transformers_config(self) -> Option<TransformersConfig> {
-        match self {
-            Self::TransformersJs {
-                reference,
-                provider,
-                model,
-                repo,
-                revision,
-                dtype,
-                dimension,
-                metric,
-                pooling,
-                normalize,
-                query_prefix,
-                document_prefix,
-                max_input_tokens,
-                max_batch_size,
-            } => Some(TransformersConfig {
-                reference,
-                provider,
-                model,
-                repo,
-                revision,
-                dtype,
-                dimension,
-                metric,
-                pooling,
-                normalize,
-                query_prefix,
-                document_prefix,
-                max_input_tokens,
-                max_batch_size,
-            }),
-            Self::LlamaCpp { .. } | Self::Qwen { .. } | Self::Model2Vec { .. } => None,
+        if let Self::TransformersJs(entry) = self {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn model2vec_config(self) -> Option<Model2VecConfig> {
+        if let Self::Model2Vec(entry) = self {
+            Some(entry)
+        } else {
+            None
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LlamaCppConfig {
     pub(crate) reference: &'static str,
     pub(crate) provider: &'static str,
@@ -241,7 +83,7 @@ pub(crate) struct LlamaCppConfig {
     pub(crate) max_batch_size: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct QwenConfig {
     pub(crate) kind: &'static str,
     pub(crate) reference: &'static str,
@@ -255,7 +97,7 @@ pub(crate) struct QwenConfig {
     pub(crate) max_image_bytes: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TransformersConfig {
     pub(crate) reference: &'static str,
     pub(crate) provider: &'static str,
@@ -273,7 +115,7 @@ pub(crate) struct TransformersConfig {
     pub(crate) max_batch_size: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Model2VecConfig {
     pub(crate) reference: &'static str,
     pub(crate) provider: &'static str,
@@ -294,7 +136,7 @@ pub(crate) struct Model2VecConfig {
 }
 
 const CATALOG: [EmbeddingCatalogEntry; 14] = [
-    EmbeddingCatalogEntry::LlamaCpp {
+    EmbeddingCatalogEntry::LlamaCpp(LlamaCppConfig {
         reference: "local/embeddinggemma-300m",
         provider: "local",
         model: "embeddinggemma-300m",
@@ -304,8 +146,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         format: "embeddinggemma",
         context_size: 2_048,
         max_batch_size: 16,
-    },
-    EmbeddingCatalogEntry::LlamaCpp {
+    }),
+    EmbeddingCatalogEntry::LlamaCpp(LlamaCppConfig {
         reference: "local/qwen3-embedding-0.6b",
         provider: "local",
         model: "qwen3-embedding-0.6b",
@@ -315,8 +157,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         format: "qwen3",
         context_size: 8_192,
         max_batch_size: 8,
-    },
-    EmbeddingCatalogEntry::Qwen {
+    }),
+    EmbeddingCatalogEntry::Qwen(QwenConfig {
         kind: "text",
         reference: "qwen/text-embedding-v4",
         provider: "qwen",
@@ -327,8 +169,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         max_batch_size: 10,
         max_input_tokens: 8_192,
         max_image_bytes: None,
-    },
-    EmbeddingCatalogEntry::Qwen {
+    }),
+    EmbeddingCatalogEntry::Qwen(QwenConfig {
         kind: "text",
         reference: "qwen/qwen3.7-text-embedding",
         provider: "qwen",
@@ -339,8 +181,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         max_batch_size: 20,
         max_input_tokens: 128_000,
         max_image_bytes: None,
-    },
-    EmbeddingCatalogEntry::Qwen {
+    }),
+    EmbeddingCatalogEntry::Qwen(QwenConfig {
         kind: "multimodal",
         reference: "qwen/qwen3-vl-embedding",
         provider: "qwen",
@@ -351,8 +193,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         max_batch_size: 20,
         max_input_tokens: 32_000,
         max_image_bytes: Some(10 * 1_024 * 1_024),
-    },
-    EmbeddingCatalogEntry::TransformersJs {
+    }),
+    EmbeddingCatalogEntry::TransformersJs(TransformersConfig {
         reference: "local/bge-small-en-v1.5",
         provider: "local",
         model: "bge-small-en-v1.5",
@@ -367,8 +209,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         document_prefix: None,
         max_input_tokens: 512,
         max_batch_size: 4,
-    },
-    EmbeddingCatalogEntry::TransformersJs {
+    }),
+    EmbeddingCatalogEntry::TransformersJs(TransformersConfig {
         reference: "local/all-minilm-l6-v2",
         provider: "local",
         model: "all-minilm-l6-v2",
@@ -383,8 +225,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         document_prefix: None,
         max_input_tokens: 256,
         max_batch_size: 4,
-    },
-    EmbeddingCatalogEntry::Model2Vec {
+    }),
+    EmbeddingCatalogEntry::Model2Vec(Model2VecConfig {
         reference: "local/potion-retrieval-32m",
         provider: "local",
         model: "potion-retrieval-32m",
@@ -399,8 +241,10 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         max_input_tokens: 1_024,
         max_batch_size: 256,
         default_concurrency: 2,
-    },
-    EmbeddingCatalogEntry::Model2Vec {
+        query_prefix: None,
+        document_prefix: None,
+    }),
+    EmbeddingCatalogEntry::Model2Vec(Model2VecConfig {
         reference: "local/potion-multilingual-128m",
         provider: "local",
         model: "potion-multilingual-128m",
@@ -415,8 +259,10 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         max_input_tokens: 1_024,
         max_batch_size: 256,
         default_concurrency: 2,
-    },
-    EmbeddingCatalogEntry::Model2Vec {
+        query_prefix: None,
+        document_prefix: None,
+    }),
+    EmbeddingCatalogEntry::Model2Vec(Model2VecConfig {
         reference: "local/potion-code-16m-v2",
         provider: "local",
         model: "potion-code-16m-v2",
@@ -431,8 +277,10 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         max_input_tokens: 1_024,
         max_batch_size: 256,
         default_concurrency: 2,
-    },
-    EmbeddingCatalogEntry::TransformersJs {
+        query_prefix: None,
+        document_prefix: None,
+    }),
+    EmbeddingCatalogEntry::TransformersJs(TransformersConfig {
         reference: "local/multilingual-e5-small",
         provider: "local",
         model: "multilingual-e5-small",
@@ -447,8 +295,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         document_prefix: Some("passage: "),
         max_input_tokens: 512,
         max_batch_size: 4,
-    },
-    EmbeddingCatalogEntry::TransformersJs {
+    }),
+    EmbeddingCatalogEntry::TransformersJs(TransformersConfig {
         reference: "local/jina-embeddings-v2-base-code",
         provider: "local",
         model: "jina-embeddings-v2-base-code",
@@ -463,8 +311,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         document_prefix: None,
         max_input_tokens: 8_192,
         max_batch_size: 2,
-    },
-    EmbeddingCatalogEntry::TransformersJs {
+    }),
+    EmbeddingCatalogEntry::TransformersJs(TransformersConfig {
         reference: "local/gte-modernbert-base",
         provider: "local",
         model: "gte-modernbert-base",
@@ -479,8 +327,8 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         document_prefix: None,
         max_input_tokens: 8_192,
         max_batch_size: 2,
-    },
-    EmbeddingCatalogEntry::TransformersJs {
+    }),
+    EmbeddingCatalogEntry::TransformersJs(TransformersConfig {
         reference: "local/nomic-embed-text-v1.5",
         provider: "local",
         model: "nomic-embed-text-v1.5",
@@ -495,7 +343,7 @@ const CATALOG: [EmbeddingCatalogEntry; 14] = [
         document_prefix: Some("search_document: "),
         max_input_tokens: 8_192,
         max_batch_size: 2,
-    },
+    }),
 ];
 
 #[cfg(test)]

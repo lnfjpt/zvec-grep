@@ -17,16 +17,17 @@ use super::{
     path::{decode_path, encode_path, path_key, query_path},
     spi::{
         IndexedFragment, StoragePathFilter, StorageSearchFilter, StorageSearchHit,
-        StorageSearchPath, StoredEntity, StoredSearchData, WorkspaceIndexEmbeddingSchema,
+        StorageSearchPath, StoredEntity, StoredSearchData,
     },
 };
+use crate::domain::model::EmbeddingSchema;
 use crate::{
     EngineError, EngineResult,
     domain::{
         CodeMetadata, Content, DirectoryId, EntityContent, EntityFragment, EntityId,
-        EntityMetadata, FileId, FileRecord, IndexField, SourcePath, validate_fragments,
+        EntityMetadata, FileId, FileRecord, IndexField, SourcePath, model::EmbeddingMetric,
+        validate_fragments,
     },
-    models::EmbeddingMetric,
     utils::sha256_hex_parts,
 };
 
@@ -63,7 +64,7 @@ impl EncodedMetadata {
 impl NativeStore {
     pub(super) fn open(
         path: &Path,
-        embedding: &WorkspaceIndexEmbeddingSchema,
+        embedding: &EmbeddingSchema,
         read_only: bool,
     ) -> EngineResult<Self> {
         let dimension = u32::try_from(embedding.dimension)
@@ -492,7 +493,7 @@ impl NativeStore {
     }
 }
 
-pub(super) fn vector_collection_name(embedding: &WorkspaceIndexEmbeddingSchema) -> String {
+pub(super) fn vector_collection_name(embedding: &EmbeddingSchema) -> String {
     format!(
         "vectors_{}",
         primary_key(

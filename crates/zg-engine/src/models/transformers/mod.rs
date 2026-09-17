@@ -1,3 +1,4 @@
+use crate::domain::Content;
 use std::{
     collections::{HashMap, VecDeque},
     env,
@@ -28,16 +29,17 @@ use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Device,
     artifacts::publish_downloaded_file,
     catalog::TransformersConfig,
     compute::ModelComputeRuntime,
     download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
     spi::{
-        CreateEmbeddingModelOptions, EmbeddingInput, EmbeddingInputKind, EmbeddingModel,
-        EmbeddingModelInfo, EmbeddingModelLimits, EmbeddingModelProgress, EmbeddingOptions,
-        EmbeddingPurpose, EmbeddingResult, ModelError, validate_inputs, validate_result,
+        EmbeddingModel, EmbeddingOptions, ModelError, input_text, validate_inputs, validate_result,
     },
+};
+use crate::domain::model::{
+    Device, EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult, ModelConfig, ModelInfo,
+    ModelProgress,
 };
 
 static PARTIAL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -118,31 +120,32 @@ struct PreparedBatch {
 }
 
 impl TransformersEmbeddingModel {
-    pub(crate) fn new(entry: TransformersConfig, options: CreateEmbeddingModelOptions) -> Self {
+    pub(crate) fn new(
+        entry: TransformersConfig,
+        options: ModelConfig,
+        compute_runtime: ModelComputeRuntime,
+    ) -> Self {
         let model_cache_dir = options
-            .model_cache_dir
+            .cache_dir
             .or_else(|| env::var_os("ZVEC_GREP_MODEL_CACHE").map(PathBuf::from))
             .unwrap_or_else(default_model_cache_dir);
         Self {
             entry,
             info: EmbeddingModelInfo {
-                reference: entry.reference.to_owned(),
-                provider: entry.provider.to_owned(),
-                name: entry.model.to_owned(),
+                model: ModelInfo {
+                    provider: entry.provider.to_owned(),
+                    name: entry.model.to_owned(),
+                    endpoint: None,
+                },
                 dimension: entry.dimension,
                 metric: entry.metric,
-                endpoint: None,
-                default_concurrency: None,
-                input_kinds: vec![EmbeddingInputKind::Text],
-                limits: EmbeddingModelLimits {
-                    max_batch_size: entry.max_batch_size,
-                    max_input_tokens: Some(entry.max_input_tokens),
-                    max_image_bytes: None,
-                },
+                max_batch_size: entry.max_batch_size,
+                max_input_tokens: Some(entry.max_input_tokens),
+                max_image_bytes: None,
             },
             model_cache_dir,
             device: options.device,
-            compute_runtime: options.compute_runtime.unwrap_or_default(),
+            compute_runtime,
             client: reqwest::Client::new(),
             state: Mutex::new(None),
         }
@@ -150,7 +153,7 @@ impl TransformersEmbeddingModel {
 
     async fn ensure_loaded(
         &self,
-        on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+        on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     ) -> Result<Arc<LoadedTransformersModel>, ModelError> {
         let mut state = self.state.lock().await;
         if let Some(loaded) = &*state {
@@ -163,7 +166,7 @@ impl TransformersEmbeddingModel {
 
     async fn load(
         &self,
-        on_progress: Option<Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+        on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     ) -> Result<LoadedTransformersModel, ModelError> {
         let model_artifact = onnx_artifact(self.entry.dtype)?;
         let external_artifact = format!("{model_artifact}_data");
@@ -375,10 +378,12 @@ impl EmbeddingModel for TransformersEmbeddingModel {
 
     async fn embed(
         &self,
-        inputs: &[EmbeddingInput],
+        inputs: &[Vec<Content>],
         options: EmbeddingOptions,
     ) -> Result<EmbeddingResult, ModelError> {
-        validate_inputs(&self.info, inputs)?;
+        validate_inputs(&self.info, inputs, |content| {
+            matches!(content, Content::Text(_))
+        })?;
         let loaded = self
             .ensure_loaded(options.on_progress.clone())
             .await
@@ -393,7 +398,7 @@ impl EmbeddingModel for TransformersEmbeddingModel {
                 )
                 .with_cause(error)
             })?;
-        let purpose = options.purpose.unwrap_or_default();
+        let purpose = options.purpose;
         let prefix = match purpose {
             EmbeddingPurpose::Document => self.entry.document_prefix,
             EmbeddingPurpose::Query => self.entry.query_prefix,
@@ -401,7 +406,7 @@ impl EmbeddingModel for TransformersEmbeddingModel {
         let texts = inputs
             .iter()
             .map(|input| {
-                let text = input.to_text()?;
+                let text = input_text(input)?;
                 Ok(match prefix {
                     Some(prefix) => format!("{prefix}{text}"),
                     None => text.into_owned(),
@@ -883,7 +888,7 @@ fn embed_batch(
     entry: TransformersConfig,
     execution_concurrency: usize,
     signal: Option<&CancellationToken>,
-    on_progress: Option<&Arc<dyn Fn(EmbeddingModelProgress) + Send + Sync>>,
+    on_progress: Option<&Arc<dyn Fn(ModelProgress) + Send + Sync>>,
 ) -> Result<EmbeddingResult, ModelError> {
     check_cancelled(signal)?;
     let prepared = prepare_batch(tokenizer, texts, entry)?;
@@ -907,7 +912,7 @@ fn embed_batch(
                 error
             );
             if let Some(on_progress) = on_progress {
-                on_progress(EmbeddingModelProgress::Warning {
+                on_progress(ModelProgress::Warning {
                     model: entry.reference.to_owned(),
                     message: warning,
                 });
@@ -1497,7 +1502,7 @@ mod tests {
         assert_eq!(merged.attention_mask, [1, 1, 0, 1, 1, 1, 1, 1, 0]);
         assert_eq!(merged.truncated, [0, 2]);
     }
-    use crate::models::spi::EmbeddingMetric;
+    use crate::domain::model::EmbeddingMetric;
 
     fn entry(pooling: &'static str, normalize: bool) -> TransformersConfig {
         TransformersConfig {
@@ -1553,10 +1558,10 @@ mod tests {
     fn prefixes_and_catalog_info_match_main() {
         let model = TransformersEmbeddingModel::new(
             entry("mean", true),
-            CreateEmbeddingModelOptions::default(),
+            ModelConfig::default(),
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
-        assert_eq!(model.info().limits.max_input_tokens, Some(2));
-        assert_eq!(model.info().input_kinds, [EmbeddingInputKind::Text]);
+        assert_eq!(model.info().max_input_tokens, Some(2));
         assert_eq!(onnx_artifact("q4").expect("q4"), "onnx/model_q4.onnx");
         assert_eq!(
             onnx_artifact("q8").expect("q8"),
@@ -1577,11 +1582,12 @@ mod tests {
                 .expect("catalog entry");
         let model = TransformersEmbeddingModel::new(
             entry,
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(cache),
+            ModelConfig {
+                cache_dir: Some(cache),
                 device: Some(Device::Cpu),
-                ..CreateEmbeddingModelOptions::default()
+                ..ModelConfig::default()
             },
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
         let loaded = model
             .ensure_loaded(None)
@@ -1612,8 +1618,8 @@ mod tests {
         let result = model
             .embed(
                 &[
-                    EmbeddingInput::text("find authentication middleware".to_owned()),
-                    EmbeddingInput::text("parse a configuration file".to_owned()),
+                    vec![Content::Text("find authentication middleware".to_owned())],
+                    vec![Content::Text("parse a configuration file".to_owned())],
                 ],
                 EmbeddingOptions::default(),
             )
@@ -1706,18 +1712,19 @@ mod tests {
         let captured = Arc::clone(&warnings);
         let model = TransformersEmbeddingModel::new(
             entry,
-            CreateEmbeddingModelOptions {
-                model_cache_dir: Some(cache),
+            ModelConfig {
+                cache_dir: Some(cache),
                 device: Some(Device::Metal),
-                ..CreateEmbeddingModelOptions::default()
+                ..ModelConfig::default()
             },
+            crate::models::compute::ModelComputeRuntime::shared(),
         );
         let result = model
             .embed(
-                &[EmbeddingInput::text("find relevant code".to_owned())],
+                &[vec![Content::Text("find relevant code".to_owned())]],
                 EmbeddingOptions {
                     on_progress: Some(Arc::new(move |progress| {
-                        if let EmbeddingModelProgress::Warning { message, .. } = progress {
+                        if let ModelProgress::Warning { message, .. } = progress {
                             lock_std_mutex(&captured).push(message);
                         }
                     })),

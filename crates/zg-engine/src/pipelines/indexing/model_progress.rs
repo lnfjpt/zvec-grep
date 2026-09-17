@@ -5,7 +5,8 @@ use crate::{
         IndexEmbeddingProgress, IndexEmbeddingStage, IndexProgress, IndexProgressPhase,
         IndexProgressReporter,
     },
-    models::{EmbeddingModelProgress, ModelProgressReporter},
+    domain::model::ModelProgress,
+    models::ModelProgressReporter,
 };
 
 pub(super) fn for_index(reporter: IndexProgressReporter) -> ModelProgressReporter {
@@ -14,12 +15,12 @@ pub(super) fn for_index(reporter: IndexProgressReporter) -> ModelProgressReporte
     })
 }
 
-fn index_progress(progress: EmbeddingModelProgress, concurrency: usize) -> IndexProgress {
+fn index_progress(progress: ModelProgress, concurrency: usize) -> IndexProgress {
     let (stage, model, downloaded_bytes, total_bytes, message) = match progress {
-        EmbeddingModelProgress::Preparing { model } => {
+        ModelProgress::Preparing { model } => {
             (IndexEmbeddingStage::Preparing, model, None, None, None)
         }
-        EmbeddingModelProgress::Downloading {
+        ModelProgress::Downloading {
             model,
             downloaded_bytes,
             total_bytes,
@@ -30,16 +31,14 @@ fn index_progress(progress: EmbeddingModelProgress, concurrency: usize) -> Index
             total_bytes,
             None,
         ),
-        EmbeddingModelProgress::Warning { model, message } => (
+        ModelProgress::Warning { model, message } => (
             IndexEmbeddingStage::Warning,
             model,
             None,
             None,
             Some(message),
         ),
-        EmbeddingModelProgress::Ready { model } => {
-            (IndexEmbeddingStage::Ready, model, None, None, None)
-        }
+        ModelProgress::Ready { model } => (IndexEmbeddingStage::Ready, model, None, None, None),
     };
     IndexProgress {
         phase: IndexProgressPhase::Indexing,
@@ -68,19 +67,19 @@ mod tests {
     fn preserves_model_lifecycle_details_and_effective_concurrency() {
         let model = "local/fixture";
         let events = [
-            EmbeddingModelProgress::Preparing {
+            ModelProgress::Preparing {
                 model: model.into(),
             },
-            EmbeddingModelProgress::Downloading {
+            ModelProgress::Downloading {
                 model: model.into(),
                 downloaded_bytes: Some(4),
                 total_bytes: Some(8),
             },
-            EmbeddingModelProgress::Warning {
+            ModelProgress::Warning {
                 model: model.into(),
                 message: "fixture warning".into(),
             },
-            EmbeddingModelProgress::Ready {
+            ModelProgress::Ready {
                 model: model.into(),
             },
         ]

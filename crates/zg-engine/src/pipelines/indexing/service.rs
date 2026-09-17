@@ -13,22 +13,23 @@ use crate::{
         context::{ContextOptions, ContextResult},
         index::{
             IndexOptions, IndexResult,
-            options::{Device, DiscoveryOptions, EmbeddingModelSpec},
+            options::{DiscoveryOptions, EmbeddingModelSpec},
         },
         info::{
             InfoOptions, InfoResult,
             result::{InfoSource, WorkspaceIndexInfo, WorkspaceIndexPolicy},
         },
     },
-    domain::{EmbeddingSchema, IndexDescriptor, IndexState, Workspace},
+    domain::{
+        IndexDescriptor, IndexState, Workspace,
+        model::{Device, ModelConfig},
+    },
     models::{
-        CreateEmbeddingModelOptions, ModelError, ModelRuntimeLease, ModelRuntimeManager,
-        ModelRuntimeRequest, ResolveEmbeddingReferenceOptions, resolve_embedding_reference,
+        ModelError, ModelRuntimeLease, ModelRuntimeManager, ModelRuntimeRequest,
+        ResolveEmbeddingReferenceOptions, resolve_embedding_reference,
     },
     pipelines::search::context::{NormalizedContextRequest, context_from_index},
-    storage::spi::{
-        WorkspaceIndexEmbeddingSchema, WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
-    },
+    storage::spi::{WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions},
     workspace::{
         CURRENT_INDEX_VERSION,
         build::{
@@ -40,10 +41,7 @@ use crate::{
             workspace_index_location,
         },
         lock::{LockMode, acquire_home_lock},
-        manifest::{
-            EmbeddingRuntimeConfig, WorkspaceManifest, read_workspace_manifest,
-            write_workspace_manifest,
-        },
+        manifest::{WorkspaceManifest, read_workspace_manifest, write_workspace_manifest},
         registry::WorkspaceRegistry,
     },
 };
@@ -247,7 +245,7 @@ impl WorkspaceIndexService {
             .storage_factory
             .open(WorkspaceIndexStorageOptions::ReadWrite {
                 storage_path: manifest.storage_home(),
-                embedding: storage_embedding_schema(&model),
+                embedding: model.info().schema(),
             })?;
         let result = index_workspace(&IndexingContext {
             workspace_index: &manifest.workspace,
@@ -559,7 +557,7 @@ fn index_manifest(
         root: location.root.clone(),
         file_selection: resolve_discovery(settings, options),
         index: IndexState::Enabled(IndexDescriptor {
-            embedding: embedding_schema(model),
+            embedding: model.info().schema(),
             revision: active.and_then(WorkspaceManifest::revision).unwrap_or(0),
         }),
         created_epoch_ms: identity.map_or(now, |value| value.workspace.created_epoch_ms),
@@ -698,10 +696,10 @@ fn acquire_model(
     models
         .acquire(ModelRuntimeRequest::new(
             reference.clone(),
-            CreateEmbeddingModelOptions {
+            ModelConfig {
                 api_key,
                 endpoint,
-                model_cache_dir: crate::config::model_cache(
+                cache_dir: crate::config::model_cache(
                     &config,
                     options
                         .model_cache
@@ -710,7 +708,6 @@ fn acquire_model(
                     existing_runtime.and_then(|runtime| runtime.cache_dir.clone()),
                 ),
                 device,
-                ..CreateEmbeddingModelOptions::default()
             },
             options.embedding_concurrency,
         ))
@@ -760,7 +757,7 @@ fn acquire_search_model(
     models
         .acquire(ModelRuntimeRequest::new(
             reference.clone(),
-            CreateEmbeddingModelOptions {
+            ModelConfig {
                 api_key: (!local)
                     .then(|| {
                         options
@@ -787,12 +784,11 @@ fn acquire_search_model(
                 } else {
                     None
                 },
-                model_cache_dir: crate::config::model_cache(
+                cache_dir: crate::config::model_cache(
                     &config,
                     options.model_cache.clone(),
                     manifest.embedding_runtime.cache_dir.clone(),
                 ),
-                ..CreateEmbeddingModelOptions::default()
             },
             embedding_concurrency,
         ))
@@ -837,7 +833,7 @@ fn assert_embedding_compatible(
     let Some(schema) = existing.embedding() else {
         return Ok(());
     };
-    schema.ensure_compatible(&embedding_schema(model))
+    schema.ensure_compatible(&model.info().schema())
 }
 
 pub(crate) fn resolve_discovery(
@@ -896,14 +892,18 @@ fn embedding_runtime(
     existing: Option<&WorkspaceManifest>,
     options: &IndexOptions,
     model: &ModelRuntimeLease,
-) -> Result<EmbeddingRuntimeConfig, EngineError> {
+) -> Result<ModelConfig, EngineError> {
     let current = existing
         .map(|manifest| manifest.embedding_runtime.clone())
         .unwrap_or_default();
     let config = crate::config::read()?;
-    if model.info().provider == "local" {
-        let reference = format!("{}/{}", model.info().provider, model.info().name);
-        Ok(EmbeddingRuntimeConfig {
+    if model.info().model.provider == "local" {
+        let reference = format!(
+            "{}/{}",
+            model.info().model.provider,
+            model.info().model.name
+        );
+        Ok(ModelConfig {
             cache_dir: crate::config::model_cache(
                 &config,
                 options
@@ -924,35 +924,15 @@ fn embedding_runtime(
                 }),
                 current.device,
             )?,
-            ..EmbeddingRuntimeConfig::default()
+            ..ModelConfig::default()
         })
     } else {
-        Ok(EmbeddingRuntimeConfig {
+        Ok(ModelConfig {
             api_key: current.api_key,
-            endpoint: model.info().endpoint.clone().or(current.endpoint),
+            endpoint: model.info().model.endpoint.clone().or(current.endpoint),
             device: None,
             cache_dir: None,
         })
-    }
-}
-
-fn embedding_schema(model: &ModelRuntimeLease) -> EmbeddingSchema {
-    let info = model.info();
-    EmbeddingSchema {
-        provider: info.provider.clone(),
-        model: info.name.clone(),
-        dimension: info.dimension,
-        metric: info.metric,
-    }
-}
-
-fn storage_embedding_schema(model: &ModelRuntimeLease) -> WorkspaceIndexEmbeddingSchema {
-    let info = model.info();
-    WorkspaceIndexEmbeddingSchema {
-        provider: info.provider.clone(),
-        model: info.name.clone(),
-        dimension: info.dimension,
-        metric: info.metric,
     }
 }
 
@@ -1093,11 +1073,11 @@ mod tests {
         api::{
             index::{
                 IndexOptions,
-                options::{Device, DiscoveryOptions, EmbeddingModelSpec},
+                options::{DiscoveryOptions, EmbeddingModelSpec},
             },
             info::InfoOptions,
         },
-        domain::{FileRecord, FileSelection, IndexState, Workspace},
+        domain::{FileRecord, FileSelection, IndexState, Workspace, model::Device},
         storage::spi::{
             IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit,
             WorkspaceIndexStorage, WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
@@ -1275,7 +1255,7 @@ mod tests {
             },
             directory.path().join(".zvec-grep"),
             None,
-            crate::workspace::manifest::EmbeddingRuntimeConfig::default(),
+            crate::domain::model::ModelConfig::default(),
         )
         .expect("manifest");
         let mut options = IndexOptions {

@@ -1,9 +1,12 @@
+#[cfg(test)]
+use crate::domain::model::Device;
+use crate::domain::model::ModelConfig;
 use crate::{
     EngineError,
     domain::{
-        EmbeddingMetric, EmbeddingSchema, FileSelection, IndexDescriptor, IndexState, Workspace,
+        FileSelection, IndexDescriptor, IndexState, Workspace,
+        model::{EmbeddingMetric, EmbeddingSchema},
     },
-    models::Device,
     utils::{atomic_write, sync_directory},
 };
 use serde::{Deserialize, Serialize};
@@ -14,19 +17,6 @@ use std::{
 
 pub(crate) const WORKSPACE_MANIFEST_FILE: &str = "manifest.json";
 pub(crate) const CURRENT_MANIFEST_VERSION: u32 = 4;
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct EmbeddingRuntimeConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device: Option<Device>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_dir: Option<PathBuf>,
-}
 
 /// Disk metadata owns layout/versioning; domain workspace owns its logical state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -39,7 +29,7 @@ pub(crate) struct WorkspaceManifest {
     pub path: PathBuf,
     pub index_version: Option<u32>,
     pub storage_generation: Option<String>,
-    pub embedding_runtime: EmbeddingRuntimeConfig,
+    pub embedding_runtime: ModelConfig,
 }
 
 // Retain the existing flat disk representation, while retiring its UUID identity.
@@ -74,7 +64,7 @@ struct ManifestData {
     generation: Option<u64>,
     created_time: u64,
     updated_time: u64,
-    embedding_runtime: EmbeddingRuntimeConfig,
+    embedding_runtime: ModelConfig,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -223,7 +213,7 @@ impl WorkspaceManifest {
         workspace: Workspace,
         home: PathBuf,
         index_version: Option<u32>,
-        embedding_runtime: EmbeddingRuntimeConfig,
+        embedding_runtime: ModelConfig,
     ) -> Result<Self, EngineError> {
         let manifest = Self {
             manifest_version: CURRENT_MANIFEST_VERSION,
@@ -483,10 +473,10 @@ mod tests {
             },
             home.to_path_buf(),
             Some(1),
-            EmbeddingRuntimeConfig {
+            ModelConfig {
                 device: Some(Device::Cpu),
                 cache_dir: Some(home.join("models")),
-                ..EmbeddingRuntimeConfig::default()
+                ..ModelConfig::default()
             },
         )
         .expect("fixture manifest")

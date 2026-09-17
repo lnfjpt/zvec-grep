@@ -755,9 +755,10 @@ mod tests {
     fn resolves_context_paths_and_freshness_after_workspace_relocation() {
         use crate::{
             domain::{
-                Content, EmbeddingMetric, EmbeddingSchema, Entity, EntityContent, EntityId,
-                FileFormat, FileId, FileIndexStatus, FileRecord, FileSelection, FileSnapshot,
-                IndexDescriptor, IndexState, SourceRange, TextRange, Workspace,
+                Content, Entity, EntityContent, EntityId, FileFormat, FileId, FileIndexStatus,
+                FileRecord, FileSelection, FileSnapshot, IndexDescriptor, IndexState, SourceRange,
+                TextRange, Workspace,
+                model::{EmbeddingMetric, EmbeddingSchema},
             },
             pipelines::search::pipeline::{SearchHit, SearchPlanResult},
             utils::sha256_hex,

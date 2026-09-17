@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
 use super::{
-    catalog::get_embedding_model_catalog_entry,
+    catalog::{EmbeddingCatalogEntry, get_embedding_model_catalog_entry},
+    compute::ModelComputeRuntime,
     llama_cpp::LlamaCppEmbeddingModel,
     model2vec::Model2VecEmbeddingModel,
     qwen::QwenEmbeddingModel,
-    spi::{CreateEmbeddingModelOptions, EmbeddingModel, ModelError},
+    spi::{EmbeddingModel, ModelError},
     transformers::TransformersEmbeddingModel,
 };
+use crate::domain::model::ModelConfig;
 
 /// Creates a catalog-backed embedding model.
 ///
@@ -19,7 +21,8 @@ use super::{
 /// Returns an error for unknown references or invalid backend options.
 pub fn create_embedding_model(
     reference: &str,
-    options: Option<CreateEmbeddingModelOptions>,
+    options: Option<ModelConfig>,
+    compute_runtime: ModelComputeRuntime,
 ) -> Result<Arc<dyn EmbeddingModel>, ModelError> {
     let entry = get_embedding_model_catalog_entry(reference).ok_or_else(|| {
         ModelError::new(
@@ -29,23 +32,24 @@ pub fn create_embedding_model(
         )
     })?;
     let options = options.unwrap_or_default();
-    if let Some(config) = entry.model2vec_config() {
-        return Ok(Arc::new(Model2VecEmbeddingModel::new(config, options)));
+    match entry {
+        EmbeddingCatalogEntry::Model2Vec(config) => Ok(Arc::new(Model2VecEmbeddingModel::new(
+            config,
+            options,
+            compute_runtime,
+        ))),
+        EmbeddingCatalogEntry::Qwen(config) => {
+            Ok(Arc::new(QwenEmbeddingModel::new(config, options)?))
+        }
+        EmbeddingCatalogEntry::TransformersJs(config) => Ok(Arc::new(
+            TransformersEmbeddingModel::new(config, options, compute_runtime),
+        )),
+        EmbeddingCatalogEntry::LlamaCpp(config) => Ok(Arc::new(LlamaCppEmbeddingModel::new(
+            config,
+            options,
+            compute_runtime,
+        ))),
     }
-    if let Some(config) = entry.qwen_config() {
-        return Ok(Arc::new(QwenEmbeddingModel::new(config, options)?));
-    }
-    if let Some(config) = entry.transformers_config() {
-        return Ok(Arc::new(TransformersEmbeddingModel::new(config, options)));
-    }
-    if let Some(config) = entry.llama_cpp_config() {
-        return Ok(Arc::new(LlamaCppEmbeddingModel::new(config, options)));
-    }
-    Err(ModelError::new(
-        crate::EngineError::UNSUPPORTED,
-        "Embedding catalog entry is not implemented",
-        Some(format!("backend={} reference={reference}", entry.backend())),
-    ))
 }
 
 #[cfg(test)]
@@ -54,31 +58,51 @@ mod tests {
 
     #[test]
     fn factory_exposes_implemented_backends() {
-        let model = create_embedding_model("local/potion-code-16m-v2", None)
-            .expect("Model2Vec backend should be implemented");
-        assert_eq!(model.info().reference, "local/potion-code-16m-v2");
+        let model = create_embedding_model(
+            "local/potion-code-16m-v2",
+            None,
+            crate::models::compute::ModelComputeRuntime::shared(),
+        )
+        .expect("Model2Vec backend should be implemented");
+        assert_eq!(model.info().model.reference(), "local/potion-code-16m-v2");
 
         let qwen = create_embedding_model(
             "qwen/text-embedding-v4",
-            Some(super::CreateEmbeddingModelOptions {
+            Some(super::ModelConfig {
                 api_key: Some("test".to_owned()),
-                ..super::CreateEmbeddingModelOptions::default()
+                ..super::ModelConfig::default()
             }),
+            crate::models::compute::ModelComputeRuntime::shared(),
         )
         .expect("Qwen backend should be implemented");
-        assert_eq!(qwen.info().reference, "qwen/text-embedding-v4");
+        assert_eq!(qwen.info().model.reference(), "qwen/text-embedding-v4");
 
-        let llama = create_embedding_model("local/embeddinggemma-300m", None)
-            .expect("llama.cpp backend should be implemented");
-        assert_eq!(llama.info().reference, "local/embeddinggemma-300m");
+        let llama = create_embedding_model(
+            "local/embeddinggemma-300m",
+            None,
+            crate::models::compute::ModelComputeRuntime::shared(),
+        )
+        .expect("llama.cpp backend should be implemented");
+        assert_eq!(llama.info().model.reference(), "local/embeddinggemma-300m");
 
-        let transformers = create_embedding_model("local/all-minilm-l6-v2", None)
-            .expect("Transformers backend should be implemented");
-        assert_eq!(transformers.info().reference, "local/all-minilm-l6-v2");
+        let transformers = create_embedding_model(
+            "local/all-minilm-l6-v2",
+            None,
+            crate::models::compute::ModelComputeRuntime::shared(),
+        )
+        .expect("Transformers backend should be implemented");
+        assert_eq!(
+            transformers.info().model.reference(),
+            "local/all-minilm-l6-v2"
+        );
 
-        let unknown = create_embedding_model("missing", None)
-            .err()
-            .expect("unknown model should fail catalog lookup");
+        let unknown = create_embedding_model(
+            "missing",
+            None,
+            crate::models::compute::ModelComputeRuntime::shared(),
+        )
+        .err()
+        .expect("unknown model should fail catalog lookup");
         assert_eq!(unknown.code(), crate::EngineError::NOT_FOUND);
     }
 }

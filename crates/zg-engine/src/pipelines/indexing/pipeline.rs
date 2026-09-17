@@ -30,18 +30,17 @@ use crate::{
         info::result::IndexStats,
     },
     domain::{
-        Entity, EntityFragment, EntityId, FileCategory, FileFormat, FileId, FileIndexStatus,
-        FileRecord, FileSnapshot, FragmentId, ImageContent, IndexState, SourcePath, WindowFragment,
-        Workspace, validate_fragments,
+        Content, Entity, EntityFragment, EntityId, FileCategory, FileFormat, FileId,
+        FileIndexStatus, FileRecord, FileSnapshot, FragmentId, ImageContent, IndexState,
+        SourcePath, WindowFragment, Workspace,
+        model::{EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult},
+        validate_fragments,
     },
     extraction::{
         ExtractedFragment, ImageSource, IndexingExtractionFragment, SourceKind, TextSource,
         extract_for_indexing, source_kind, vector_content_for_fragment,
     },
-    models::{
-        EmbeddingInput, EmbeddingInputKind, EmbeddingModelInfo, EmbeddingOptions, EmbeddingPurpose,
-        EmbeddingResult, ModelError, ModelRuntimeLease,
-    },
+    models::{EmbeddingConcurrencyDefaults, EmbeddingOptions, ModelError, ModelRuntimeLease},
     storage::spi::{IndexedFragment, WorkspaceIndexStorage},
     utils::{collapse_whitespace, decode_text, sha256_hex},
 };
@@ -63,9 +62,11 @@ const EMBEDDING_SUCCESS_STREAK_MIN: usize = 4;
 pub(crate) trait IndexEmbeddingRuntime: Send + Sync {
     fn info(&self) -> &EmbeddingModelInfo;
 
+    fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults;
+
     async fn embed(
         &self,
-        contents: &[EmbeddingInput],
+        contents: &[Vec<Content>],
         options: EmbeddingOptions,
         progress: Option<IndexProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError>;
@@ -77,9 +78,13 @@ impl IndexEmbeddingRuntime for ModelRuntimeLease {
         self.info()
     }
 
+    fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
+        self.concurrency_defaults()
+    }
+
     async fn embed(
         &self,
-        contents: &[EmbeddingInput],
+        contents: &[Vec<Content>],
         options: EmbeddingOptions,
         progress: Option<IndexProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError> {
@@ -539,7 +544,7 @@ async fn resolve_status_modifications(
 
 struct PreparedFragment {
     fragment: EntityFragment,
-    embedding_content: EmbeddingInput,
+    embedding_content: Vec<Content>,
 }
 
 struct PreparedFile {
@@ -568,10 +573,10 @@ async fn index_candidates(
 ) -> Result<IndexWriteStats, EngineError> {
     let policy = resolve_embedding_policy(
         context.embedding_concurrency,
-        context.embedding_model.info(),
+        context.embedding_model.concurrency_defaults(),
     )?;
     let scheduler = Arc::new(EmbeddingScheduler::new(policy));
-    let max_batch_size = context.embedding_model.info().limits.max_batch_size;
+    let max_batch_size = context.embedding_model.info().max_batch_size;
     let mut stats = IndexWriteStats::default();
     let mut current_batch = Vec::new();
     let mut current_fragments = 0;
@@ -884,7 +889,7 @@ async fn prepare_candidate(
         None
     };
     let chunk_options = index_chunk_options(
-        context.embedding_model.info().limits.max_input_tokens,
+        context.embedding_model.info().max_input_tokens,
         source_text.as_deref(),
     );
     let extracted = if let Some(format) = image_format {
@@ -922,12 +927,12 @@ fn prepare_fragments(
                 .fragment
                 .as_entity()
                 .expect("extracted fragment belongs to an entity");
-            EmbeddingInput::new(vector_content_for_fragment(
+            vector_content_for_fragment(
                 &item.fragment,
                 owner.metadata.as_ref(),
                 item.embedding_source.as_deref(),
                 max_chars,
-            ))
+            )
         })
         .collect::<Vec<_>>();
     extracted
@@ -1025,7 +1030,7 @@ async fn embed_prepared_files(
     progress: Option<IndexProgressReporter>,
 ) -> EmbeddingBatchOutcome {
     let started = Instant::now();
-    if files.len() == 1 && files[0].fragments.len() > model.info().limits.max_batch_size {
+    if files.len() == 1 && files[0].fragments.len() > model.info().max_batch_size {
         let file = files.into_iter().next().expect("one prepared file");
         let outcome = match embed_file(&file, model, &scheduler, signal.as_ref(), progress).await {
             Ok(embedding) => EmbeddedFileOutcome::Success {
@@ -1135,7 +1140,7 @@ async fn embed_file(
     signal: Option<&CancellationToken>,
     progress: Option<IndexProgressReporter>,
 ) -> Result<EmbeddingResult, ModelError> {
-    let maximum = model.info().limits.max_batch_size;
+    let maximum = model.info().max_batch_size;
     let mut running = FuturesUnordered::new();
     for (batch_index, fragments) in file.fragments.chunks(maximum).enumerate() {
         running.push(embed_fragment_batch(
@@ -1229,7 +1234,7 @@ async fn embed_fragment_batch(
 
 async fn embed_with_retry(
     model: &dyn IndexEmbeddingRuntime,
-    contents: &[EmbeddingInput],
+    contents: &[Vec<Content>],
     scheduler: &EmbeddingScheduler,
     signal: Option<&CancellationToken>,
     progress: Option<IndexProgressReporter>,
@@ -1244,7 +1249,7 @@ async fn embed_with_retry(
             .embed(
                 contents,
                 EmbeddingOptions {
-                    purpose: Some(EmbeddingPurpose::Document),
+                    purpose: EmbeddingPurpose::Document,
                     signal: signal.cloned(),
                     ..EmbeddingOptions::default()
                 },
@@ -1400,7 +1405,7 @@ struct EmbeddingConcurrencyPolicy {
 
 fn resolve_embedding_policy(
     requested: Option<usize>,
-    model: &EmbeddingModelInfo,
+    defaults: EmbeddingConcurrencyDefaults,
 ) -> Result<EmbeddingConcurrencyPolicy, EngineError> {
     if requested == Some(0) {
         return Err(EngineError::invalid_argument(
@@ -1416,23 +1421,12 @@ fn resolve_embedding_policy(
         });
     }
 
-    let remote = model.provider == "qwen";
-    let multimodal = model.input_kinds.contains(&EmbeddingInputKind::Image);
-    let local_default = model.default_concurrency.unwrap_or(1).max(1);
-    let initial = if remote {
-        if multimodal { 4 } else { 8 }
-    } else {
-        local_default
-    };
-    let maximum = if remote {
-        if multimodal { 8 } else { 12 }
-    } else {
-        local_default
-    };
+    let initial = defaults.initial.max(1);
+    let maximum = defaults.maximum.max(initial);
     Ok(EmbeddingConcurrencyPolicy {
         initial,
         minimum: initial.min(4),
-        maximum: maximum.max(initial),
+        maximum,
         adaptive: maximum > 1,
     })
 }
@@ -1652,7 +1646,7 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
             "indexing requires an enabled workspace",
         ));
     }
-    if context.embedding_model.info().limits.max_batch_size == 0 {
+    if context.embedding_model.info().max_batch_size == 0 {
         return Err(EngineError::internal(
             "embedding model max_batch_size must be greater than zero",
         ));
@@ -1660,20 +1654,20 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
     if let IndexState::Enabled(index) = &context.workspace_index.index {
         let schema = &index.embedding;
         let model = context.embedding_model.info();
-        if schema.provider != model.provider
-            || schema.model != model.name
+        if schema.provider != model.model.provider
+            || schema.model != model.model.name
             || schema.dimension != model.dimension
             || schema.metric != model.metric
         {
             return Err(EngineError::invalid_argument(format!(
                 "workspace embedding schema does not match model {}",
-                model.reference
+                model.model.reference()
             )));
         }
     }
     let _ = resolve_embedding_policy(
         context.embedding_concurrency,
-        context.embedding_model.info(),
+        context.embedding_model.concurrency_defaults(),
     )?;
     Ok(())
 }
@@ -2078,8 +2072,10 @@ mod tests {
 
     use crate::{
         api::index::progress::IndexProgressPhase,
-        domain::{Content, EmbeddingSchema, FileSelection, IndexDescriptor},
-        models::{EmbeddingMetric, EmbeddingModelLimits},
+        domain::{
+            Content, FileSelection, IndexDescriptor,
+            model::{EmbeddingMetric, EmbeddingSchema},
+        },
         storage::spi::{StorageResult, StorageSearchFilter, StorageSearchHit},
     };
 
@@ -2110,7 +2106,7 @@ mod tests {
             .iter()
             .filter(|item| matches!(item.fragment, EntityFragment::Window(_)))
         {
-            let [Content::Text(text)] = item.embedding_content.contents.as_slice() else {
+            let [Content::Text(text)] = item.embedding_content.as_slice() else {
                 panic!("markdown embedding is text");
             };
             assert!(text.starts_with("heading: "));
@@ -2339,19 +2335,16 @@ mod tests {
         fn new() -> Self {
             Self {
                 info: EmbeddingModelInfo {
-                    reference: "local/test".to_owned(),
-                    provider: "local".to_owned(),
-                    name: "test".to_owned(),
+                    model: crate::domain::model::ModelInfo {
+                        provider: "local".to_owned(),
+                        name: "test".to_owned(),
+                        endpoint: None,
+                    },
                     dimension: 2,
                     metric: EmbeddingMetric::Cosine,
-                    endpoint: None,
-                    default_concurrency: Some(2),
-                    input_kinds: vec![EmbeddingInputKind::Text],
-                    limits: EmbeddingModelLimits {
-                        max_batch_size: 1,
-                        max_input_tokens: Some(64),
-                        max_image_bytes: None,
-                    },
+                    max_batch_size: 1,
+                    max_input_tokens: Some(64),
+                    max_image_bytes: None,
                 },
                 calls: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
@@ -2366,9 +2359,16 @@ mod tests {
             &self.info
         }
 
+        fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
+            EmbeddingConcurrencyDefaults {
+                initial: 2,
+                maximum: 2,
+            }
+        }
+
         async fn embed(
             &self,
-            contents: &[EmbeddingInput],
+            contents: &[Vec<Content>],
             _options: EmbeddingOptions,
             _progress: Option<IndexProgressReporter>,
         ) -> Result<EmbeddingResult, ModelError> {
@@ -2592,7 +2592,7 @@ mod tests {
         let scanner = NativeScanner::default();
         let storage = MemoryStorage::default();
         let mut model = ConcurrentModel::new();
-        model.info.limits.max_batch_size = COMMIT_BATCH_FILES * 2;
+        model.info.max_batch_size = COMMIT_BATCH_FILES * 2;
         let result = index_workspace(&IndexingContext {
             workspace_index: &workspace,
             storage: &storage,
