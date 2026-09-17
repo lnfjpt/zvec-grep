@@ -124,6 +124,8 @@ pub mod options {
     }
 
     #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(default)]
+    #[allow(clippy::struct_excessive_bools)]
     pub struct RgOptions {
         pub extra_args: Vec<String>,
         pub pattern_files: Vec<PathBuf>,
@@ -132,6 +134,34 @@ pub mod options {
         pub word_regexp: bool,
         pub before_context: usize,
         pub after_context: usize,
+        pub smart_case: bool,
+        pub line_regexp: bool,
+        pub invert_match: bool,
+        pub multiline: bool,
+        pub multiline_dotall: bool,
+        pub crlf: bool,
+        pub text: bool,
+        pub no_unicode: bool,
+        pub stop_on_nonmatch: bool,
+        pub max_count: Option<usize>,
+        pub threads: Option<usize>,
+        pub regex_size_limit: Option<usize>,
+        pub dfa_size_limit: Option<usize>,
+        pub no_ignore_dot: bool,
+        pub no_ignore_files: bool,
+        pub no_ignore_global: bool,
+        pub no_ignore_parent: bool,
+        pub no_ignore_vcs: bool,
+        pub one_file_system: bool,
+        pub glob_case_insensitive: bool,
+        /// CLI glob rules retain their order across -g and --iglob.
+        pub glob_rules: Vec<RgGlob>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct RgGlob {
+        pub pattern: String,
+        pub case_insensitive: bool,
     }
 }
 

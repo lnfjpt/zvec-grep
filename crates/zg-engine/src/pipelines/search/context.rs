@@ -51,6 +51,9 @@ pub(crate) fn normalize_context_request(
         .iter()
         .chain(&options.queries)
         .filter_map(|query| {
+            if options.rg {
+                return Some(query.clone());
+            }
             let query = query.trim();
             (!query.is_empty()).then(|| query.to_owned())
         })

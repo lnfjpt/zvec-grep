@@ -603,6 +603,27 @@ fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<
     assert!(response.contains("resident workspace manager"));
     assert!(response.contains("\"isError\":false"));
 
+    for (command, has_match) in [
+        ("rg -F ' resident ' sample.txt", false),
+        ("rg --iglob '*.RS' resident .", false),
+        ("rg -S Resident sample.txt", false),
+        ("rg -S RESIDENT -i sample.txt", true),
+        ("rg -e '' sample.txt", true),
+    ] {
+        let mut request = rg.clone();
+        request["params"]["arguments"]["command"] = json!(command);
+        let response = post_json(port, Some(&session), &request.to_string())?;
+        assert!(
+            response.contains("\"isError\":false"),
+            "{command}: {response}"
+        );
+        assert_eq!(
+            response.contains("matchedBy=lexical"),
+            has_match,
+            "{command}: {response}"
+        );
+    }
+
     let index = json!({
         "jsonrpc": "2.0",
         "id": 4,

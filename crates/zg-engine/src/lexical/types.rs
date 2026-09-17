@@ -17,15 +17,12 @@ pub(crate) struct LexicalSearchRequest {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct LexicalOptions {
-    pub fixed_strings: bool,
-    pub ignore_case: bool,
-    pub word_regexp: bool,
-    pub before_context: usize,
-    pub after_context: usize,
+    pub matching: crate::api::context::options::RgOptions,
     pub hidden: bool,
     pub no_ignore: bool,
     pub follow: bool,
     pub globs: Vec<String>,
+    pub insensitive_globs: Vec<String>,
     pub file_types: Vec<String>,
     pub excluded_file_types: Vec<String>,
     pub ignore_files: Vec<PathBuf>,

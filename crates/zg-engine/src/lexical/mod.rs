@@ -114,7 +114,13 @@ fn worker_threads_for_search(
     if is_single_file_search(root, &request.paths) {
         1
     } else {
-        configured.max(1)
+        request
+            .options
+            .matching
+            .threads
+            .filter(|threads| *threads > 0)
+            .unwrap_or(configured)
+            .max(1)
     }
 }
 
@@ -160,10 +166,11 @@ fn search_sync(
         worker_threads,
         "running embedded grep"
     );
+    let count_truncated = AtomicBool::new(false);
     let mut lexical_matches = if worker_threads == 1 {
-        search_paths_serial(root, request, &matcher, &walker)?
+        search_paths_serial(root, request, &matcher, &walker, &count_truncated)?
     } else {
-        search_paths_parallel(root, request, &matcher, &walker)?
+        search_paths_parallel(root, request, &matcher, &walker, &count_truncated)?
     };
 
     expand_context(&mut lexical_matches, request);
@@ -179,9 +186,11 @@ fn search_sync(
         )
     });
 
-    let truncated = request
-        .limit
-        .is_some_and(|limit| lexical_matches.len() > limit);
+    let truncated = count_truncated.load(Ordering::Relaxed)
+        || (request.options.matching.stop_on_nonmatch && !lexical_matches.is_empty())
+        || request
+            .limit
+            .is_some_and(|limit| lexical_matches.len() > limit);
     if let Some(limit) = request.limit {
         lexical_matches.truncate(limit);
     }
@@ -206,9 +215,10 @@ fn search_paths_serial(
     request: &LexicalSearchRequest,
     matcher: &RegexMatcher,
     walker: &WalkBuilder,
+    count_truncated: &AtomicBool,
 ) -> Result<Vec<LexicalMatch>, EngineError> {
     let mut lexical_matches = Vec::new();
-    let mut searcher = build_searcher();
+    let mut searcher = build_searcher(request);
     for result in walker.build() {
         let entry = result.map_err(|error| {
             EngineError::storage_failure(format!("failed to traverse workspace: {error}"))
@@ -223,7 +233,15 @@ fn search_paths_serial(
         if !matches_modified_time(&path, request) {
             continue;
         }
-        search_file(root, &path, matcher, &mut searcher, &mut lexical_matches)?;
+        search_file(
+            root,
+            &path,
+            matcher,
+            &mut searcher,
+            request,
+            &mut lexical_matches,
+            count_truncated,
+        )?;
     }
     Ok(lexical_matches)
 }
@@ -233,6 +251,7 @@ fn search_paths_parallel(
     request: &LexicalSearchRequest,
     matcher: &RegexMatcher,
     walker: &WalkBuilder,
+    count_truncated: &AtomicBool,
 ) -> Result<Vec<LexicalMatch>, EngineError> {
     let lexical_matches = Mutex::new(Vec::new());
     let first_error = Mutex::new(None);
@@ -241,7 +260,7 @@ fn search_paths_parallel(
         let lexical_matches = &lexical_matches;
         let first_error = &first_error;
         let stopped = &stopped;
-        let mut searcher = build_searcher();
+        let mut searcher = build_searcher(request);
         Box::new(move |result| {
             if stopped.load(Ordering::Acquire) {
                 return WalkState::Quit;
@@ -270,8 +289,15 @@ fn search_paths_parallel(
             }
 
             let mut file_matches = Vec::new();
-            if let Err(error) = search_file(root, &path, matcher, &mut searcher, &mut file_matches)
-            {
+            if let Err(error) = search_file(
+                root,
+                &path,
+                matcher,
+                &mut searcher,
+                request,
+                &mut file_matches,
+                count_truncated,
+            ) {
                 return stop_parallel_search(first_error, stopped, error);
             }
             if file_matches.is_empty() {
@@ -300,9 +326,22 @@ fn search_paths_parallel(
         .map_err(|_| EngineError::internal("embedded grep result collector was poisoned"))
 }
 
-fn build_searcher() -> grep::searcher::Searcher {
+fn build_searcher(request: &LexicalSearchRequest) -> grep::searcher::Searcher {
+    let options = &request.options.matching;
     SearcherBuilder::new()
-        .binary_detection(BinaryDetection::quit(b'\0'))
+        .multi_line(options.multiline)
+        .invert_match(options.invert_match)
+        .stop_on_nonmatch(options.stop_on_nonmatch)
+        .line_terminator(if options.crlf {
+            grep::matcher::LineTerminator::crlf()
+        } else {
+            grep::matcher::LineTerminator::byte(b'\n')
+        })
+        .binary_detection(if options.text {
+            BinaryDetection::none()
+        } else {
+            BinaryDetection::quit(b'\0')
+        })
         .bom_sniffing(false)
         .line_number(true)
         .build()
@@ -346,10 +385,23 @@ fn build_matcher(
     let mut builder = RegexMatcherBuilder::new();
     builder
         .multi_line(true)
-        .line_terminator(Some(b'\n'))
-        .case_insensitive(request.options.ignore_case)
-        .fixed_strings(request.options.fixed_strings)
-        .word(request.options.word_regexp);
+        .line_terminator((!request.options.matching.multiline).then_some(b'\n'))
+        .case_insensitive(request.options.matching.ignore_case)
+        .fixed_strings(request.options.matching.fixed_strings)
+        .word(request.options.matching.word_regexp)
+        .case_smart(request.options.matching.smart_case)
+        .whole_line(request.options.matching.line_regexp)
+        .crlf(request.options.matching.crlf)
+        .unicode(!request.options.matching.no_unicode)
+        .dot_matches_new_line(
+            request.options.matching.multiline && request.options.matching.multiline_dotall,
+        );
+    if let Some(bytes) = request.options.matching.regex_size_limit {
+        builder.size_limit(bytes);
+    }
+    if let Some(bytes) = request.options.matching.dfa_size_limit {
+        builder.dfa_size_limit(bytes);
+    }
     builder.build_many(patterns).map_err(|error| {
         EngineError::invalid_argument(format!("invalid lexical search pattern: {error}"))
     })
@@ -377,19 +429,19 @@ fn build_walker(
         .follow_links(request.options.follow)
         .threads(worker_threads)
         .max_depth(request.options.max_depth)
-        .max_filesize(request.options.max_file_size_bytes);
+        .max_filesize(request.options.max_file_size_bytes)
+        .same_file_system(request.options.matching.one_file_system);
 
-    if request.options.hidden {
-        let filter_root = root.to_path_buf();
-        walker.filter_entry(move |entry| {
-            let path = entry
-                .path()
-                .strip_prefix(&filter_root)
-                .unwrap_or_else(|_| entry.path());
-            !is_hard_ignored_path(path)
-        });
-    }
+    let filter_root = root.to_path_buf();
+    walker.filter_entry(move |entry| {
+        let path = entry
+            .path()
+            .strip_prefix(&filter_root)
+            .unwrap_or_else(|_| entry.path());
+        !is_hard_ignored_path(path)
+    });
 
+    let options = &request.options.matching;
     if request.options.no_ignore {
         walker
             .parents(false)
@@ -398,10 +450,23 @@ fn build_walker(
             .git_global(false)
             .git_exclude(false);
     } else {
-        walker.add_custom_ignore_filename(".rgignore");
+        walker
+            .parents(!options.no_ignore_parent)
+            .ignore(!options.no_ignore_dot)
+            .git_ignore(!options.no_ignore_vcs)
+            .git_global(!options.no_ignore_global && !options.no_ignore_vcs)
+            .git_exclude(!options.no_ignore_vcs);
+        if !options.no_ignore_dot {
+            walker.add_custom_ignore_filename(".rgignore");
+        }
     }
 
-    for ignore_file in &request.options.ignore_files {
+    for ignore_file in request
+        .options
+        .ignore_files
+        .iter()
+        .filter(|_| !options.no_ignore_files)
+    {
         let path = resolve_path(root, ignore_file);
         if let Some(error) = walker.add_ignore(&path) {
             return Err(EngineError::storage_failure(format!(
@@ -411,9 +476,35 @@ fn build_walker(
         }
     }
 
-    if !request.options.globs.is_empty() {
+    if !request.options.globs.is_empty()
+        || !request.options.insensitive_globs.is_empty()
+        || !options.glob_rules.is_empty()
+    {
         let mut overrides = OverrideBuilder::new(root);
-        for glob in &request.options.globs {
+        let rules = request
+            .options
+            .globs
+            .iter()
+            .map(|glob| (glob, false))
+            .chain(
+                request
+                    .options
+                    .insensitive_globs
+                    .iter()
+                    .map(|glob| (glob, true)),
+            )
+            .chain(
+                options
+                    .glob_rules
+                    .iter()
+                    .map(|rule| (&rule.pattern, rule.case_insensitive)),
+            );
+        for (glob, insensitive) in rules {
+            overrides
+                .case_insensitive(insensitive || options.glob_case_insensitive)
+                .map_err(|error| {
+                    EngineError::invalid_argument(format!("invalid glob case setting: {error}"))
+                })?;
             overrides.add(glob).map_err(|error| {
                 EngineError::invalid_argument(format!("invalid glob {glob:?}: {error}"))
             })?;
@@ -448,7 +539,9 @@ fn search_file(
     path: &Path,
     matcher: &RegexMatcher,
     searcher: &mut grep::searcher::Searcher,
+    request: &LexicalSearchRequest,
     results: &mut Vec<LexicalMatch>,
+    count_truncated: &AtomicBool,
 ) -> Result<(), EngineError> {
     let absolute_path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let relative_path = absolute_path
@@ -476,6 +569,9 @@ fn search_file(
             absolute_path: &absolute_path,
             relative_path: &relative_path,
             results,
+            options: &request.options.matching,
+            count: 0,
+            count_truncated,
         };
         match decoded {
             Some(text) => searcher.search_slice(matcher, text.as_bytes(), sink),
@@ -496,6 +592,9 @@ struct MatchSink<'a> {
     absolute_path: &'a Path,
     relative_path: &'a Path,
     results: &'a mut Vec<LexicalMatch>,
+    options: &'a crate::api::context::options::RgOptions,
+    count: usize,
+    count_truncated: &'a AtomicBool,
 }
 
 impl Sink for MatchSink<'_> {
@@ -503,22 +602,80 @@ impl Sink for MatchSink<'_> {
 
     fn matched(
         &mut self,
-        _searcher: &grep::searcher::Searcher,
+        searcher: &grep::searcher::Searcher,
         matched: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         let bytes = matched.bytes();
-        let Some(first) = self.matcher.find(bytes).map_err(io::Error::other)? else {
-            return Ok(true);
-        };
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return Ok(true);
-        };
         let line_number = matched
             .line_number()
             .and_then(|line| usize::try_from(line).ok())
             .ok_or_else(|| io::Error::other("search match has no representable line number"))?;
-        let line_offset = usize::try_from(matched.absolute_byte_offset())
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let line_offset =
+            usize::try_from(matched.absolute_byte_offset()).map_err(io::Error::other)?;
+        if self.options.invert_match {
+            let mut offset = 0;
+            for (line, bytes) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+                let selection = grep::matcher::Match::new(0, trim_line_terminator(bytes).len());
+                if !self.record(bytes, line_number + line, line_offset + offset, selection)? {
+                    return Ok(false);
+                }
+                offset += bytes.len();
+            }
+            return Ok(true);
+        }
+        let mut selections: Vec<grep::matcher::Match> = Vec::new();
+        let multiline = searcher.multi_line_with_matcher(self.matcher);
+        self.matcher
+            .find_iter(bytes, |found| {
+                // Multiline matching may report several matches on the same line.
+                // Keep one source span per overlapping group of matching lines,
+                // so max-count has the same line-based meaning as ripgrep.
+                if let Some(previous) = selections.last_mut() {
+                    let previous_end = previous.end().saturating_sub(usize::from(
+                        previous.end() > previous.start() && bytes[previous.end() - 1] == b'\n',
+                    ));
+                    if found.start() <= previous_end
+                        || !bytes[previous_end..found.start()].contains(&b'\n')
+                    {
+                        *previous = grep::matcher::Match::new(previous.start(), found.end());
+                        return true;
+                    }
+                }
+                selections.push(found);
+                multiline
+                    && self.options.max_count.is_none_or(|maximum| {
+                        selections.len() <= maximum.saturating_sub(self.count)
+                    })
+            })
+            .map_err(io::Error::other)?;
+        for selection in selections {
+            if !self.record(bytes, line_number, line_offset, selection)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl MatchSink<'_> {
+    fn record(
+        &mut self,
+        bytes: &[u8],
+        line_number: usize,
+        line_offset: usize,
+        first: grep::matcher::Match,
+    ) -> io::Result<bool> {
+        if self
+            .options
+            .max_count
+            .is_some_and(|maximum| self.count >= maximum)
+        {
+            self.count_truncated.store(true, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return Ok(true);
+        };
         let (Some(start), Some(end)) = (
             text_position_at_byte_offset(text, first.start()),
             text_position_at_byte_offset(text, first.end()),
@@ -540,13 +697,28 @@ impl Sink for MatchSink<'_> {
             end.1,
         )
         .map_err(io::Error::other)?;
+        let content_start = bytes[..first.start()]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |offset| offset + 1);
+        let content_end = if first.end() > first.start() && bytes[first.end() - 1] == b'\n' {
+            first.end()
+        } else {
+            bytes[first.end()..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |offset| first.end() + offset + 1)
+        };
+        self.count += 1;
         self.results.push(LexicalMatch {
             rank: 0,
             absolute_path: self.absolute_path.to_path_buf(),
             relative_path: self.relative_path.to_path_buf(),
             range,
             excerpt_range: None,
-            content: text[..trim_line_terminator(bytes).len()].to_owned(),
+            content: text[content_start
+                ..content_start + trim_line_terminator(&bytes[content_start..content_end]).len()]
+                .to_owned(),
         });
         Ok(true)
     }
@@ -620,11 +792,57 @@ fn diagnostics(
     }
 }
 
-fn diagnostic_args(request: &LexicalSearchRequest) -> Vec<String> {
+fn matching_diagnostic_args(options: &crate::api::context::options::RgOptions) -> Vec<String> {
     let mut args = Vec::new();
-    push_diagnostic_switch(&mut args, request.options.fixed_strings, "--fixed-strings");
-    push_diagnostic_switch(&mut args, request.options.ignore_case, "--ignore-case");
-    push_diagnostic_switch(&mut args, request.options.word_regexp, "--word-regexp");
+    for (enabled, name) in [
+        (options.smart_case, "--smart-case"),
+        (options.line_regexp, "--line-regexp"),
+        (options.invert_match, "--invert-match"),
+        (options.multiline, "--multiline"),
+        (options.multiline_dotall, "--multiline-dotall"),
+        (options.crlf, "--crlf"),
+        (options.text, "--text"),
+        (options.no_unicode, "--no-unicode"),
+        (options.stop_on_nonmatch, "--stop-on-nonmatch"),
+        (options.no_ignore_dot, "--no-ignore-dot"),
+        (options.no_ignore_files, "--no-ignore-files"),
+        (options.no_ignore_global, "--no-ignore-global"),
+        (options.no_ignore_parent, "--no-ignore-parent"),
+        (options.no_ignore_vcs, "--no-ignore-vcs"),
+        (options.one_file_system, "--one-file-system"),
+        (options.glob_case_insensitive, "--glob-case-insensitive"),
+    ] {
+        push_diagnostic_switch(&mut args, enabled, name);
+    }
+    for (value, name) in [
+        (options.max_count, "--max-count"),
+        (options.threads, "--threads"),
+        (options.regex_size_limit, "--regex-size-limit"),
+        (options.dfa_size_limit, "--dfa-size-limit"),
+    ] {
+        push_diagnostic_value(&mut args, name, value.map(|value| value.to_string()));
+    }
+    args
+}
+
+fn diagnostic_args(request: &LexicalSearchRequest) -> Vec<String> {
+    let options = &request.options.matching;
+    let mut args = matching_diagnostic_args(options);
+    push_diagnostic_switch(
+        &mut args,
+        request.options.matching.fixed_strings,
+        "--fixed-strings",
+    );
+    push_diagnostic_switch(
+        &mut args,
+        request.options.matching.ignore_case,
+        "--ignore-case",
+    );
+    push_diagnostic_switch(
+        &mut args,
+        request.options.matching.word_regexp,
+        "--word-regexp",
+    );
     push_diagnostic_switch(&mut args, request.options.hidden, "--hidden");
     push_diagnostic_switch(&mut args, request.options.no_ignore, "--no-ignore");
     push_diagnostic_switch(&mut args, request.options.follow, "--follow");
@@ -643,6 +861,20 @@ fn diagnostic_args(request: &LexicalSearchRequest) -> Vec<String> {
     );
     for glob in &request.options.globs {
         args.extend(["--glob".to_owned(), glob.clone()]);
+    }
+    for glob in &request.options.insensitive_globs {
+        args.extend(["--iglob".to_owned(), glob.clone()]);
+    }
+    for rule in &options.glob_rules {
+        args.extend([
+            if rule.case_insensitive {
+                "--iglob"
+            } else {
+                "--glob"
+            }
+            .to_owned(),
+            rule.pattern.clone(),
+        ]);
     }
     for file_type in &request.options.file_types {
         args.extend(["--type".to_owned(), file_type.clone()]);
@@ -713,8 +945,8 @@ impl ContextSource {
 }
 
 fn expand_context(matches: &mut [LexicalMatch], request: &LexicalSearchRequest) {
-    let before = request.options.before_context;
-    let after = request.options.after_context;
+    let before = request.options.matching.before_context;
+    let after = request.options.matching.after_context;
     if before == 0 && after == 0 {
         return;
     }
@@ -952,8 +1184,8 @@ mod tests {
         )
         .expect("invalid UTF-16 fixture");
         let mut request = request("你好");
-        request.options.before_context = 1;
-        request.options.after_context = 1;
+        request.options.matching.before_context = 1;
+        request.options.matching.after_context = 1;
         let reply = search(&LexicalSearchService::new(), root.path(), &request).await;
         assert_eq!(reply.matches.len(), fixtures.len());
         for item in reply.matches {
@@ -989,7 +1221,7 @@ mod tests {
             excerpt_range: None,
             content: text[start..end].trim_end_matches("\r\n").to_owned(),
         }];
-        request.options.after_context = 0;
+        request.options.matching.after_context = 0;
         expand_context(&mut items, &request);
         assert_eq!(items[0].content, &text[..end]);
         assert_eq!(items[0].excerpt_range, Some(range));
@@ -1048,11 +1280,14 @@ mod tests {
             ..LexicalSearchRequest::default()
         };
         request.options = LexicalOptions {
-            fixed_strings: true,
-            ignore_case: true,
-            word_regexp: true,
-            before_context: 1,
-            after_context: 1,
+            matching: crate::api::context::options::RgOptions {
+                fixed_strings: true,
+                ignore_case: true,
+                word_regexp: true,
+                before_context: 1,
+                after_context: 1,
+                ..Default::default()
+            },
             ..LexicalOptions::default()
         };
 

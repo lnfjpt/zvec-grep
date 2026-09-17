@@ -33,84 +33,58 @@ pub fn parse_managed_rg_args(args: &[String]) -> Result<ContextOptions, ManagedR
     let mut index = 0;
     let mut options_finished = false;
     let mut positionals = Vec::new();
+    let mut unrestricted = 0;
     while index < args.len() {
         let arg = &args[index];
-        if options_finished {
+        if options_finished || !arg.starts_with('-') || arg == "-" {
             positionals.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        if arg == "--" {
+        } else if arg == "--" {
             options_finished = true;
-            index += 1;
-            continue;
-        }
-        if let Some((name, value)) = arg.split_once('=')
-            && parse_long_with_value(name, value, &mut request)?
-        {
-            index += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "-n" | "-H" | "--line-number" | "--with-filename" | "--recursive" => {}
-            "-F" | "--fixed-strings" => {
-                request.rg_options.fixed_strings = true;
+        } else if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            let name = format!("--{name}");
+            if takes_value(&name) {
+                let value = match inline {
+                    Some(value) => value.to_owned(),
+                    None => take_value(args, &mut index, &name)?,
+                };
+                apply_value(&name, &value, &mut request)?;
+            } else if inline.is_some() {
+                return Err(ManagedRgArgumentError::UnsupportedOption(arg.clone()));
+            } else {
+                apply_switch(&name, &mut request)?;
             }
-            "-i" | "--ignore-case" => {
-                request.rg_options.ignore_case = true;
+        } else {
+            for (offset, flag) in arg.char_indices().skip(1) {
+                if flag == 'u' {
+                    unrestricted += 1;
+                    request.no_ignore = true;
+                    request.hidden |= unrestricted >= 2;
+                    request.rg_options.text |= unrestricted >= 3;
+                    continue;
+                }
+                let name = short_option(flag).ok_or_else(|| {
+                    let flag = format!("-{flag}");
+                    if is_output_option(&flag) {
+                        ManagedRgArgumentError::OutputOption(flag)
+                    } else {
+                        ManagedRgArgumentError::UnsupportedOption(flag)
+                    }
+                })?;
+                if takes_value(name) {
+                    let rest = &arg[offset + flag.len_utf8()..];
+                    let value = if rest.is_empty() {
+                        take_value(args, &mut index, name)?
+                    } else {
+                        rest.to_owned()
+                    };
+                    apply_value(name, &value, &mut request)?;
+                    break;
+                }
+                apply_switch(name, &mut request)?;
             }
-            "-w" | "--word-regexp" => {
-                request.rg_options.word_regexp = true;
-            }
-            "--hidden" => request.hidden = true,
-            "--no-ignore" => request.no_ignore = true,
-            "-L" | "--follow" => request.follow = true,
-            "-g" | "--glob" => request.globs.push(take_value(args, &mut index, arg)?),
-            "--iglob" => request
-                .insensitive_globs
-                .push(take_value(args, &mut index, arg)?),
-            "-t" | "--type" => request.file_types.push(take_value(args, &mut index, arg)?),
-            "-T" | "--type-not" => request
-                .excluded_file_types
-                .push(take_value(args, &mut index, arg)?),
-            "--ignore-file" => request
-                .ignore_files
-                .push(PathBuf::from(take_value(args, &mut index, arg)?)),
-            "--max-depth" => request.max_depth = Some(take_usize(args, &mut index, arg)?),
-            "--max-filesize" => {
-                let value = take_value(args, &mut index, arg)?;
-                request.max_file_size_bytes =
-                    Some(parse_byte_size(&value).map_err(|_| invalid(arg, &value))?);
-            }
-            "-A" | "--after-context" => {
-                request.rg_options.after_context = take_usize(args, &mut index, arg)?;
-            }
-            "-B" | "--before-context" => {
-                request.rg_options.before_context = take_usize(args, &mut index, arg)?;
-            }
-            "-C" | "--context" => {
-                let value = take_usize(args, &mut index, arg)?;
-                request.rg_options.before_context = value;
-                request.rg_options.after_context = value;
-            }
-            "-e" | "--regexp" => request.queries.push(take_value(args, &mut index, arg)?),
-            "-f" | "--file" => request
-                .rg_options
-                .pattern_files
-                .push(PathBuf::from(take_value(args, &mut index, arg)?)),
-            value if is_output_option(value) => {
-                return Err(ManagedRgArgumentError::OutputOption(value.to_owned()));
-            }
-            value if value.starts_with("--") && flag_without_value(value) => {
-                request.rg_options.extra_args.push(value.to_owned());
-            }
-            value if value.starts_with('-') && value.len() > 2 => {
-                parse_short_group(value, args, &mut index, &mut request)?;
-            }
-            value if value.starts_with('-') => {
-                return Err(ManagedRgArgumentError::UnsupportedOption(value.to_owned()));
-            }
-            value => positionals.push(value.to_owned()),
         }
         index += 1;
     }
@@ -124,148 +98,174 @@ pub fn parse_managed_rg_args(args: &[String]) -> Result<ContextOptions, ManagedR
     Ok(request)
 }
 
-fn parse_long_with_value(
+fn short_option(flag: char) -> Option<&'static str> {
+    Some(match flag {
+        'n' => "--line-number",
+        'H' => "--with-filename",
+        'F' => "--fixed-strings",
+        'i' => "--ignore-case",
+        's' => "--case-sensitive",
+        'S' => "--smart-case",
+        'w' => "--word-regexp",
+        'x' => "--line-regexp",
+        'v' => "--invert-match",
+        'U' => "--multiline",
+        'a' => "--text",
+        'L' => "--follow",
+        'e' => "--regexp",
+        'f' => "--file",
+        'g' => "--glob",
+        't' => "--type",
+        'T' => "--type-not",
+        'A' => "--after-context",
+        'B' => "--before-context",
+        'C' => "--context",
+        'm' => "--max-count",
+        'j' => "--threads",
+        _ => return None,
+    })
+}
+
+fn apply_switch(name: &str, request: &mut ContextOptions) -> Result<(), ManagedRgArgumentError> {
+    let options = &mut request.rg_options;
+    match name {
+        "--line-number" | "--with-filename" | "--recursive" | "--no-config" | "--no-mmap"
+        | "--no-search-zip" => {}
+        "--fixed-strings" => options.fixed_strings = true,
+        "--no-fixed-strings" => options.fixed_strings = false,
+        "--ignore-case" | "--case-sensitive" | "--smart-case" => {
+            options.ignore_case = name == "--ignore-case";
+            options.smart_case = name == "--smart-case";
+        }
+        "--word-regexp" | "--line-regexp" => {
+            options.word_regexp = name == "--word-regexp";
+            options.line_regexp = name == "--line-regexp";
+        }
+        "--invert-match" => options.invert_match = true,
+        "--no-invert-match" => options.invert_match = false,
+        "--multiline" => {
+            options.multiline = true;
+            options.stop_on_nonmatch = false;
+        }
+        "--no-multiline" => options.multiline = false,
+        "--multiline-dotall" => options.multiline_dotall = true,
+        "--no-multiline-dotall" => options.multiline_dotall = false,
+        "--crlf" => options.crlf = true,
+        "--no-crlf" => options.crlf = false,
+        "--text" => options.text = true,
+        "--no-text" => options.text = false,
+        "--unicode" => options.no_unicode = false,
+        "--no-unicode" => options.no_unicode = true,
+        "--stop-on-nonmatch" => {
+            options.stop_on_nonmatch = true;
+            options.multiline = false;
+        }
+        "--hidden" => request.hidden = true,
+        "--no-hidden" => request.hidden = false,
+        "--no-ignore" => request.no_ignore = true,
+        "--ignore" => request.no_ignore = false,
+        "--follow" => request.follow = true,
+        "--no-follow" => request.follow = false,
+        "--no-ignore-dot" => options.no_ignore_dot = true,
+        "--ignore-dot" => options.no_ignore_dot = false,
+        "--no-ignore-files" => options.no_ignore_files = true,
+        "--ignore-files" => options.no_ignore_files = false,
+        "--no-ignore-global" => options.no_ignore_global = true,
+        "--ignore-global" => options.no_ignore_global = false,
+        "--no-ignore-parent" => options.no_ignore_parent = true,
+        "--ignore-parent" => options.no_ignore_parent = false,
+        "--no-ignore-vcs" => options.no_ignore_vcs = true,
+        "--ignore-vcs" => options.no_ignore_vcs = false,
+        "--one-file-system" => options.one_file_system = true,
+        "--glob-case-insensitive" => options.glob_case_insensitive = true,
+        "--no-glob-case-insensitive" => options.glob_case_insensitive = false,
+        name if is_output_option(name) => {
+            return Err(ManagedRgArgumentError::OutputOption(name.to_owned()));
+        }
+        _ => return Err(ManagedRgArgumentError::UnsupportedOption(name.to_owned())),
+    }
+    Ok(())
+}
+
+fn takes_value(name: &str) -> bool {
+    matches!(
+        name,
+        "--regexp"
+            | "--file"
+            | "--glob"
+            | "--iglob"
+            | "--type"
+            | "--type-not"
+            | "--ignore-file"
+            | "--max-depth"
+            | "--max-filesize"
+            | "--before-context"
+            | "--after-context"
+            | "--context"
+            | "--max-count"
+            | "--threads"
+            | "--regex-size-limit"
+            | "--dfa-size-limit"
+            | "--engine"
+    )
+}
+
+fn apply_value(
     name: &str,
     value: &str,
     request: &mut ContextOptions,
-) -> Result<bool, ManagedRgArgumentError> {
+) -> Result<(), ManagedRgArgumentError> {
+    if name != "--regexp" {
+        non_empty(name, value)?;
+    }
     match name {
-        "--glob" => request.globs.push(non_empty(name, value)?),
-        "--iglob" => request.insensitive_globs.push(non_empty(name, value)?),
-        "--type" => request.file_types.push(non_empty(name, value)?),
-        "--type-not" => request.excluded_file_types.push(non_empty(name, value)?),
-        "--ignore-file" => request.ignore_files.push(non_empty(name, value)?.into()),
+        "--regexp" => request.queries.push(value.to_owned()),
+        "--file" => request.rg_options.pattern_files.push(value.into()),
+        "--glob" | "--iglob" => {
+            request
+                .rg_options
+                .glob_rules
+                .push(zg_engine::api::context::options::RgGlob {
+                    pattern: value.to_owned(),
+                    case_insensitive: name == "--iglob",
+                });
+        }
+        "--type" => request.file_types.push(value.to_owned()),
+        "--type-not" => request.excluded_file_types.push(value.to_owned()),
+        "--ignore-file" => request.ignore_files.push(value.into()),
         "--max-depth" => request.max_depth = Some(parse_usize(name, value)?),
         "--max-filesize" => {
             request.max_file_size_bytes =
                 Some(parse_byte_size(value).map_err(|_| invalid(name, value))?);
         }
-        "--context" => {
-            let parsed = parse_usize(name, value)?;
-            request.rg_options.before_context = parsed;
-            request.rg_options.after_context = parsed;
-        }
         "--before-context" => request.rg_options.before_context = parse_usize(name, value)?,
         "--after-context" => request.rg_options.after_context = parse_usize(name, value)?,
-        "--regexp" => request.queries.push(non_empty(name, value)?),
-        "--file" => request
-            .rg_options
-            .pattern_files
-            .push(non_empty(name, value)?.into()),
-        name if is_output_option(name) => {
-            return Err(ManagedRgArgumentError::OutputOption(name.to_owned()));
+        "--context" => {
+            let count = parse_usize(name, value)?;
+            request.rg_options.before_context = count;
+            request.rg_options.after_context = count;
         }
-        name if flag_with_value(name) => request
-            .rg_options
-            .extra_args
-            .extend([name.to_owned(), value.to_owned()]),
-        _ => return Ok(false),
-    }
-    Ok(true)
-}
-
-fn parse_short_group(
-    arg: &str,
-    args: &[String],
-    index: &mut usize,
-    request: &mut ContextOptions,
-) -> Result<(), ManagedRgArgumentError> {
-    let chars = arg.char_indices().skip(1).collect::<Vec<_>>();
-    for (position, (offset, option)) in chars.iter().copied().enumerate() {
-        let flag = format!("-{option}");
-        match option {
-            'n' | 'H' => {}
-            'F' => {
-                request.rg_options.fixed_strings = true;
+        "--max-count" => request.rg_options.max_count = Some(parse_usize(name, value)?),
+        "--threads" => request.rg_options.threads = Some(parse_usize(name, value)?),
+        "--regex-size-limit" | "--dfa-size-limit" => {
+            let bytes = parse_byte_size(value)
+                .ok()
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or_else(|| invalid(name, value))?;
+            if name == "--regex-size-limit" {
+                request.rg_options.regex_size_limit = Some(bytes);
+            } else {
+                request.rg_options.dfa_size_limit = Some(bytes);
             }
-            'i' => {
-                request.rg_options.ignore_case = true;
-            }
-            'w' => {
-                request.rg_options.word_regexp = true;
-            }
-            'P' | 'S' | 's' | 'a' | 'u' | 'U' | 'v' | 'x' | 'z' => {
-                request.rg_options.extra_args.push(flag);
-            }
-            'L' => request.follow = true,
-            'e' | 'g' | 'E' | 't' | 'T' | 'f' | 'm' | 'j' | 'A' | 'B' | 'C' => {
-                let inline_start = offset + option.len_utf8();
-                let value = if position + 1 < chars.len() {
-                    arg[inline_start..].to_owned()
-                } else {
-                    take_value(args, index, &flag)?
-                };
-                match option {
-                    'e' => request.queries.push(value),
-                    'g' => request.globs.push(value),
-                    'E' | 'm' | 'j' => request.rg_options.extra_args.extend([flag, value]),
-                    't' => request.file_types.push(value),
-                    'T' => request.excluded_file_types.push(value),
-                    'f' => request.rg_options.pattern_files.push(value.into()),
-                    'A' => request.rg_options.after_context = parse_usize(&flag, &value)?,
-                    'B' => request.rg_options.before_context = parse_usize(&flag, &value)?,
-                    'C' => {
-                        let parsed = parse_usize(&flag, &value)?;
-                        request.rg_options.before_context = parsed;
-                        request.rg_options.after_context = parsed;
-                    }
-                    _ => unreachable!("covered short option"),
-                }
-                return Ok(());
-            }
-            _ if is_output_option(&flag) => return Err(ManagedRgArgumentError::OutputOption(flag)),
-            _ => return Err(ManagedRgArgumentError::UnsupportedOption(flag)),
+        }
+        "--engine" if value == "default" => {}
+        _ => {
+            return Err(ManagedRgArgumentError::UnsupportedOption(format!(
+                "{name}={value}"
+            )));
         }
     }
     Ok(())
-}
-
-fn flag_with_value(value: &str) -> bool {
-    matches!(
-        value,
-        "--dfa-size-limit"
-            | "--encoding"
-            | "--engine"
-            | "--max-columns"
-            | "--max-count"
-            | "--regex-size-limit"
-            | "--threads"
-    )
-}
-
-fn flag_without_value(value: &str) -> bool {
-    matches!(
-        value,
-        "--auto-hybrid-regex"
-            | "--case-sensitive"
-            | "--binary"
-            | "--crlf"
-            | "--invert-match"
-            | "--line-regexp"
-            | "--mmap"
-            | "--multiline"
-            | "--multiline-dotall"
-            | "--no-crlf"
-            | "--no-fixed-strings"
-            | "--no-ignore-dot"
-            | "--no-ignore-files"
-            | "--no-ignore-global"
-            | "--no-ignore-parent"
-            | "--no-ignore-vcs"
-            | "--no-config"
-            | "--no-mmap"
-            | "--no-multiline"
-            | "--no-search-zip"
-            | "--pcre2"
-            | "--one-file-system"
-            | "--search-zip"
-            | "--smart-case"
-            | "--stop-on-nonmatch"
-            | "--text"
-            | "--unicode"
-            | "--no-unicode"
-            | "--glob-case-insensitive"
-    )
 }
 
 fn is_output_option(value: &str) -> bool {
@@ -317,19 +317,9 @@ fn take_value(
     *index += 1;
     args.get(*index)
         .cloned()
-        .filter(|value| !value.is_empty())
         .ok_or_else(|| ManagedRgArgumentError::MissingOptionValue {
             option: option.to_owned(),
         })
-}
-
-fn take_usize(
-    args: &[String],
-    index: &mut usize,
-    option: &str,
-) -> Result<usize, ManagedRgArgumentError> {
-    let value = take_value(args, index, option)?;
-    parse_usize(option, &value)
 }
 
 fn parse_usize(option: &str, value: &str) -> Result<usize, ManagedRgArgumentError> {
@@ -350,4 +340,51 @@ fn non_empty(option: &str, value: &str) -> Result<String, ManagedRgArgumentError
         });
     }
     Ok(value.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_managed_rg_args;
+
+    #[test]
+    fn rejects_unsupported_features_during_parsing() {
+        for flag in [
+            "-P",
+            "--pcre2",
+            "-z",
+            "--search-zip",
+            "--encoding=utf-8",
+            "--engine=auto",
+            "--engine=pcre2",
+            "--mmap",
+            "--smart-case=true",
+            "--json",
+        ] {
+            assert!(
+                parse_managed_rg_args(&[flag.into(), "needle".into()]).is_err(),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_values_and_keeps_literal_equals_in_patterns() {
+        for args in [
+            vec!["--max-count"],
+            vec!["--threads", "-1"],
+            vec!["--glob="],
+            vec!["--regex-size-limit=bogus"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(parse_managed_rg_args(&args).is_err(), "{args:?}");
+        }
+        for pattern in ["a=b", "--glob=x"] {
+            let request =
+                parse_managed_rg_args(&["--".into(), pattern.into()]).expect("literal pattern");
+            assert_eq!(request.query.as_deref(), Some(pattern));
+        }
+        let request = parse_managed_rg_args(&["-e".into(), String::new(), "file".into()])
+            .expect("empty regex");
+        assert_eq!(request.queries, [""]);
+    }
 }

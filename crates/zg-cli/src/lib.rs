@@ -1586,7 +1586,7 @@ mod tests {
             "zg",
             "query",
             "--rg",
-            "-nHFiwPSsuvxUzL",
+            "-nHFiwSsuvxUL",
             "-einline",
             "-g*.js",
             "-tts",

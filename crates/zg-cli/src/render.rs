@@ -450,9 +450,13 @@ File filters:
   --symbol-type <type>              alias, class, enum, function, interface, module, value
   --prefer-symbol                   Prefer exact indexed symbols
 
-Managed --rg supports common ripgrep matching, context, engine, encoding,
-discovery, glob, and type flags. Use -e when a pattern begins with "-".
-Options that replace rg's output format are rejected.
+Managed --rg uses the embedded Rust regex engine (--engine default).
+Matching: -F, -i/-s/-S, -w/-x, -v, -U, --multiline-dotall, --crlf, -a.
+Bounds: -A/-B/-C, -m/--max-count (per file), -j/--threads (0 = automatic).
+Discovery: -u/-uu/-uuu, --no-ignore-*, --one-file-system, globs and types.
+Patterns preserve whitespace; -e accepts empty patterns and leading "-".
+Unicode BOM decoding is automatic. PCRE2, compressed search, explicit encoding,
+and options that replace rg's output format are not supported.
 
 Environment:
   ZVEC_GREP_MODE         Default client mode: direct, server, or auto

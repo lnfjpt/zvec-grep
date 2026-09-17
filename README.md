@@ -46,6 +46,21 @@ factory is installed in the production composition root.
 Lexical search runs in-process with ripgrep's `grep` and `ignore` crates; the
 binary and ordinary CI jobs do not require a system `rg` executable.
 
+Managed `zg query --rg` preserves literal pattern whitespace and supports empty
+patterns with `-e ''`. Matching options include fixed strings (`-F`), case
+selection (`-i`, `-s`, `-S`, with the last option winning), word/whole-line
+matching (`-w`, `-x`), inversion (`-v`), multiline search (`-U`),
+`--multiline-dotall`, `--crlf`, and text search through NUL bytes (`-a`).
+Case-sensitive and insensitive glob rules (`-g`, `--iglob`) retain command-line
+order. `-m` bounds matches per file and reports truncated coverage when additional
+matches are omitted; `--limit` bounds the final result list. `-j 0` selects the
+automatic thread count. Ignore controls include `-u`/`-uu`/`-uuu`,
+`--no-ignore-dot`, `--no-ignore-files`, `--no-ignore-global`,
+`--no-ignore-parent`, and `--no-ignore-vcs`. Managed search still excludes its
+internal directories. The full MCP toolset uses the same argument parser and
+engine. PCRE2, compressed-file search, explicit encoding selection, and native
+ripgrep output-format switches are rejected; Unicode BOM decoding is automatic.
+
 ## Remote embedding authorization
 
 In an interactive terminal, `zg index` prompts before sending data to an
