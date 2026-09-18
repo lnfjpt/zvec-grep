@@ -198,6 +198,7 @@ fn vector_metadata_text(metadata: Option<&EntityMetadata>, max_chars: Option<usi
             scope,
             signature,
             documentation,
+            ..
         }) => vec![
             match (symbol_type, symbol_name) {
                 (Some(kind), Some(name)) => Some(format!("symbol: {} {name}", kind.as_str())),
