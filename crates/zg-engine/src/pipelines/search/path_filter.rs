@@ -1,112 +1,60 @@
-//! Compile common path globs into retrieval predicates, with ripgrep matching
-//! as the fallback for syntax that cannot be represented exactly.
+//! Compile path globs into storage predicates only when they preserve file-selection semantics.
 
 use std::path::Path;
 
-use ignore::overrides::{Override, OverrideBuilder};
-
 use crate::{
     EngineError,
-    domain::SourcePath,
+    domain::{GlobRule, SourcePath},
     storage::spi::{StoragePathFilter, WorkspaceIndexStorage},
 };
 
-pub(super) struct GlobFilter<'a> {
-    matcher: Override,
-    sensitive: &'a [String],
-    insensitive: &'a [String],
-}
-
-impl<'a> GlobFilter<'a> {
-    pub(super) fn new(
-        workspace_root: &Path,
-        sensitive: &'a [String],
-        insensitive: &'a [String],
-    ) -> Result<Self, EngineError> {
-        let mut builder = OverrideBuilder::new(workspace_root);
-        // The current API keeps these in separate lists: insensitive rules
-        // follow sensitive rules, preserving the order within each list.
-        for (patterns, insensitive) in [(sensitive, false), (insensitive, true)] {
-            builder
-                .case_insensitive(insensitive)
-                .map_err(|error| glob_error(&error))?;
-            for pattern in patterns {
-                builder.add(pattern).map_err(|error| glob_error(&error))?;
-            }
-        }
-        Ok(Self {
-            matcher: builder.build().map_err(|error| glob_error(&error))?,
-            sensitive,
-            insensitive,
-        })
+pub(super) fn compile_path_filter(
+    rules: &[GlobRule],
+    storage: &dyn WorkspaceIndexStorage,
+) -> Result<Option<StoragePathFilter>, EngineError> {
+    if !storage.supports_path_filters() || rules.iter().any(|rule| rule.case_insensitive) {
+        return Ok(None);
     }
-
-    pub(super) fn is_match(&self, relative_path: &Path) -> bool {
-        // A file cannot be reached by a ripgrep walk when one of its parent
-        // directories is excluded, even if a later rule includes the file.
-        !self.matcher.matched(relative_path, false).is_ignore()
-            && relative_path
-                .parent()
-                .into_iter()
-                .flat_map(Path::ancestors)
-                .take_while(|parent| !parent.as_os_str().is_empty())
-                .all(|parent| !self.matcher.matched(parent, true).is_ignore())
-    }
-
-    pub(super) fn pushdown(
-        &self,
-        storage: &dyn WorkspaceIndexStorage,
-    ) -> Result<Option<StoragePathFilter>, EngineError> {
-        if !storage.supports_path_filters() || !self.insensitive.is_empty() {
-            return Ok(None);
-        }
-        let mut includes = Vec::new();
-        let mut excludes = Vec::new();
-        let mut has_exclusion = false;
-        let mut uses_file_name = false;
-        for pattern in self.sensitive {
-            if let Some(pattern) = pattern.strip_prefix('!') {
-                // Recursive directory exclusions at the end of the rule list
-                // remove whole subtrees. Other exclusions can prune matching
-                // directories by name and require the walk-aware fallback.
-                let Some(directory) = recursive_directory(pattern) else {
-                    return Ok(None);
-                };
-                excludes.push(directory_filter(directory)?);
-                has_exclusion = true;
-            } else {
-                // Re-inclusion depends on which parent directories a later
-                // rule restores, so do not reduce it to Boolean file matches.
-                if has_exclusion {
-                    return Ok(None);
-                }
-                let Some((predicate, name)) = positive_filter(pattern)? else {
-                    return Ok(None);
-                };
-                uses_file_name |= name;
-                includes.push(predicate);
-            }
-        }
-        if uses_file_name && storage.has_non_unicode_file_names()? {
-            // Source records retain native paths. Lossy STRING metadata must
-            // never determine the result for a non-Unicode basename.
-            return Ok(None);
-        }
-        let include = if includes.is_empty() {
-            StoragePathFilter::All
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    let mut has_exclusion = false;
+    let mut uses_file_name = false;
+    for rule in rules {
+        let pattern = rule.pattern.as_str();
+        if let Some(pattern) = pattern.strip_prefix('!') {
+            // Other exclusions can prune matching parent directories and need
+            // the shared matcher's walk-aware fallback.
+            let Some(directory) = recursive_directory(pattern) else {
+                return Ok(None);
+            };
+            excludes.push(directory_filter(directory)?);
+            has_exclusion = true;
         } else {
-            any(includes)
-        };
-        Ok(Some(if excludes.is_empty() {
-            include
-        } else {
-            all(vec![include, negate(any(excludes))])
-        }))
+            // Re-inclusion depends on whether parent directories remain reachable.
+            if has_exclusion {
+                return Ok(None);
+            }
+            let Some((predicate, name)) = positive_filter(pattern)? else {
+                return Ok(None);
+            };
+            uses_file_name |= name;
+            includes.push(predicate);
+        }
     }
-}
-
-fn glob_error(error: &ignore::Error) -> EngineError {
-    EngineError::invalid_argument(format!("invalid ripgrep glob: {error}"))
+    if uses_file_name && storage.has_non_unicode_file_names()? {
+        // Lossy string metadata cannot decide matches for native file names.
+        return Ok(None);
+    }
+    let include = if includes.is_empty() {
+        StoragePathFilter::All
+    } else {
+        any(includes)
+    };
+    Ok(Some(if excludes.is_empty() {
+        include
+    } else {
+        all(vec![include, negate(any(excludes))])
+    }))
 }
 
 fn positive_filter(pattern: &str) -> Result<Option<(StoragePathFilter, bool)>, EngineError> {

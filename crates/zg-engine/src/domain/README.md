@@ -3,6 +3,7 @@
 The domain module defines the engine's shared data types.
 
 1. **Workspace** defines a named scope for indexing and searching source files.
+1. **File filter** defines file selection rules.
 1. **Source** describes source files and directories, their formats and content locations.
 1. **Content** represents atomic data, such as text, images, or tables.
 1. **Metadata** describes category-specific attributes of content, such as a code symbol’s name and kind.

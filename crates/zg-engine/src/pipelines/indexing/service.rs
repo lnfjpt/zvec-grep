@@ -11,10 +11,7 @@ use crate::{
     EngineError,
     api::{
         context::{ContextOptions, ContextResult},
-        index::{
-            IndexOptions, IndexResult,
-            options::{DiscoveryOptions, EmbeddingModelSpec},
-        },
+        index::{IndexOptions, IndexResult, options::EmbeddingModelSpec},
         info::{
             InfoOptions, InfoResult,
             result::{InfoSource, WorkspaceIndexInfo, WorkspaceIndexPolicy},
@@ -196,6 +193,16 @@ impl WorkspaceIndexService {
                     .and_then(|manifest| manifest.index_version),
             )?;
         }
+        // Validate before model acquisition; invalid filters must not trigger downloads or inference.
+        let filter = resolve_filter(existing.as_ref(), &options);
+        crate::file_selection::FileMatcher::new(&location.root, &filter)?;
+        if options.reset_paths
+            || options.filter != crate::api::index::options::FileFilterUpdate::default()
+            || options.scan != crate::api::index::options::ScanOptionsUpdate::default()
+        {
+            // A changed selection can admit files outside a watcher's narrow change scope.
+            options.changes.clear();
+        }
         let model = acquire_model(models, existing.as_ref(), &options)?;
         if !rebuilding {
             assert_embedding_compatible(existing.as_ref(), &model)?;
@@ -241,6 +248,7 @@ impl WorkspaceIndexService {
             })?;
         let result = index_workspace(&IndexingContext {
             workspace_index: &manifest.workspace,
+            scan: &manifest.scan,
             storage: storage.as_ref(),
             scanner: &self.scanner,
             embedding_model: &model,
@@ -389,9 +397,14 @@ impl WorkspaceIndexService {
         let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: manifest.storage_home(),
         })?;
-        let status =
-            get_workspace_index_status(&manifest.workspace, storage.as_ref(), &self.scanner, None)
-                .await;
+        let status = get_workspace_index_status(
+            &manifest.workspace,
+            &manifest.scan,
+            storage.as_ref(),
+            &self.scanner,
+            None,
+        )
+        .await;
         let close = storage.close();
         let status = status?;
         close?;
@@ -430,6 +443,7 @@ impl WorkspaceIndexService {
             })?;
             let status = get_workspace_index_status(
                 &manifest.workspace,
+                &manifest.scan,
                 storage.as_ref(),
                 &self.scanner,
                 None,
@@ -533,7 +547,7 @@ fn index_manifest(
             .or_else(|| active.map(|value| value.workspace.name.clone()))
             .unwrap_or_else(|| workspace_name(&location.root)),
         root: location.root.clone(),
-        file_selection: resolve_discovery(active, options),
+        filter: resolve_filter(active, options),
         index: IndexState::Enabled(IndexDescriptor {
             fts: crate::domain::FTS_CONFIG,
             embedding: model.info().clone(),
@@ -548,6 +562,7 @@ fn index_manifest(
         Some(CURRENT_INDEX_VERSION),
         runtime,
     )?;
+    manifest.scan = resolve_scan(active, options);
     manifest.storage_generation = active.and_then(|value| value.storage_generation.clone());
     Ok(manifest)
 }
@@ -812,56 +827,34 @@ fn assert_embedding_compatible(
     schema.ensure_index_compatible(model.info())
 }
 
-pub(crate) fn resolve_discovery(
+pub(crate) fn resolve_filter(
     existing: Option<&WorkspaceManifest>,
     options: &IndexOptions,
-) -> DiscoveryOptions {
-    let mut discovery = if options.reset_paths {
-        DiscoveryOptions::default()
+) -> crate::domain::FileFilter {
+    let mut filter = if options.reset_paths {
+        crate::domain::FileFilter::default()
     } else {
-        existing.map_or_else(DiscoveryOptions::default, |manifest| {
-            manifest.workspace.file_selection.clone()
+        existing.map_or_else(crate::domain::FileFilter::default, |manifest| {
+            manifest.workspace.filter.clone()
         })
     };
-    apply_discovery_overrides(&mut discovery, &options.discovery);
-    discovery
+    options.filter.apply(&mut filter);
+    filter
 }
 
-fn apply_discovery_overrides(target: &mut DiscoveryOptions, overrides: &DiscoveryOptions) {
-    if !overrides.include_paths.is_empty() {
-        target.include_paths.clone_from(&overrides.include_paths);
-    }
-    if !overrides.exclude_paths.is_empty() {
-        target.exclude_paths.clone_from(&overrides.exclude_paths);
-    }
-    if !overrides.globs.is_empty() {
-        target.globs.clone_from(&overrides.globs);
-    }
-    if !overrides.insensitive_globs.is_empty() {
-        target
-            .insensitive_globs
-            .clone_from(&overrides.insensitive_globs);
-    }
-    if !overrides.file_types.is_empty() {
-        target.file_types.clone_from(&overrides.file_types);
-    }
-    if !overrides.excluded_file_types.is_empty() {
-        target
-            .excluded_file_types
-            .clone_from(&overrides.excluded_file_types);
-    }
-    if !overrides.ignore_files.is_empty() {
-        target.ignore_files.clone_from(&overrides.ignore_files);
-    }
-    target.hidden |= overrides.hidden;
-    target.no_ignore |= overrides.no_ignore;
-    target.follow |= overrides.follow;
-    if overrides.max_depth.is_some() {
-        target.max_depth = overrides.max_depth;
-    }
-    if overrides.max_file_size_bytes.is_some() {
-        target.max_file_size_bytes = overrides.max_file_size_bytes;
-    }
+fn resolve_scan(
+    existing: Option<&WorkspaceManifest>,
+    options: &IndexOptions,
+) -> crate::file_selection::ScanOptions {
+    let mut scan = if options.reset_paths {
+        crate::file_selection::ScanOptions::default()
+    } else {
+        existing.map_or_else(crate::file_selection::ScanOptions::default, |manifest| {
+            manifest.scan.clone()
+        })
+    };
+    options.scan.apply(&mut scan);
+    scan
 }
 
 fn embedding_runtime(
@@ -1002,7 +995,12 @@ fn epoch_millis() -> u64 {
 }
 
 fn workspace_info(manifest: &WorkspaceManifest) -> WorkspaceIndexInfo {
-    WorkspaceIndexInfo::from_workspace(&manifest.workspace, &manifest.path, manifest.index_version)
+    WorkspaceIndexInfo::from_workspace(
+        &manifest.workspace,
+        &manifest.path,
+        &manifest.scan,
+        manifest.index_version,
+    )
 }
 
 /// Find the old registration of a physically moved workspace. The recorded root
@@ -1049,11 +1047,11 @@ mod tests {
         api::{
             index::{
                 IndexOptions,
-                options::{DiscoveryOptions, EmbeddingModelSpec},
+                options::{EmbeddingModelSpec, FileFilterUpdate},
             },
             info::InfoOptions,
         },
-        domain::{FileRecord, FileSelection, IndexState, Workspace, model::Device},
+        domain::{FileFilter, FileRecord, IndexState, Workspace, model::Device},
         storage::spi::{
             IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit,
             WorkspaceIndexStorage, WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
@@ -1185,13 +1183,7 @@ mod tests {
             .expect("manifest object")
             .remove("root")
             .expect("workspace root");
-        let mut discovery = legacy
-            .as_object_mut()
-            .expect("manifest object")
-            .remove("discovery")
-            .expect("discovery");
-        discovery["absolutePath"] = root;
-        discovery["recursive"] = true.into();
+        let discovery = serde_json::json!({"absolutePath":root,"recursive":true});
         legacy["rootPaths"] = serde_json::json!([discovery]);
         std::fs::write(
             home.join("manifest.json"),
@@ -1213,17 +1205,15 @@ mod tests {
     }
 
     #[test]
-    fn discovery_overrides_preserve_saved_settings_until_reset() {
+    fn selection_updates_preserve_omitted_settings_and_clear_explicit_values() {
         let directory = tempdir().expect("workspace");
-        let manifest = crate::workspace::manifest::WorkspaceManifest::new(
+        let mut manifest = crate::workspace::manifest::WorkspaceManifest::new(
             Workspace {
-                name: "workspace".to_owned(),
+                name: "workspace".into(),
                 root: directory.path().to_path_buf(),
-                file_selection: FileSelection {
-                    include_paths: vec!["src".into()],
+                filter: FileFilter {
                     globs: vec!["*.rs".into()],
-                    hidden: true,
-                    ..FileSelection::default()
+                    ..FileFilter::default()
                 },
                 index: IndexState::Uninitialized,
                 created_epoch_ms: 0,
@@ -1234,21 +1224,39 @@ mod tests {
             crate::domain::model::ModelConfig::default(),
         )
         .expect("manifest");
-        let mut options = IndexOptions {
-            discovery: DiscoveryOptions {
-                globs: vec!["*.md".into()],
-                ..DiscoveryOptions::default()
-            },
+        manifest.scan.hidden = true;
+        manifest.scan.max_depth = Some(3);
+        let mut options = IndexOptions::default();
+        assert_eq!(
+            super::resolve_filter(Some(&manifest), &options),
+            manifest.workspace.filter
+        );
+        assert_eq!(
+            super::resolve_scan(Some(&manifest), &options),
+            manifest.scan
+        );
+        options.filter.globs = Some(Vec::new());
+        options.scan.hidden = Some(false);
+        options.scan.max_depth = Some(None);
+        assert!(
+            super::resolve_filter(Some(&manifest), &options)
+                .globs
+                .is_empty()
+        );
+        let scan = super::resolve_scan(Some(&manifest), &options);
+        assert!(!scan.hidden);
+        assert_eq!(scan.max_depth, None);
+        options = IndexOptions {
+            reset_paths: true,
             ..IndexOptions::default()
         };
-        let resolved = super::resolve_discovery(Some(&manifest), &options);
-        assert_eq!(resolved.include_paths, ["src"]);
-        assert_eq!(resolved.globs, ["*.md"]);
-        assert!(resolved.hidden);
-        options.reset_paths = true;
         assert_eq!(
-            super::resolve_discovery(Some(&manifest), &options),
-            options.discovery
+            super::resolve_filter(Some(&manifest), &options),
+            FileFilter::default()
+        );
+        assert_eq!(
+            super::resolve_scan(Some(&manifest), &options),
+            crate::file_selection::ScanOptions::default()
         );
     }
 
@@ -1288,9 +1296,9 @@ mod tests {
                 &models,
                 IndexOptions {
                     root: Some(original.clone()),
-                    discovery: DiscoveryOptions {
-                        globs: vec!["*.rs".into()],
-                        ..DiscoveryOptions::default()
+                    filter: FileFilterUpdate {
+                        globs: Some(vec!["*.rs".into()]),
+                        ..FileFilterUpdate::default()
                     },
                     embedding: Some(EmbeddingModelSpec {
                         reference: "local/potion-code-16m-v2".into(),
@@ -1322,7 +1330,10 @@ mod tests {
             std::fs::canonicalize(&moved).expect("moved root")
         );
         assert_eq!(workspace.path, workspace.root.join(".zvec-grep"));
-        assert_eq!(workspace.discovery.globs, ["*.rs"]);
+        assert_eq!(
+            workspace.filter.globs,
+            vec![crate::domain::GlobRule::from("*.rs")]
+        );
         assert_eq!(info.status.expect("status").files_scanned, 0);
         service
             .index(
@@ -1338,10 +1349,7 @@ mod tests {
             .expect("manifest read")
             .expect("manifest");
         assert_eq!(after.workspace.name, before.workspace.name);
-        assert_eq!(
-            after.workspace.file_selection,
-            before.workspace.file_selection
-        );
+        assert_eq!(after.workspace.filter, before.workspace.filter);
         assert_eq!(after.workspace.root, moved);
         assert_eq!(
             service
@@ -1505,7 +1513,7 @@ mod tests {
             .expect("read")
             .expect("active");
         let mut target = active.clone();
-        target.workspace.file_selection.globs.push("*.rs".into());
+        target.workspace.filter.globs.push("*.rs".into());
         target.embedding_runtime.endpoint = Some("https://abandoned.test/embeddings".into());
         let abandoned = super::prepare_build(target, Some(&active)).expect("crashed build");
         std::fs::write(
@@ -1521,10 +1529,7 @@ mod tests {
             .expect("read")
             .expect("active");
         assert_eq!(updated.storage_generation, active.storage_generation);
-        assert_eq!(
-            updated.workspace.file_selection,
-            active.workspace.file_selection
-        );
+        assert_eq!(updated.workspace.filter, active.workspace.filter);
         assert_eq!(updated.embedding_runtime, active.embedding_runtime);
         assert!(!abandoned.target.storage_home().exists());
         assert!(!super::has_build(&home));
@@ -2254,7 +2259,7 @@ mod tests {
         let service = WorkspaceIndexService::with_storage_factory(factory.clone());
         let models = ModelRuntimeManager::new();
         let mut options = empty_index_options(directory.path());
-        options.discovery.include_paths = vec!["sources".into()];
+        options.filter.globs = Some(vec!["sources/**".into()]);
         options.embedding.as_mut().expect("local model").cache_dir =
             Some(directory.path().join("model-cache"));
         let result = service
@@ -2327,10 +2332,7 @@ mod tests {
             .expect("manifest");
         assert_eq!(rebuilt.index_version, Some(5));
         assert_eq!(rebuilt.workspace.root, manifest.workspace.root);
-        assert_eq!(
-            rebuilt.workspace.file_selection,
-            manifest.workspace.file_selection
-        );
+        assert_eq!(rebuilt.workspace.filter, manifest.workspace.filter);
         assert_eq!(rebuilt.embedding_runtime, manifest.embedding_runtime);
         assert_eq!(rebuilt.workspace.name, manifest.workspace.name);
         assert_eq!(

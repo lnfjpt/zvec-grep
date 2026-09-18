@@ -20,8 +20,9 @@ use super::{
     file_ids::FileIds,
     pending::{self, PendingChange, PendingChanges},
     spi::{
-        IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit, StoredSearchData,
-        WorkspaceIndexStorage, WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
+        IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit,
+        StoredFileAttributes, StoredSearchData, WorkspaceIndexStorage,
+        WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
     },
     zvec::NativeStore,
 };
@@ -309,6 +310,10 @@ impl WorkspaceIndexStorage for ZvecStorage {
 
     fn list_file_paths(&self) -> StorageResult<Vec<(FileId, PathBuf)>> {
         self.read(NativeStore::list_file_paths)
+    }
+
+    fn list_file_attributes(&self) -> StorageResult<Vec<StoredFileAttributes>> {
+        self.read(NativeStore::list_file_attributes)
     }
 
     fn resolve_file_ids(&self, paths: &[PathBuf]) -> StorageResult<Vec<FileId>> {

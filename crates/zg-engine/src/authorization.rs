@@ -579,7 +579,7 @@ mod tests {
         use crate::{
             api::context::{ContextOptions, options::RefreshPolicy},
             domain::{
-                FileSelection, IndexDescriptor, IndexState, Workspace,
+                FileFilter, IndexDescriptor, IndexState, Workspace,
                 model::{EmbeddingModelInfo, Metric, ModelConfig},
             },
             workspace::{build::prepare_build, manifest::write_workspace_manifest},
@@ -590,7 +590,7 @@ mod tests {
             Workspace {
                 name: "workspace".to_owned(),
                 root: directory.path().to_path_buf(),
-                file_selection: FileSelection::default(),
+                filter: FileFilter::default(),
                 index: IndexState::Enabled(IndexDescriptor {
                     fts: crate::domain::FTS_CONFIG,
                     embedding: EmbeddingModelInfo {

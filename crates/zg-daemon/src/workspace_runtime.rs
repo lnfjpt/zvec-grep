@@ -20,14 +20,16 @@ use zg_engine::{
     EngineError, ErrorSite, ZvecGrep,
     api::{
         context::{ContextOptions, ContextResult, options::RefreshPolicy},
-        index::{IndexOptions, IndexResult, options::WorkspaceChange as IndexChange},
+        index::{
+            IndexOptions, IndexResult,
+            options::{FileFilterUpdate, ScanOptionsUpdate, WorkspaceChange as IndexChange},
+        },
         info::{InfoOptions, InfoResult, result::IndexStatusSnapshot},
     },
 };
 use zg_host_native::{
-    DiscoveryOptions as HostDiscoveryOptions, HostError, HostErrorSite, NativeWatcherFactory,
-    RootSpec, TaskControl, WatchRequest, WorkspaceChange, WorkspaceWatchSessionPort,
-    WorkspaceWatcherFactoryPort,
+    AllowAllPaths, HostError, HostErrorSite, RootSpec, TaskControl, WatchRequest, WorkspaceChange,
+    WorkspaceWatchSessionPort, WorkspaceWatcherFactoryPort,
 };
 
 use crate::job_scheduler::{
@@ -56,6 +58,7 @@ struct RuntimeManagerInner {
 struct WorkspaceRuntime {
     canonical_root: PathBuf,
     index_template: Mutex<IndexOptions>,
+    pending_watcher_configuration: Mutex<Option<(uuid::Uuid, IndexOptions)>>,
     index_status: Mutex<CachedIndexStatus>,
     watcher: tokio::sync::Mutex<Option<WatcherHandle>>,
     watcher_active: AtomicBool,
@@ -110,6 +113,7 @@ impl WorkspaceRuntime {
 }
 
 struct WatcherHandle {
+    configured_job: Option<uuid::Uuid>,
     barrier: mpsc::Sender<oneshot::Sender<()>>,
     cancellation: CancellationToken,
     session: Arc<dyn WorkspaceWatchSessionPort>,
@@ -171,7 +175,25 @@ struct ZvecGrepIndexExecutor {
 #[async_trait::async_trait]
 impl IndexExecutor for ZvecGrepIndexExecutor {
     async fn index(&self, options: IndexOptions) -> Result<IndexResult, EngineError> {
-        self.engine.index(options).await
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let signal = options.signal.clone().unwrap_or_default();
+        loop {
+            let result = self.engine.index(options.clone()).await;
+            if !result
+                .as_ref()
+                .is_err_and(|error| error.code() == EngineError::RESOURCE_BUSY)
+                || tokio::time::Instant::now() >= deadline
+            {
+                return result;
+            }
+            // Resident reads may briefly own the lock. Retry only lock contention,
+            // retaining cancellation and the original one-operation request.
+            tokio::select! {
+                () = signal.cancelled() => return Err(EngineError::cancelled("index request was cancelled")),
+                () = tokio::time::sleep_until((tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(50)).min(deadline)) => {}
+            }
+        }
     }
 
     async fn drop_index(&self, options: InfoOptions) -> Result<bool, EngineError> {
@@ -179,11 +201,31 @@ impl IndexExecutor for ZvecGrepIndexExecutor {
     }
 }
 
+struct EngineWatcherFactory {
+    engine: Arc<ZvecGrep>,
+}
+
+#[async_trait::async_trait]
+impl WorkspaceWatcherFactoryPort for EngineWatcherFactory {
+    async fn watch(
+        &self,
+        request: &WatchRequest,
+        control: &TaskControl,
+    ) -> Result<Arc<dyn WorkspaceWatchSessionPort>, HostError> {
+        self.engine
+            .watch_workspace(&request.root.path, control)
+            .await
+            .map_err(|error| HostError::storage_failure("engine-file-selection", error.to_string()))
+    }
+}
+
 impl WorkspaceRuntimeManager {
     pub(crate) fn native(engine: Arc<ZvecGrep>) -> Self {
         Self::new(
-            Arc::new(ZvecGrepIndexExecutor { engine }),
-            Arc::new(NativeWatcherFactory::default()),
+            Arc::new(ZvecGrepIndexExecutor {
+                engine: Arc::clone(&engine),
+            }),
+            Arc::new(EngineWatcherFactory { engine }),
             SchedulerConfig::default(),
         )
     }
@@ -230,10 +272,10 @@ impl WorkspaceRuntimeManager {
         let canonical_root = canonical_root(options.root.as_deref())?;
         options.root = Some(canonical_root.clone());
         let runtime = self.runtime(canonical_root.clone(), &options);
-        let mut template = options.clone();
-        template.signal = None;
-        template.name = None;
-        *lock(&runtime.index_template) = template;
+        let reconfigure = options.reset_paths
+            || options.filter != FileFilterUpdate::default()
+            || options.scan != ScanOptionsUpdate::default();
+        let template = index_template(&options);
         runtime.invalidate_status();
         let target_revision = runtime.dirty_revision.load(Ordering::Acquire);
         let submitted = self
@@ -243,6 +285,7 @@ impl WorkspaceRuntimeManager {
         {
             let manager = self.clone();
             let job_id = submitted.job.id;
+            let template = template.clone();
             tokio::spawn(async move {
                 let Ok(completed) = manager.inner.scheduler.wait(job_id).await else {
                     return;
@@ -250,7 +293,7 @@ impl WorkspaceRuntimeManager {
                 manager.invalidate_status(&completed.job.canonical_root);
                 if completed.job.state == JobState::Succeeded {
                     let _ = manager
-                        .on_index_succeeded(completed.job, target_revision)
+                        .on_index_succeeded(completed.job, target_revision, template, reconfigure)
                         .await;
                 }
             });
@@ -271,10 +314,30 @@ impl WorkspaceRuntimeManager {
         runtime.invalidate_status();
         if completed.job.state == JobState::Succeeded
             && let Err(error) = self
-                .on_index_succeeded(completed.job.clone(), target_revision)
+                .on_index_succeeded(
+                    completed.job.clone(),
+                    target_revision,
+                    template,
+                    reconfigure,
+                )
                 .await
         {
             warn!(%error, root = %completed.job.canonical_root.display(), "index succeeded but watcher activation failed");
+        }
+        if completed.job.state == JobState::Succeeded {
+            // Policy installation acknowledges its reconciliation before returning.
+            // A caller waiting for indexing must not race that followup writer.
+            self.inner
+                .scheduler
+                .wait_for_root_idle(&runtime.canonical_root)
+                .await;
+            if let Err(error) = self.ensure_watching(Arc::clone(&runtime)).await {
+                warn!(%error, "index completed with pending watcher configuration");
+            }
+            self.inner
+                .scheduler
+                .wait_for_root_idle(&runtime.canonical_root)
+                .await;
         }
         Ok(submission(completed, submitted.reused))
     }
@@ -494,14 +557,11 @@ impl WorkspaceRuntimeManager {
     fn runtime(&self, canonical_root: PathBuf, options: &IndexOptions) -> Arc<WorkspaceRuntime> {
         let mut runtimes = lock(&self.inner.runtimes);
         Arc::clone(runtimes.entry(canonical_root.clone()).or_insert_with(|| {
-            let mut template = options.clone();
-            // Naming, cancellation, and progress observers belong to one request.
-            template.name = None;
-            template.signal = None;
-            template.on_progress = None;
+            let template = index_template(options);
             Arc::new(WorkspaceRuntime {
                 canonical_root,
                 index_template: Mutex::new(template),
+                pending_watcher_configuration: Mutex::new(None),
                 index_status: Mutex::new(CachedIndexStatus::default()),
                 watcher: tokio::sync::Mutex::new(None),
                 watcher_active: AtomicBool::new(false),
@@ -515,6 +575,8 @@ impl WorkspaceRuntimeManager {
         &self,
         job: IndexJobSnapshot,
         revision: u64,
+        template: IndexOptions,
+        reconfigure: bool,
     ) -> Result<(), WorkspaceRuntimeError> {
         let runtime = lock(&self.inner.runtimes).get(&job.canonical_root).cloned();
         let Some(runtime) = runtime else {
@@ -523,36 +585,89 @@ impl WorkspaceRuntimeManager {
         runtime
             .indexed_revision
             .fetch_max(revision, Ordering::AcqRel);
-        self.ensure_watching(runtime).await
+        let result = if reconfigure {
+            self.configure_watcher(Arc::clone(&runtime), Some((job.id, template)))
+                .await
+        } else {
+            *lock(&runtime.index_template) = template;
+            self.ensure_watching(Arc::clone(&runtime)).await
+        };
+        if result.is_err() {
+            // A successor may already hold the workspace write lock. Keep the old
+            // session alive and retry the pending policy after the writer drains.
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager
+                    .inner
+                    .scheduler
+                    .wait_for_root_idle(&runtime.canonical_root)
+                    .await;
+                if let Err(error) = manager.ensure_watching(runtime).await {
+                    warn!(%error, "pending watcher configuration could not be activated");
+                }
+            });
+        }
+        result
     }
 
-    async fn ensure_watching(
+    fn ensure_watching(
         &self,
         runtime: Arc<WorkspaceRuntime>,
+    ) -> futures::future::BoxFuture<'_, Result<(), WorkspaceRuntimeError>> {
+        // Watch completion may trigger replacement of its own session; erase the
+        // future type to break the configure -> watch loop -> configure type cycle.
+        Box::pin(self.configure_watcher(runtime, None))
+    }
+
+    async fn configure_watcher(
+        &self,
+        runtime: Arc<WorkspaceRuntime>,
+        completed: Option<(uuid::Uuid, IndexOptions)>,
     ) -> Result<(), WorkspaceRuntimeError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Ok(());
         }
         let mut watcher = runtime.watcher.lock().await;
-        if watcher.is_some() {
+        if let Some(completed) = completed {
+            *lock(&runtime.pending_watcher_configuration) = Some(completed);
+        }
+        let pending = lock(&runtime.pending_watcher_configuration).clone();
+        let configured_job = pending.as_ref().map(|(id, _)| *id);
+        if let Some(handle) = watcher.as_ref()
+            && !handle.task.is_finished()
+            && (configured_job.is_none() || handle.configured_job == configured_job)
+        {
+            lock(&runtime.pending_watcher_configuration).take();
             return Ok(());
         }
-        let template = lock(&runtime.index_template).clone();
         let cancellation = self.inner.shutdown.child_token();
         let session = self
             .inner
             .watcher_factory
             .watch(
                 &WatchRequest {
-                    root: RootSpec {
-                        path: runtime.canonical_root.clone(),
-                        recursive: true,
-                        discovery: host_discovery(&template),
-                    },
+                    // The native factory resolves saved engine policy; test factories
+                    // can still use this request solely as a root identifier.
+                    root: RootSpec::new(runtime.canonical_root.clone(), Arc::new(AllowAllPaths)),
                 },
                 &TaskControl::new(cancellation.clone()),
             )
             .await?;
+        // Prepare the new policy before retiring the current session. A failed
+        // initialization leaves the previous watcher running.
+        if let Some(previous) = watcher.take() {
+            previous.cancellation.cancel();
+            if let Err(error) = previous.session.close().await {
+                warn!(%error, "previous watcher close failed during replacement");
+            }
+            if let Err(error) = previous.task.await {
+                warn!(%error, "previous watcher task failed during replacement");
+            }
+        }
+        if let Some((_, template)) = pending {
+            *lock(&runtime.index_template) = template;
+            lock(&runtime.pending_watcher_configuration).take();
+        }
         runtime.watcher_active.store(true, Ordering::Release);
         let weak_inner = Arc::downgrade(&self.inner);
         let weak_runtime = Arc::downgrade(&runtime);
@@ -570,11 +685,26 @@ impl WorkspaceRuntimeManager {
             .await;
         });
         *watcher = Some(WatcherHandle {
+            configured_job,
             barrier,
             cancellation,
             session,
             task,
         });
+        // Cover the interval between indexing and installing a watcher, including
+        // first activation. A barrier ensures the daemon has queued the reconciliation.
+        if let Some(handle) = watcher.as_ref() {
+            handle.session.flush().await?;
+            let (acknowledge, acknowledged) = oneshot::channel();
+            handle
+                .barrier
+                .send(acknowledge)
+                .await
+                .map_err(|_| EngineError::resource_closed("workspace watcher has stopped"))?;
+            acknowledged.await.map_err(|_| {
+                EngineError::resource_closed("workspace watcher barrier was interrupted")
+            })?;
+        }
         Ok(())
     }
 
@@ -831,6 +961,9 @@ async fn watch_loop(
             continue;
         };
         let scheduler = inner.scheduler.clone();
+        let manager = WorkspaceRuntimeManager {
+            inner: Arc::clone(&inner),
+        };
         let weak_runtime = Arc::downgrade(&runtime);
         tokio::spawn(async move {
             let Ok(completed) = scheduler.wait(submitted.job.id).await else {
@@ -844,6 +977,9 @@ async fn watch_loop(
                 runtime
                     .indexed_revision
                     .fetch_max(target_revision, Ordering::AcqRel);
+                if let Err(error) = manager.ensure_watching(runtime).await {
+                    warn!(%error, "watch successor could not activate pending configuration");
+                }
             }
         });
     }
@@ -879,21 +1015,21 @@ fn canonical_root(root: Option<&Path>) -> Result<PathBuf, WorkspaceRuntimeError>
     })
 }
 
-fn host_discovery(options: &IndexOptions) -> HostDiscoveryOptions {
-    HostDiscoveryOptions {
-        include_paths: options.discovery.include_paths.clone(),
-        exclude_paths: options.discovery.exclude_paths.clone(),
-        globs: options.discovery.globs.clone(),
-        insensitive_globs: options.discovery.insensitive_globs.clone(),
-        file_types: options.discovery.file_types.clone(),
-        excluded_file_types: options.discovery.excluded_file_types.clone(),
-        hidden: options.discovery.hidden,
-        no_ignore: options.discovery.no_ignore,
-        ignore_files: options.discovery.ignore_files.clone(),
-        max_depth: options.discovery.max_depth,
-        max_file_size_bytes: options.discovery.max_file_size_bytes,
-        follow: options.discovery.follow,
-    }
+fn index_template(options: &IndexOptions) -> IndexOptions {
+    let mut template = options.clone();
+    // Saved workspace settings are authoritative for subsequent watch jobs.
+    // Configuration patches and one-operation controls must never be replayed.
+    template.name = None;
+    template.signal = None;
+    template.on_progress = None;
+    template.allow_remote = false;
+    template.rebuild = false;
+    template.reset_paths = false;
+    template.changes.clear();
+    template.filter = FileFilterUpdate::default();
+    template.scan = ScanOptionsUpdate::default();
+    template.embedding = None;
+    template
 }
 
 fn map_change(change: WorkspaceChange) -> IndexChange {
@@ -965,7 +1101,7 @@ mod tests {
         path::PathBuf,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
@@ -990,6 +1126,7 @@ mod tests {
     struct RecordingExecutor {
         calls: Mutex<Vec<IndexOptions>>,
         drops: AtomicUsize,
+        fail: AtomicBool,
     }
 
     struct FailingExecutor;
@@ -1008,6 +1145,9 @@ mod tests {
                 .lock()
                 .expect("calls should be writable")
                 .push(options);
+            if self.fail.load(Ordering::Acquire) {
+                return Err(EngineError::internal("fixture index failed"));
+            }
             Ok(IndexResult::default())
         }
 
@@ -1018,13 +1158,13 @@ mod tests {
     }
 
     struct ManualWatcherFactory {
-        receiver: Mutex<Option<mpsc::Receiver<WorkspaceChangeBatch>>>,
+        receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<WorkspaceChangeBatch>>>,
         watches: Mutex<Vec<WatchRequest>>,
         closes: Arc<AtomicUsize>,
     }
 
     struct ManualWatchSession {
-        receiver: tokio::sync::Mutex<mpsc::Receiver<WorkspaceChangeBatch>>,
+        receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<WorkspaceChangeBatch>>>,
         closes: Arc<AtomicUsize>,
     }
 
@@ -1039,14 +1179,8 @@ mod tests {
                 .lock()
                 .expect("watches should be writable")
                 .push(request.clone());
-            let receiver = self
-                .receiver
-                .lock()
-                .expect("receiver should be writable")
-                .take()
-                .expect("only one watcher should be created");
             Ok(Arc::new(ManualWatchSession {
-                receiver: tokio::sync::Mutex::new(receiver),
+                receiver: Arc::clone(&self.receiver),
                 closes: Arc::clone(&self.closes),
             }))
         }
@@ -1072,6 +1206,30 @@ mod tests {
         async fn close(&self) -> Result<(), HostError> {
             self.closes.fetch_add(1, Ordering::AcqRel);
             Ok(())
+        }
+    }
+
+    struct BusyWatcherFactory {
+        inner: ManualWatcherFactory,
+        busy: AtomicBool,
+        blocked: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl WorkspaceWatcherFactoryPort for BusyWatcherFactory {
+        async fn watch(
+            &self,
+            request: &WatchRequest,
+            control: &TaskControl,
+        ) -> Result<Arc<dyn WorkspaceWatchSessionPort>, HostError> {
+            if self.busy.load(Ordering::Acquire) {
+                self.blocked.notify_one();
+                return Err(HostError::storage_failure(
+                    "engine-file-selection",
+                    "workspace is locked by successor",
+                ));
+            }
+            self.inner.watch(request, control).await
         }
     }
 
@@ -1169,7 +1327,7 @@ mod tests {
         let manager = WorkspaceRuntimeManager::new(
             Arc::new(FailingExecutor),
             Arc::new(ManualWatcherFactory {
-                receiver: Mutex::new(Some(receiver)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
                 watches: Mutex::new(Vec::new()),
                 closes: Arc::new(AtomicUsize::new(0)),
             }),
@@ -1201,7 +1359,7 @@ mod tests {
         let manager = WorkspaceRuntimeManager::new(
             Arc::new(FailingExecutor),
             Arc::new(ManualWatcherFactory {
-                receiver: Mutex::new(Some(receiver)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
                 watches: Mutex::new(Vec::new()),
                 closes: Arc::new(AtomicUsize::new(0)),
             }),
@@ -1234,7 +1392,7 @@ mod tests {
         let manager = WorkspaceRuntimeManager::new(
             executor.clone(),
             Arc::new(ManualWatcherFactory {
-                receiver: Mutex::new(Some(receiver)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
                 watches: Mutex::new(Vec::new()),
                 closes: Arc::new(AtomicUsize::new(0)),
             }),
@@ -1277,7 +1435,7 @@ mod tests {
         let manager = WorkspaceRuntimeManager::new(
             executor.clone(),
             Arc::new(ManualWatcherFactory {
-                receiver: Mutex::new(Some(receiver)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
                 watches: Mutex::new(Vec::new()),
                 closes: Arc::new(AtomicUsize::new(0)),
             }),
@@ -1343,7 +1501,7 @@ mod tests {
         let executor = Arc::new(RecordingExecutor::default());
         let (sender, receiver) = mpsc::channel(4);
         let watchers = Arc::new(ManualWatcherFactory {
-            receiver: Mutex::new(Some(receiver)),
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             watches: Mutex::new(Vec::new()),
             closes: Arc::new(AtomicUsize::new(0)),
         });
@@ -1447,7 +1605,7 @@ mod tests {
         let workspace = tempdir().expect("workspace should be created");
         let (_sender, receiver) = mpsc::channel(1);
         let watchers = Arc::new(ManualWatcherFactory {
-            receiver: Mutex::new(Some(receiver)),
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             watches: Mutex::new(Vec::new()),
             closes: Arc::new(AtomicUsize::new(0)),
         });
@@ -1485,7 +1643,7 @@ mod tests {
         let executor = Arc::new(RecordingExecutor::default());
         let (_sender, receiver) = mpsc::channel(1);
         let watchers = Arc::new(ManualWatcherFactory {
-            receiver: Mutex::new(Some(receiver)),
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             watches: Mutex::new(Vec::new()),
             closes: Arc::new(AtomicUsize::new(0)),
         });
@@ -1525,7 +1683,7 @@ mod tests {
         let executor = Arc::new(RecordingExecutor::default());
         let (_sender, receiver) = mpsc::channel(1);
         let watchers = Arc::new(ManualWatcherFactory {
-            receiver: Mutex::new(Some(receiver)),
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             watches: Mutex::new(Vec::new()),
             closes: Arc::new(AtomicUsize::new(0)),
         });
@@ -1545,5 +1703,239 @@ mod tests {
         assert_eq!(watchers.closes.load(Ordering::Acquire), 1);
         assert_eq!(manager.snapshot().active_runtimes, 0);
         assert!(manager.submit_index(options, false).await.is_err());
+    }
+    #[tokio::test]
+    async fn manual_updates_replace_the_watcher_once_without_replaying_configuration() {
+        use zg_engine::api::index::options::{FileFilterUpdate, ScanOptionsUpdate};
+        let workspace = tempdir().expect("workspace");
+        let root = workspace.path().canonicalize().expect("root");
+        let executor = Arc::new(RecordingExecutor::default());
+        let (sender, receiver) = mpsc::channel(4);
+        let watchers = Arc::new(ManualWatcherFactory {
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            watches: Mutex::new(Vec::new()),
+            closes: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = WorkspaceRuntimeManager::new(
+            executor.clone(),
+            watchers.clone(),
+            SchedulerConfig::default(),
+        );
+        manager
+            .submit_index(
+                IndexOptions {
+                    root: Some(root.clone()),
+                    ..IndexOptions::default()
+                },
+                true,
+            )
+            .await
+            .expect("initial index");
+        manager
+            .submit_index(
+                IndexOptions {
+                    root: Some(root.clone()),
+                    rebuild: true,
+                    reset_paths: true,
+                    allow_remote: true,
+                    filter: FileFilterUpdate {
+                        globs: Some(vec!["*.rs".into()]),
+                        ..FileFilterUpdate::default()
+                    },
+                    scan: ScanOptionsUpdate {
+                        hidden: Some(false),
+                        max_depth: Some(None),
+                        ..ScanOptionsUpdate::default()
+                    },
+                    ..IndexOptions::default()
+                },
+                true,
+            )
+            .await
+            .expect("manual reconfiguration");
+        assert_eq!(watchers.watches.lock().expect("watches").len(), 2);
+        assert_eq!(watchers.closes.load(Ordering::Acquire), 1);
+        sender
+            .send(WorkspaceChangeBatch {
+                changes: vec![WorkspaceChange::Upsert("changed.rs".into())],
+            })
+            .await
+            .expect("watch change");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while executor.calls.lock().expect("calls").len() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watch job starts");
+        manager.inner.scheduler.wait_for_root_idle(&root).await;
+        {
+            let calls = executor.calls.lock().expect("calls");
+            let watched = &calls[2];
+            assert_eq!(watched.filter, FileFilterUpdate::default());
+            assert_eq!(watched.scan, ScanOptionsUpdate::default());
+            assert!(!watched.rebuild);
+            assert!(!watched.reset_paths);
+            assert!(!watched.allow_remote);
+            assert_eq!(
+                watched.changes,
+                vec![IndexChange::Upsert("changed.rs".into())]
+            );
+        }
+        assert_eq!(
+            watchers.watches.lock().expect("watches").len(),
+            2,
+            "watch completion must not restart its own session"
+        );
+        manager.shutdown_all().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn pending_policy_retries_after_a_busy_successor_without_losing_the_old_watcher() {
+        use zg_engine::api::index::options::ScanOptionsUpdate;
+        let workspace = tempdir().expect("workspace");
+        let root = workspace.path().canonicalize().expect("root");
+        let (started, mut calls) = mpsc::unbounded_channel();
+        let executor = Arc::new(GatedExecutor {
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (_sender, receiver) = mpsc::channel(4);
+        let watchers = Arc::new(BusyWatcherFactory {
+            inner: ManualWatcherFactory {
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                watches: Mutex::new(Vec::new()),
+                closes: Arc::new(AtomicUsize::new(0)),
+            },
+            busy: AtomicBool::new(false),
+            blocked: tokio::sync::Notify::new(),
+        });
+        let manager = WorkspaceRuntimeManager::new(
+            executor.clone(),
+            watchers.clone(),
+            SchedulerConfig::default(),
+        );
+        let runtime = manager.runtime(root.clone(), &IndexOptions::default());
+        manager
+            .ensure_watching(runtime.clone())
+            .await
+            .expect("old watcher");
+        watchers.busy.store(true, Ordering::Release);
+        manager
+            .submit_index(
+                IndexOptions {
+                    root: Some(root.clone()),
+                    embedding_concurrency: Some(5),
+                    scan: ScanOptionsUpdate {
+                        hidden: Some(true),
+                        ..ScanOptionsUpdate::default()
+                    },
+                    ..IndexOptions::default()
+                },
+                false,
+            )
+            .await
+            .expect("manual reconfiguration");
+        calls.recv().await.expect("manual writer starts");
+        let successor = manager
+            .inner
+            .scheduler
+            .submit(
+                root.clone(),
+                IndexOptions {
+                    root: Some(root.clone()),
+                    changes: vec![IndexChange::Rescan],
+                    ..IndexOptions::default()
+                },
+                crate::job_scheduler::JobReason::Watch,
+            )
+            .expect("watch successor");
+        executor.release.add_permits(1);
+        calls.recv().await.expect("successor starts");
+        tokio::time::timeout(Duration::from_secs(2), watchers.blocked.notified())
+            .await
+            .expect("policy refresh observes busy writer");
+        assert_eq!(watchers.inner.closes.load(Ordering::Acquire), 0);
+        assert!(super::lock(&runtime.pending_watcher_configuration).is_some());
+        watchers.busy.store(false, Ordering::Release);
+        executor.release.add_permits(1);
+        manager
+            .inner
+            .scheduler
+            .wait(successor.job.id)
+            .await
+            .expect("successor completes");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while watchers.inner.watches.lock().expect("watches").len() < 2
+                || super::lock(&runtime.pending_watcher_configuration).is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending policy is retried after idle");
+        assert_eq!(watchers.inner.closes.load(Ordering::Acquire), 1);
+        assert_eq!(
+            super::lock(&runtime.index_template).embedding_concurrency,
+            Some(5)
+        );
+        assert!(super::lock(&runtime.pending_watcher_configuration).is_none());
+        manager.shutdown_all().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn failed_manual_update_preserves_the_live_watcher_and_execution_template() {
+        use zg_engine::api::index::options::ScanOptionsUpdate;
+        let workspace = tempdir().expect("workspace");
+        let root = workspace.path().canonicalize().expect("root");
+        let executor = Arc::new(RecordingExecutor::default());
+        let (_sender, receiver) = mpsc::channel(4);
+        let watchers = Arc::new(ManualWatcherFactory {
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            watches: Mutex::new(Vec::new()),
+            closes: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = WorkspaceRuntimeManager::new(
+            executor.clone(),
+            watchers.clone(),
+            SchedulerConfig::default(),
+        );
+        manager
+            .submit_index(
+                IndexOptions {
+                    root: Some(root.clone()),
+                    embedding_concurrency: Some(2),
+                    ..IndexOptions::default()
+                },
+                true,
+            )
+            .await
+            .expect("initial index");
+        executor.fail.store(true, Ordering::Release);
+        let failed = manager
+            .submit_index(
+                IndexOptions {
+                    root: Some(root.clone()),
+                    embedding_concurrency: Some(99),
+                    scan: ScanOptionsUpdate {
+                        hidden: Some(true),
+                        ..ScanOptionsUpdate::default()
+                    },
+                    ..IndexOptions::default()
+                },
+                true,
+            )
+            .await
+            .expect("failed result");
+        assert_eq!(failed.job.state, crate::job_scheduler::JobState::Failed);
+        assert_eq!(watchers.watches.lock().expect("watches").len(), 1);
+        assert_eq!(watchers.closes.load(Ordering::Acquire), 0);
+        let runtime = manager.runtime(root.clone(), &IndexOptions::default());
+        assert_eq!(
+            super::lock(&runtime.index_template).embedding_concurrency,
+            Some(2)
+        );
+        assert!(manager.runtime_snapshot(&root).watcher_active);
+        manager.shutdown_all().await.expect("shutdown");
     }
 }

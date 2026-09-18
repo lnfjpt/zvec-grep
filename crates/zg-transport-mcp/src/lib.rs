@@ -37,7 +37,10 @@ use zg_engine::{
         },
         index::{
             IndexOptions,
-            options::{Device, DiscoveryOptions as IndexDiscoveryOptions, EmbeddingModelSpec},
+            options::{
+                Device, EmbeddingModelSpec, FileCategory, FileFilter, FileFilterUpdate, FileFormat,
+                GlobRule, ScanOptions, ScanOptionsUpdate, deserialize_optional_update,
+            },
         },
         info::{
             InfoOptions, InfoResult,
@@ -536,8 +539,35 @@ impl ServerHandler for ZvecGrepMcpServer {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GlobInput {
+    #[schemars(length(min = 1, max = 1024))]
+    pub pattern: String,
+    #[serde(default)]
+    pub case_insensitive: bool,
+}
+
+impl From<GlobInput> for GlobRule {
+    fn from(value: GlobInput) -> Self {
+        Self {
+            pattern: value.pattern,
+            case_insensitive: value.case_insensitive,
+        }
+    }
+}
+
+impl From<GlobRule> for GlobInput {
+    fn from(value: GlobRule) -> Self {
+        Self {
+            pattern: value.pattern,
+            case_insensitive: value.case_insensitive,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchInput {
     /// Absolute workspace root visible to the daemon.
     #[schemars(length(min = 1, max = 1024))]
@@ -559,27 +589,15 @@ pub struct SearchInput {
     /// Maximum returned items per query group or fused plan.
     #[schemars(range(min = 1, max = 50))]
     pub limit: Option<usize>,
-    /// Ordered case-sensitive rg-style glob rules.
-    pub globs: Option<PathListInput>,
-    /// Ordered case-insensitive rg-style glob rules.
-    pub insensitive_globs: Option<PathListInput>,
-    /// Included ripgrep file type names.
-    pub file_types: Option<PathListInput>,
-    /// Excluded ripgrep file type names.
-    pub excluded_file_types: Option<PathListInput>,
-    /// Include hidden paths.
-    pub hidden: Option<bool>,
-    /// Ignore repository ignore files.
-    pub no_ignore: Option<bool>,
-    /// Additional ignore files relative to the workspace root.
-    pub ignore_files: Option<PathListInput>,
-    /// Maximum recursive directory depth.
-    pub max_depth: Option<usize>,
-    /// Maximum indexed file size in bytes.
-    #[schemars(range(min = 1))]
-    pub max_file_size_bytes: Option<u64>,
-    /// Follow symbolic links.
-    pub follow: Option<bool>,
+    /// Ordered path glob rules; later matching rules take precedence.
+    #[schemars(length(max = 128))]
+    pub globs: Option<Vec<GlobInput>>,
+    /// Included engine file formats, such as rust or markdown.
+    pub formats: Option<PathListInput>,
+    pub excluded_formats: Option<PathListInput>,
+    /// Included engine file categories, such as code or document.
+    pub categories: Option<PathListInput>,
+    pub excluded_categories: Option<PathListInput>,
     /// Embedding requests processed concurrently during updates.
     #[schemars(range(min = 1))]
     pub embedding_concurrency: Option<usize>,
@@ -606,7 +624,7 @@ pub struct SearchInput {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IndexInput {
     /// Absolute workspace root visible to the daemon.
     #[schemars(length(min = 1, max = 1024))]
@@ -630,16 +648,22 @@ pub struct IndexInput {
     pub rebuild: Option<bool>,
     /// Replace the index root-path configuration.
     pub reset_paths: Option<bool>,
-    pub globs: Option<PathListInput>,
-    pub insensitive_globs: Option<PathListInput>,
-    pub file_types: Option<PathListInput>,
-    pub excluded_file_types: Option<PathListInput>,
+    #[schemars(length(max = 128))]
+    pub globs: Option<Vec<GlobInput>>,
+    pub formats: Option<PathListInput>,
+    pub excluded_formats: Option<PathListInput>,
+    pub categories: Option<PathListInput>,
+    pub excluded_categories: Option<PathListInput>,
     pub hidden: Option<bool>,
     pub no_ignore: Option<bool>,
+    /// Whether indexing scans nested Git repositories and submodules.
+    pub nested_git: Option<bool>,
     pub ignore_files: Option<PathListInput>,
-    pub max_depth: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_optional_update")]
+    pub max_depth: Option<Option<usize>>,
     #[schemars(range(min = 1))]
-    pub max_file_size_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_update")]
+    pub max_file_size_bytes: Option<Option<u64>>,
     pub follow: Option<bool>,
     /// Embedding batch tasks processed concurrently during this update.
     #[schemars(range(min = 1))]
@@ -819,21 +843,20 @@ struct RootSpecOutput {
     absolute_path: String,
     recursive: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    include: Vec<String>,
+    globs: Vec<GlobInput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    exclude: Vec<String>,
+    formats: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    globs: Vec<String>,
+    excluded_formats: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    insensitive_globs: Vec<String>,
+    categories: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    file_types: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    excluded_file_types: Vec<String>,
+    excluded_categories: Vec<String>,
     #[serde(skip_serializing_if = "is_false")]
     hidden: bool,
     #[serde(skip_serializing_if = "is_false")]
     no_ignore: bool,
+    nested_git: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ignore_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -994,6 +1017,59 @@ const fn default_auto_update() -> bool {
     true
 }
 
+fn normalize_globs(input: Option<Vec<GlobInput>>) -> Result<Option<Vec<GlobRule>>, String> {
+    input
+        .map(|rules| {
+            if rules.len() > MAX_PATH_FILTERS {
+                return Err(format!("globs accepts at most {MAX_PATH_FILTERS} values"));
+            }
+            for rule in &rules {
+                validate_text("glob pattern", &rule.pattern, 1, MAX_PATH_CHARS)?;
+            }
+            Ok(rules.into_iter().map(Into::into).collect())
+        })
+        .transpose()
+}
+
+fn normalize_formats(
+    input: Option<PathListInput>,
+    field: &str,
+) -> Result<Option<Vec<FileFormat>>, String> {
+    normalize_filter_names(input, field, FileFormat::parse)
+}
+
+fn normalize_categories(
+    input: Option<PathListInput>,
+    field: &str,
+) -> Result<Option<Vec<FileCategory>>, String> {
+    normalize_filter_names(input, field, FileCategory::parse)
+}
+
+fn normalize_filter_names<T>(
+    input: Option<PathListInput>,
+    field: &str,
+    parse: fn(&str) -> Option<T>,
+) -> Result<Option<Vec<T>>, String> {
+    input
+        .map(|input| {
+            let values = match input {
+                PathListInput::One(value) => vec![value],
+                PathListInput::Many(values) => values,
+            };
+            if values.len() > MAX_PATH_FILTERS {
+                return Err(format!("{field} accepts at most {MAX_PATH_FILTERS} values"));
+            }
+            values
+                .into_iter()
+                .map(|value| {
+                    validate_text(field, &value, 1, MAX_PATH_CHARS)?;
+                    parse(&value).ok_or_else(|| format!("unknown {field} value {value:?}"))
+                })
+                .collect()
+        })
+        .transpose()
+}
+
 impl SearchInput {
     fn into_request(self) -> Result<ContextOptions, String> {
         let root = absolute_root(&self.root)?;
@@ -1008,9 +1084,6 @@ impl SearchInput {
         }
         if self.embedding_concurrency == Some(0) {
             return Err("embeddingConcurrency must be greater than zero".to_owned());
-        }
-        if self.max_file_size_bytes == Some(0) {
-            return Err("maxFileSizeBytes must be greater than zero".to_owned());
         }
         if self.symbol_types.len() > 7 {
             return Err("symbolTypes accepts at most 7 values".to_owned());
@@ -1037,10 +1110,6 @@ impl SearchInput {
             .collect();
         let auto_update =
             self.auto_update || matches!(self.freshness, FreshnessInput::WaitForFresh);
-        let ignore_files = normalize_path_list(self.ignore_files, "ignoreFiles")?
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
 
         let request = ContextOptions {
             query: None,
@@ -1060,19 +1129,19 @@ impl SearchInput {
             trace: self.trace.unwrap_or(false),
             prefer_symbol: self.prefer_symbol.unwrap_or(false),
             symbol_types: self.symbol_types.into_iter().map(Into::into).collect(),
-            globs: normalize_path_list(self.globs, "globs")?,
-            insensitive_globs: normalize_path_list(self.insensitive_globs, "insensitiveGlobs")?,
-            file_types: normalize_path_list(self.file_types, "fileTypes")?,
-            excluded_file_types: normalize_path_list(
-                self.excluded_file_types,
-                "excludedFileTypes",
-            )?,
-            hidden: self.hidden.unwrap_or(false),
-            no_ignore: self.no_ignore.unwrap_or(false),
-            ignore_files,
-            max_depth: self.max_depth,
-            max_file_size_bytes: self.max_file_size_bytes,
-            follow: self.follow.unwrap_or(false),
+            filter: FileFilter {
+                globs: normalize_globs(self.globs)?.unwrap_or_default(),
+                formats: normalize_formats(self.formats, "formats")?.unwrap_or_default(),
+                excluded_formats: normalize_formats(self.excluded_formats, "excludedFormats")?
+                    .unwrap_or_default(),
+                categories: normalize_categories(self.categories, "categories")?
+                    .unwrap_or_default(),
+                excluded_categories: normalize_categories(
+                    self.excluded_categories,
+                    "excludedCategories",
+                )?
+                .unwrap_or_default(),
+            },
             modified_after_epoch_ms: parse_optional_time(self.modified_after, "modifiedAfter")?,
             modified_before_epoch_ms: parse_optional_time(self.modified_before, "modifiedBefore")?,
             api_key: self.api_key,
@@ -1087,7 +1156,6 @@ impl SearchInput {
         {
             return Err("modifiedAfter must not be later than modifiedBefore".to_owned());
         }
-        validate_scoped_paths(&root, &request.ignore_files, "ignore file")?;
         Ok(request)
     }
 }
@@ -1125,7 +1193,7 @@ impl IndexInput {
         if self.embedding_concurrency == Some(0) {
             return Err("embeddingConcurrency must be greater than zero".to_owned());
         }
-        if self.max_file_size_bytes == Some(0) {
+        if self.max_file_size_bytes == Some(Some(0)) {
             return Err("maxFileSizeBytes must be greater than zero".to_owned());
         }
         if let Some(endpoint) = &self.endpoint {
@@ -1138,26 +1206,34 @@ impl IndexInput {
             return Err("device requires an explicit embedding model".to_owned());
         }
 
-        let discovery = IndexDiscoveryOptions {
-            globs: normalize_path_list(self.globs, "globs")?,
-            insensitive_globs: normalize_path_list(self.insensitive_globs, "insensitiveGlobs")?,
-            file_types: normalize_path_list(self.file_types, "fileTypes")?,
-            excluded_file_types: normalize_path_list(
-                self.excluded_file_types,
-                "excludedFileTypes",
+        let filter = FileFilterUpdate {
+            globs: normalize_globs(self.globs)?,
+            formats: normalize_formats(self.formats, "formats")?,
+            excluded_formats: normalize_formats(self.excluded_formats, "excludedFormats")?,
+            categories: normalize_categories(self.categories, "categories")?,
+            excluded_categories: normalize_categories(
+                self.excluded_categories,
+                "excludedCategories",
             )?,
-            hidden: self.hidden.unwrap_or(false),
-            no_ignore: self.no_ignore.unwrap_or(false),
-            ignore_files: normalize_path_list(self.ignore_files, "ignoreFiles")?
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
+        };
+        let scan = ScanOptionsUpdate {
+            hidden: self.hidden,
+            no_ignore: self.no_ignore,
+            nested_git: self.nested_git,
+            ignore_files: self
+                .ignore_files
+                .map(|paths| {
+                    normalize_path_list(Some(paths), "ignoreFiles")
+                        .map(|paths| paths.into_iter().map(PathBuf::from).collect())
+                })
+                .transpose()?,
             max_depth: self.max_depth,
             max_file_size_bytes: self.max_file_size_bytes,
-            follow: self.follow.unwrap_or(false),
-            ..IndexDiscoveryOptions::default()
+            follow: self.follow,
         };
-        validate_scoped_paths(&root, &discovery.ignore_files, "ignore file")?;
+        if let Some(paths) = &scan.ignore_files {
+            validate_scoped_paths(&root, paths, "ignore file")?;
+        }
         let embedding = if let Some(reference) = self.embedding {
             let reference = reference.trim().to_owned();
             validate_text("embedding", &reference, 1, 256)?;
@@ -1177,7 +1253,8 @@ impl IndexInput {
                 name: self.name,
                 rebuild: self.rebuild.unwrap_or(false),
                 reset_paths: self.reset_paths.unwrap_or(false),
-                discovery,
+                filter,
+                scan,
                 embedding,
                 api_key: self.api_key,
                 embedding_concurrency: self.embedding_concurrency,
@@ -1197,11 +1274,13 @@ impl IndexInput {
             || self.rebuild.is_some()
             || self.reset_paths.is_some()
             || self.globs.is_some()
-            || self.insensitive_globs.is_some()
-            || self.file_types.is_some()
-            || self.excluded_file_types.is_some()
+            || self.formats.is_some()
+            || self.excluded_formats.is_some()
+            || self.categories.is_some()
+            || self.excluded_categories.is_some()
             || self.hidden.is_some()
             || self.no_ignore.is_some()
+            || self.nested_git.is_some()
             || self.ignore_files.is_some()
             || self.max_depth.is_some()
             || self.max_file_size_bytes.is_some()
@@ -1576,7 +1655,7 @@ impl From<InfoResult> for IndexStatusOutput {
         let workspace_index = reply.workspace_index.map(|info| WorkspaceIndexOutput {
             name: info.name,
             path: info.path.display().to_string(),
-            root_paths: vec![RootSpecOutput::new(&info.root, info.discovery)],
+            root_paths: vec![RootSpecOutput::new(&info.root, info.filter, info.scan)],
             embedding: info.embedding.map(|embedding| IndexedEmbeddingOutput {
                 provider: embedding.provider,
                 model: embedding.model,
@@ -1687,26 +1766,42 @@ const fn index_job_state(state: IndexOperationState) -> IndexJobState {
 }
 
 impl RootSpecOutput {
-    fn new(root: &Path, discovery: IndexDiscoveryOptions) -> Self {
+    fn new(root: &Path, filter: FileFilter, scan: ScanOptions) -> Self {
         Self {
             absolute_path: root.display().to_string(),
             recursive: true,
-            include: discovery.include_paths,
-            exclude: discovery.exclude_paths,
-            globs: discovery.globs,
-            insensitive_globs: discovery.insensitive_globs,
-            file_types: discovery.file_types,
-            excluded_file_types: discovery.excluded_file_types,
-            hidden: discovery.hidden,
-            no_ignore: discovery.no_ignore,
-            ignore_files: discovery
+            globs: filter.globs.into_iter().map(Into::into).collect(),
+            formats: filter
+                .formats
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect(),
+            excluded_formats: filter
+                .excluded_formats
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect(),
+            categories: filter
+                .categories
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect(),
+            excluded_categories: filter
+                .excluded_categories
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect(),
+            hidden: scan.hidden,
+            no_ignore: scan.no_ignore,
+            nested_git: scan.nested_git,
+            ignore_files: scan
                 .ignore_files
                 .into_iter()
                 .map(|path| path.display().to_string())
                 .collect(),
-            max_depth: discovery.max_depth,
-            max_file_size_bytes: discovery.max_file_size_bytes,
-            follow: discovery.follow,
+            max_depth: scan.max_depth,
+            max_file_size_bytes: scan.max_file_size_bytes,
+            follow: scan.follow,
         }
     }
 }
@@ -1847,8 +1942,8 @@ mod tests {
 
     use super::{
         AGENT_TOOL_NAME, FULL_TOOL_NAMES, FreshnessInput, IndexInput, IndexToolRequest,
-        PathListInput, QueryListInput, RgInput, SearchInput, ServerStatusProvider,
-        ServerStatusSnapshot, ZvecGrepMcpServer, error_result,
+        QueryListInput, RgInput, SearchInput, ServerStatusProvider, ServerStatusSnapshot,
+        ZvecGrepMcpServer, error_result,
     };
 
     struct FixedStatus;
@@ -1876,16 +1971,15 @@ mod tests {
             fts: Some(QueryListInput::One("run".to_owned())),
             vector: None,
             limit: Some(8),
-            globs: Some(PathListInput::Many(vec!["*.rs".to_owned()])),
-            insensitive_globs: None,
-            file_types: None,
-            excluded_file_types: None,
-            hidden: Some(true),
-            no_ignore: None,
-            ignore_files: None,
-            max_depth: None,
-            max_file_size_bytes: None,
-            follow: None,
+            globs: Some(vec![super::GlobInput {
+                pattern: "*.rs".to_owned(),
+                case_insensitive: false,
+            }]),
+            formats: None,
+            excluded_formats: None,
+            categories: None,
+            excluded_categories: None,
+
             embedding_concurrency: Some(2),
             fuse: Some(true),
             prefer_symbol: Some(true),
@@ -1930,7 +2024,8 @@ mod tests {
                 name: "search-engine".to_owned(),
                 path: root.join(".zvec-grep"),
                 root,
-                discovery: super::IndexDiscoveryOptions::default(),
+                filter: super::FileFilter::default(),
+                scan: super::ScanOptions::default(),
                 policy: super::WorkspaceIndexPolicy::Enabled,
                 embedding: None,
                 fts: Some(zg_engine::api::info::result::WorkspaceIndexFts {
@@ -1995,7 +2090,7 @@ mod tests {
         assert_eq!(request.queries, ["call chain"]);
         assert_eq!(request.routes.len(), 1);
         assert!(request.auto_update);
-        assert_eq!(request.globs, ["*.rs"]);
+        assert_eq!(request.filter.globs[0].pattern, "*.rs");
         assert!(request.fuse);
         assert!(request.prefer_symbol);
         assert!(request.trace);
@@ -2093,6 +2188,97 @@ mod tests {
     }
 
     #[test]
+    fn index_updates_preserve_omitted_empty_false_and_null_values() {
+        let parsed: IndexInput = serde_json::from_value(serde_json::json!({
+            "root": test_root(), "globs": [], "formats": [], "categories": [],
+            "hidden": false, "follow": false, "nestedGit": false, "ignoreFiles": [],
+            "maxDepth": null, "maxFileSizeBytes": null
+        }))
+        .expect("valid test fixture");
+        let IndexToolRequest::Index { options, .. } =
+            parsed.into_request().expect("valid test fixture")
+        else {
+            panic!("index");
+        };
+        assert_eq!(options.filter.globs, Some(Vec::new()));
+        assert_eq!(options.filter.formats, Some(Vec::new()));
+        assert_eq!(options.filter.categories, Some(Vec::new()));
+        assert_eq!(options.filter.excluded_formats, None);
+        assert_eq!(options.scan.hidden, Some(false));
+        assert_eq!(options.scan.follow, Some(false));
+        assert_eq!(options.scan.nested_git, Some(false));
+        assert_eq!(options.scan.no_ignore, None);
+        assert_eq!(options.scan.ignore_files, Some(Vec::new()));
+        assert_eq!(options.scan.max_depth, Some(None));
+        assert_eq!(options.scan.max_file_size_bytes, Some(None));
+    }
+
+    #[test]
+    fn nested_git_is_index_only_and_status_preserves_both_boolean_values() {
+        for value in [true, false] {
+            let input: IndexInput = serde_json::from_value(serde_json::json!({
+                "root": test_root(), "nestedGit": value
+            }))
+            .expect("index input");
+            let IndexToolRequest::Index { options, .. } =
+                input.into_request().expect("index request")
+            else {
+                panic!("index");
+            };
+            assert_eq!(options.scan.nested_git, Some(value));
+            assert!(
+                serde_json::from_value::<SearchInput>(serde_json::json!({
+                    "root": test_root(), "query": "needle", "nestedGit": value
+                }))
+                .is_err()
+            );
+            let output = super::RootSpecOutput::new(
+                &test_root(),
+                super::FileFilter::default(),
+                super::ScanOptions {
+                    nested_git: value,
+                    ..super::ScanOptions::default()
+                },
+            );
+            assert_eq!(
+                serde_json::to_value(output).expect("status output")["nested_git"],
+                value
+            );
+        }
+        assert!(index_input().into_request().is_ok());
+        let IndexToolRequest::Index { options, .. } =
+            index_input().into_request().expect("omitted option")
+        else {
+            panic!("index");
+        };
+        assert_eq!(options.scan.nested_git, None);
+    }
+
+    #[test]
+    fn search_accepts_ordered_globs_and_engine_formats_and_rejects_scan_options() {
+        let parsed: SearchInput = serde_json::from_value(serde_json::json!({
+            "root": test_root(), "query": "needle",
+            "globs": [{"pattern": "*.RS", "caseInsensitive": true}, {"pattern": "!test.rs"}, {"pattern": " notes/** "}],
+            "formats": ["rust"], "categories": ["code"]
+        }))
+        .expect("valid test fixture");
+        let request = parsed.into_request().expect("valid test fixture");
+        assert_eq!(request.filter.globs[0].pattern, "*.RS");
+        assert!(request.filter.globs[0].case_insensitive);
+        assert!(!request.filter.globs[1].case_insensitive);
+        assert_eq!(request.filter.globs[2].pattern, " notes/** ");
+        assert_eq!(request.filter.formats[0].as_str(), "rust");
+        assert_eq!(request.filter.categories[0].as_str(), "code");
+        assert!(request.globs.is_empty() && request.file_types.is_empty());
+        assert!(
+            serde_json::from_value::<SearchInput>(serde_json::json!({
+                "root": test_root(), "query": "needle", "hidden": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn maps_full_index_to_index_request() {
         let request = index_input()
             .into_request()
@@ -2108,7 +2294,10 @@ mod tests {
         assert!(wait);
         assert!(debug);
         assert_eq!(request.root, Some(test_root()));
-        assert_eq!(request.discovery.globs, ["*.rs"]);
+        assert_eq!(
+            request.filter.globs.as_ref().expect("valid test fixture")[0].pattern,
+            "*.rs"
+        );
         assert_eq!(request.name.as_deref(), Some("search-engine"));
         assert_eq!(
             request
@@ -2225,12 +2414,17 @@ mod tests {
             embedding: Some("potion-base-8M".to_owned()),
             rebuild: Some(false),
             reset_paths: None,
-            globs: Some(PathListInput::One("*.rs".to_owned())),
-            insensitive_globs: None,
-            file_types: None,
-            excluded_file_types: None,
+            globs: Some(vec![super::GlobInput {
+                pattern: "*.rs".to_owned(),
+                case_insensitive: false,
+            }]),
+            formats: None,
+            excluded_formats: None,
+            categories: None,
+            excluded_categories: None,
             hidden: None,
             no_ignore: None,
+            nested_git: None,
             ignore_files: None,
             max_depth: None,
             max_file_size_bytes: None,

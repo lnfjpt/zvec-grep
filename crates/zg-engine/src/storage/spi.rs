@@ -9,7 +9,9 @@ use async_trait::async_trait;
 
 use crate::{
     EngineError,
-    domain::{Entity, EntityFragment, EntityId, FileId, FileRecord, SourcePath, SymbolType},
+    domain::{
+        Entity, EntityFragment, EntityId, FileFormat, FileId, FileRecord, SourcePath, SymbolType,
+    },
 };
 
 pub(crate) type StorageResult<T> = Result<T, EngineError>;
@@ -45,6 +47,26 @@ impl WorkspaceIndexStorageOptions {
 pub(crate) struct StoredEntity {
     pub entity: Entity,
     pub file: FileRecord,
+}
+
+/// File attributes needed by query filters, without content hashes or index status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredFileAttributes {
+    pub id: FileId,
+    pub relative_path: PathBuf,
+    pub formats: Vec<FileFormat>,
+    pub modified_epoch_ms: Option<u64>,
+}
+
+impl From<&FileRecord> for StoredFileAttributes {
+    fn from(file: &FileRecord) -> Self {
+        Self {
+            id: file.id,
+            relative_path: file.relative_path.to_path_buf(),
+            formats: file.formats.clone(),
+            modified_epoch_ms: file.snapshot.modified_epoch_ms,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -123,6 +145,15 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
             .list_files()?
             .into_iter()
             .map(|file| (file.id, file.relative_path.into_path_buf()))
+            .collect())
+    }
+
+    /// Read stored formats and modification times without loading complete file records.
+    fn list_file_attributes(&self) -> StorageResult<Vec<StoredFileAttributes>> {
+        Ok(self
+            .list_files()?
+            .iter()
+            .map(StoredFileAttributes::from)
             .collect())
     }
 

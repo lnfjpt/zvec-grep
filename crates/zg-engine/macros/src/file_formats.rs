@@ -183,8 +183,31 @@ impl Catalog {
         Ok(())
     }
 
+    fn parse_method(&self) -> TokenStream {
+        let names = self.0.iter().map(|format| &format.name);
+        let variants = self.0.iter().map(|format| &format.variant);
+        quote! {
+                /// Resolves a canonical format name or an unambiguous extension alias.
+                #[must_use]
+                pub fn parse(name: &str) -> Option<Self> {
+                    let normalized = name.trim().to_ascii_lowercase();
+                    let name = normalized.strip_prefix('.').unwrap_or(&normalized);
+                    match name {
+                        "unknown" => Some(Self::Unknown),
+                        #(#names => Some(Self::#variants),)*
+                        _ => match lookup_extension(name) {
+                            [format] => Some(*format),
+                            _ => None,
+                        },
+                    }
+                }
+
+        }
+    }
+
     pub(super) fn expand(&self) -> Result<TokenStream> {
         self.validate()?;
+        let parse_method = self.parse_method();
         let variants: Vec<_> = self.0.iter().map(|format| &format.variant).collect();
         let ids: Vec<_> = self.0.iter().map(|format| &format.id).collect();
         let names: Vec<_> = self.0.iter().map(|format| &format.name).collect();
@@ -223,7 +246,7 @@ impl Catalog {
         Ok(quote! {
             #[repr(u16)]
             #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-            pub(crate) enum FileFormat {
+            pub enum FileFormat {
                 Unknown = 0,
                 #(#variants = #ids,)*
             }
@@ -236,12 +259,15 @@ impl Catalog {
                     }
                 }
 
-                pub(crate) const fn as_str(self) -> &'static str {
+                #[must_use]
+                pub const fn as_str(self) -> &'static str {
                     match self {
                         Self::Unknown => "unknown",
                         #(Self::#variants => #names,)*
                     }
                 }
+
+                #parse_method
 
                 pub(crate) const fn from_id(id: u16) -> Option<Self> {
                     match id {

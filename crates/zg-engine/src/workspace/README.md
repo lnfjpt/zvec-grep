@@ -1,6 +1,6 @@
 # Workspace persistence
 
-`workspace` connects domain workspace state to the filesystem. It owns the name registry, manifest encoding, physical index locations, build publication and recovery, and workspace locks. The domain owns `Workspace`, `FileSelection`, `IndexState`, `IndexDescriptor`, and `EmbeddingModelInfo`; API result views are assembled at the application boundary.
+`workspace` connects domain workspace state to the filesystem. It owns the name registry, manifest encoding, physical index locations, build publication and recovery, and workspace locks. The domain owns `Workspace`, `FileFilter`, `IndexState`, `IndexDescriptor`, and `EmbeddingModelInfo`; scanning settings come from the engine's `file_selection` capability. API result views are assembled at the application boundary.
 
 ## Names and the registry
 

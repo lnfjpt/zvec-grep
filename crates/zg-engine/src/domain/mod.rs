@@ -1,5 +1,6 @@
 mod content;
 mod entity;
+mod file_filter;
 mod metadata;
 pub(crate) mod model;
 mod source;
@@ -12,7 +13,7 @@ pub(crate) use source::{FileId, FileIndexStatus, FileRecord, FileSnapshot};
 pub(crate) use source::{DirectoryId, DirectoryRecord, SourcePath};
 
 // File formats.
-pub(crate) use source::{FileCategory, FileFormat};
+pub use source::{FileCategory, FileFormat};
 
 // Source ranges.
 pub(crate) use source::{ByteRange, SourceRange, TextRange};
@@ -30,8 +31,10 @@ pub use metadata::{CodeMetadata, EntityMetadata, MarkdownMetadata, SymbolType};
 // Fragments.
 pub(crate) use entity::{EntityFragment, FragmentId, WindowFragment, validate_fragments};
 
+// File filters.
+pub use file_filter::{FileFilter, GlobRule};
+
 // Workspaces.
-pub use workspace::FileSelection;
 pub(crate) use workspace::{FTS_CONFIG, FtsConfig, IndexDescriptor, IndexState, Workspace};
 
 // Models.

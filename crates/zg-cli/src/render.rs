@@ -295,6 +295,15 @@ pub fn write_info_result(mut writer: impl Write, result: &InfoResult) -> io::Res
     writeln!(writer, "Root: {}", result.root.display())?;
     writeln!(writer, "Index path: {}", result.index_path.display())?;
     if let Some(index) = &result.workspace_index {
+        writeln!(
+            writer,
+            "Nested Git repositories: {}",
+            if index.scan.nested_git {
+                "included"
+            } else {
+                "excluded"
+            }
+        )?;
         if let Some(embedding) = &index.embedding {
             writeln!(
                 writer,
@@ -450,8 +459,10 @@ Embedding runtime:
 File filters:
   -g, --glob <glob>                 Include paths; prefix with ! to exclude; repeatable
   --iglob <glob>                    Case-insensitive path glob; repeatable
-  -t, --type <type>                 Include a ripgrep file type; repeatable
-  -T, --type-not <type>             Exclude a ripgrep file type; repeatable
+  -t, --type <format>               Include an engine format, e.g. rust or markdown
+  -T, --type-not <format>           Exclude an engine format; repeatable
+  --category <category>             Include an engine category, e.g. code or document
+  --category-not <category>         Exclude a file category; repeatable
   --modified-after <time>           Only files modified after a date or epoch milliseconds
   --modified-before <time>          Only files modified before a date or epoch milliseconds
   --symbol-type <type>              alias, class, enum, function, interface, module, value
@@ -499,14 +510,17 @@ Embedding options:
 File selection:
   -g, --glob <glob>                 Include paths; prefix with ! to exclude; repeatable
   --iglob <glob>                    Case-insensitive path glob; repeatable
-  -t, --type <type>                 Include a ripgrep file type; repeatable
-  -T, --type-not <type>             Exclude a ripgrep file type; repeatable
-  --hidden                          Include hidden paths except .git and .zvec-grep
-  --no-ignore                       Do not apply default or .gitignore rules
+  -t, --type <format>               Include an engine format, e.g. rust or markdown
+  -T, --type-not <format>           Exclude an engine format; repeatable
+  --category <category>             Include an engine category, e.g. code or document
+  --category-not <category>         Exclude a file category; repeatable
+  --hidden[=true|false]              Include hidden paths except .git and .zvec-grep
+  --no-ignore[=true|false]           Do not apply default or .gitignore rules
+  --nested-git[=true|false]          Scan nested Git repositories and submodules
   --ignore-file <path>              Add an explicit ignore file; repeatable
   --max-depth <n>                   Maximum directory depth
   --max-filesize <size>             Maximum bytes or K/M/G/T size
-  -L, --follow                      Follow symbolic links safely
+  -L, --follow[=true|false]          Follow symbolic links safely
   --reset-paths                     Clear inherited file-selection settings
 
 Interactive remote indexing asks to allow once, allow for this workspace, or

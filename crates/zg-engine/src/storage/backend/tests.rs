@@ -269,6 +269,47 @@ fn failed_files_retain_queryable_paths_and_directory_ownership() {
 }
 
 #[test]
+fn query_attributes_follow_replacement_failure_deletion_and_reopen() {
+    let temporary = tempfile::tempdir().expect("workspace");
+    let storage = open(temporary.path(), false);
+    let (mut file, entry) = file_at(storage.as_ref(), "source.txt");
+    file.formats = vec![FileFormat::C, FileFormat::Cpp];
+    file.snapshot.modified_epoch_ms = Some(0);
+    storage.replace_file(&file, &[entry]).expect("write");
+    assert_eq!(
+        storage.list_file_attributes().expect("attributes"),
+        [StoredFileAttributes::from(&file)]
+    );
+
+    file.formats = vec![FileFormat::Html];
+    file.snapshot.modified_epoch_ms = None;
+    storage
+        .mark_file_failed(&file, "extractor failed")
+        .expect("replace with failed record");
+    assert_eq!(
+        storage.list_file_attributes().expect("updated attributes"),
+        [StoredFileAttributes::from(&file)]
+    );
+    storage.close().expect("checkpoint");
+
+    let reopened = open(temporary.path(), false);
+    assert_eq!(
+        reopened
+            .list_file_attributes()
+            .expect("persisted attributes"),
+        [StoredFileAttributes::from(&file)]
+    );
+    reopened.delete_file(file.id).expect("delete");
+    assert!(
+        reopened
+            .list_file_attributes()
+            .expect("deleted attributes")
+            .is_empty()
+    );
+    reopened.close().expect("close");
+}
+
+#[test]
 fn recovery_validates_source_record_owners_before_mutating_any_collection() {
     let directory = tempfile::tempdir().expect("workspace");
     let home = directory.path();

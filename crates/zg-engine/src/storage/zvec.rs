@@ -17,7 +17,7 @@ use super::{
     path::{decode_path, encode_path, path_key, query_path},
     spi::{
         IndexedFragment, StoragePathFilter, StorageSearchFilter, StorageSearchHit,
-        StorageSearchPath, StoredEntity, StoredSearchData,
+        StorageSearchPath, StoredEntity, StoredFileAttributes, StoredSearchData,
     },
 };
 use crate::domain::{FTS_CONFIG, model::EmbeddingModelInfo};
@@ -25,7 +25,7 @@ use crate::{
     EngineError, EngineResult,
     domain::{
         CodeMetadata, Content, DirectoryId, EntityContent, EntityFragment, EntityId,
-        EntityMetadata, FileId, FileRecord, IndexField, SourcePath, model::Metric,
+        EntityMetadata, FileFormat, FileId, FileRecord, IndexField, SourcePath, model::Metric,
         validate_fragments,
     },
     utils::sha256_hex_parts,
@@ -126,6 +126,19 @@ impl NativeStore {
         )?;
         iterator
             .map(|doc| decode_file_path_doc(&native(doc, "read source path")?))
+            .collect()
+    }
+
+    pub(super) fn list_file_attributes(&self) -> EngineResult<Vec<StoredFileAttributes>> {
+        let iterator = native(
+            self.files.iter_with_options(
+                Some(&["file_id", "path", "formats", "modified_epoch_ms"]),
+                false,
+            ),
+            "iterate source attributes",
+        )?;
+        iterator
+            .map(|doc| decode_file_attributes_doc(&native(doc, "read source attributes")?))
             .collect()
     }
 
@@ -632,6 +645,14 @@ fn files_schema() -> EngineResult<CollectionSchema> {
     scalar(&mut schema, "path", DataType::String, false, false)?;
     wildcard_string(&mut schema, "relative_path", true)?;
     file_membership_schema(&mut schema)?;
+    scalar(&mut schema, "formats", DataType::ArrayUint32, false, false)?;
+    scalar(
+        &mut schema,
+        "modified_epoch_ms",
+        DataType::Uint64,
+        true,
+        false,
+    )?;
     scalar(&mut schema, "payload", DataType::String, false, false)?;
     Ok(schema)
 }
@@ -714,6 +735,23 @@ fn encode_file_doc(file: &FileRecord, directories: &[DirectoryId]) -> EngineResu
     }
     file_membership_doc(&mut doc, file, directories)?;
     native(
+        doc.add_array_u32(
+            "formats",
+            &file
+                .formats
+                .iter()
+                .map(|format| u32::from(*format as u16))
+                .collect::<Vec<_>>(),
+        ),
+        "encode file formats",
+    )?;
+    if let Some(modified) = file.snapshot.modified_epoch_ms {
+        native(
+            doc.add_u64("modified_epoch_ms", modified),
+            "encode file modification time",
+        )?;
+    }
+    native(
         doc.add_string("payload", &codec::encode_file(file)?),
         "encode file payload",
     )?;
@@ -722,14 +760,48 @@ fn encode_file_doc(file: &FileRecord, directories: &[DirectoryId]) -> EngineResu
 
 fn decode_file_doc(doc: &Doc) -> EngineResult<FileRecord> {
     let file = codec::decode_file(&string_field(doc, "payload")?)?;
-    let (id, path) = decode_file_path_doc(doc)?;
-    if id != file.id
-        || path != file.relative_path.as_path()
+    let attributes = decode_file_attributes_doc(doc)?;
+    if attributes.id != file.id
+        || attributes.relative_path != file.relative_path.as_path()
+        || attributes.formats != file.formats
+        || attributes.modified_epoch_ms != file.snapshot.modified_epoch_ms
         || string_field(doc, "path_key")? != path_key(&file.relative_path)?
     {
-        return Err(corrupt("file identity differs from its indexed path"));
+        return Err(corrupt("file attributes differ from their stored payload"));
     }
     Ok(file)
+}
+
+fn decode_file_attributes_doc(doc: &Doc) -> EngineResult<StoredFileAttributes> {
+    let (id, relative_path) = decode_file_path_doc(doc)?;
+    let formats = native(doc.get_array_u32("formats"), "read file formats")?
+        .ok_or_else(|| corrupt("missing file formats"))?
+        .into_iter()
+        .map(|id| {
+            u16::try_from(id)
+                .ok()
+                .and_then(FileFormat::from_id)
+                .ok_or_else(|| corrupt(format!("unknown file format {id}")))
+        })
+        .collect::<EngineResult<Vec<_>>>()?;
+    if formats.is_empty()
+        || (formats.len() > 1 && formats.contains(&FileFormat::Unknown))
+        || formats
+            .iter()
+            .enumerate()
+            .any(|(index, format)| formats[..index].contains(format))
+    {
+        return Err(corrupt("invalid file formats"));
+    }
+    Ok(StoredFileAttributes {
+        id,
+        relative_path,
+        formats,
+        modified_epoch_ms: native(
+            doc.get_u64("modified_epoch_ms"),
+            "read file modification time",
+        )?,
+    })
 }
 
 fn decode_file_path_doc(doc: &Doc) -> EngineResult<(FileId, PathBuf)> {

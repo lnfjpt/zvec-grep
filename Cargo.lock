@@ -3908,8 +3908,6 @@ name = "zg-host-native"
 version = "0.0.1"
 dependencies = [
  "async-trait",
- "globset",
- "ignore",
  "notify",
  "same-file",
  "tempfile",

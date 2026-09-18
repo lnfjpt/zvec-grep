@@ -17,15 +17,12 @@ use crate::{
         DiscoveredFile, ReadBatchRequest, RootSpec, ScanDiagnostics, ScanRequest, ScanSnapshot,
         SkippedFile, SkippedFileReason, SourceFile, TaskControl, WorkspaceScannerPort,
     },
-    pattern::normalize_relative_path,
-    policy::{FileTypeResolver, IgnoreRule, RootPolicy},
 };
 
 const MAX_SKIPPED_FILE_SAMPLES: usize = 20;
 
 #[derive(Clone, Debug)]
 pub struct NativeScanner {
-    resolver: FileTypeResolver,
     scan_slots: Arc<Semaphore>,
 }
 
@@ -33,7 +30,6 @@ impl NativeScanner {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            resolver: FileTypeResolver::new(),
             scan_slots: Arc::new(Semaphore::new(1)),
         }
     }
@@ -60,9 +56,8 @@ impl WorkspaceScannerPort for NativeScanner {
     ) -> Result<ScanSnapshot, HostError> {
         let _permit = acquire_slot(&self.scan_slots, control).await?;
         let request = request.clone();
-        let resolver = self.resolver.clone();
         run_blocking(control, move |blocking_control| {
-            discover_sync(&request, &resolver, &blocking_control)
+            discover_sync(&request, &blocking_control)
         })
         .await
     }
@@ -174,18 +169,17 @@ fn control_check(control: &TaskControl) -> Result<(), HostError> {
 
 #[derive(Debug)]
 struct ScanDomain {
-    policy: RootPolicy,
+    root: RootSpec,
     canonical_path: PathBuf,
     metadata: Metadata,
 }
 
 fn discover_sync(
     request: &ScanRequest,
-    resolver: &FileTypeResolver,
     control: &BlockingControl,
 ) -> Result<ScanSnapshot, HostError> {
     control.check()?;
-    let domains = validate_domains(&request.roots, resolver)?;
+    let domains = validate_domains(&request.roots)?;
     let scope = ScanScope::new(&request.scope_paths)?;
     let mut files = Vec::new();
     let mut diagnostics = ScanDiagnostics::default();
@@ -193,13 +187,7 @@ fn discover_sync(
     for domain in domains {
         control.check()?;
         if domain.metadata.is_file() {
-            scan_root_file(
-                &domain.policy,
-                &scope,
-                &mut files,
-                &mut diagnostics,
-                control,
-            )?;
+            scan_root_file(&domain.root, &scope, &mut files, &mut diagnostics, control)?;
         } else if domain.metadata.is_dir() {
             scan_root_directory(&domain, &scope, &mut files, &mut diagnostics, control)?;
         }
@@ -259,33 +247,35 @@ impl ScanScope {
     }
 }
 
-fn validate_domains(
-    roots: &[RootSpec],
-    resolver: &FileTypeResolver,
-) -> Result<Vec<ScanDomain>, HostError> {
+fn validate_domains(roots: &[RootSpec]) -> Result<Vec<ScanDomain>, HostError> {
     let mut domains = Vec::with_capacity(roots.len());
     for root in roots {
-        let policy = RootPolicy::new(root.clone(), resolver)?;
-        let metadata = fs::metadata(policy.root_path()).map_err(|error| {
+        if !root.path.is_absolute() {
+            return Err(HostError::invalid_argument(format!(
+                "workspace root must be absolute: {}",
+                root.path.display()
+            )));
+        }
+        let metadata = fs::metadata(&root.path).map_err(|error| {
             HostError::invalid_argument(format!(
                 "workspace root {} could not be inspected: {error}",
-                policy.root_path().display()
+                root.path.display()
             ))
         })?;
         if !metadata.is_file() && !metadata.is_dir() {
             return Err(HostError::invalid_argument(format!(
                 "workspace root {} must be a file or directory",
-                policy.root_path().display()
+                root.path.display()
             )));
         }
-        let canonical_path = fs::canonicalize(policy.root_path()).map_err(|error| {
+        let canonical_path = fs::canonicalize(&root.path).map_err(|error| {
             HostError::invalid_argument(format!(
                 "workspace root {} could not be resolved: {error}",
-                policy.root_path().display()
+                root.path.display()
             ))
         })?;
         domains.push(ScanDomain {
-            policy,
+            root: root.clone(),
             canonical_path,
             metadata,
         });
@@ -295,8 +285,8 @@ fn validate_domains(
             if domains_overlap(&domains[left_index], &domains[right_index])? {
                 return Err(HostError::invalid_argument(format!(
                     "workspace roots overlap: left={} right={}",
-                    domains[left_index].policy.root_path().display(),
-                    domains[right_index].policy.root_path().display()
+                    domains[left_index].root.path.display(),
+                    domains[right_index].root.path.display()
                 )));
             }
         }
@@ -305,7 +295,7 @@ fn validate_domains(
 }
 
 fn domains_overlap(left: &ScanDomain, right: &ScanDomain) -> Result<bool, HostError> {
-    if is_same_file(left.policy.root_path(), right.policy.root_path()).map_err(|error| {
+    if is_same_file(&left.root.path, &right.root.path).map_err(|error| {
         HostError::storage_failure(
             "native-scanner",
             format!("root identity check failed: {error}"),
@@ -332,39 +322,32 @@ fn domains_overlap(left: &ScanDomain, right: &ScanDomain) -> Result<bool, HostEr
 }
 
 fn directory_covers_directory(directory: &ScanDomain, child: &ScanDomain) -> bool {
-    directory.policy.root().recursive && child.canonical_path.starts_with(&directory.canonical_path)
+    directory.root.recursive && child.canonical_path.starts_with(&directory.canonical_path)
 }
 
 fn directory_covers_file(directory: &ScanDomain, file: &Path) -> bool {
     file.starts_with(&directory.canonical_path)
-        && (directory.policy.root().recursive || file.parent() == Some(&directory.canonical_path))
+        && (directory.root.recursive || file.parent() == Some(&directory.canonical_path))
 }
 
 fn scan_root_file(
-    policy: &RootPolicy,
+    root: &RootSpec,
     scope: &ScanScope,
     files: &mut Vec<DiscoveredFile>,
     diagnostics: &mut ScanDiagnostics,
     control: &BlockingControl,
 ) -> Result<(), HostError> {
-    if !scope.includes_file(policy.root_path()) {
+    if !scope.includes_file(&root.path) {
         return Ok(());
     }
-    let Some(name) = policy.root_path().file_name() else {
+    let Some(name) = root.path.file_name() else {
         return Ok(());
     };
     let relative_path = PathBuf::from(name);
-    let relative_display = normalize_relative_path(&relative_path);
-    if !policy.matches_file_selection(&relative_display) {
+    if !root.policy.includes_file(&root.path)? {
         return Ok(());
     }
-    if let Some(file) = read_file_info(
-        policy,
-        policy.root_path(),
-        &relative_path,
-        diagnostics,
-        control,
-    )? {
+    if let Some(file) = read_file_info(root, &root.path, &relative_path, diagnostics, control)? {
         files.push(file);
     }
     Ok(())
@@ -377,24 +360,18 @@ fn scan_root_directory(
     diagnostics: &mut ScanDiagnostics,
     control: &BlockingControl,
 ) -> Result<(), HostError> {
-    if !scope.intersects_directory(domain.policy.root_path()) {
+    if !scope.intersects_directory(&domain.root.path) {
         return Ok(());
     }
-    let root_name = domain
-        .policy
-        .root_path()
-        .file_name()
-        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-    if RootPolicy::is_hard_skipped_name(&root_name) {
+    if !domain.root.policy.can_descend(&domain.root.path)? {
         return Ok(());
     }
     let mut visited = HashSet::from([domain.canonical_path.clone()]);
     walk(
-        &domain.policy,
+        &domain.root,
         scope,
-        domain.policy.root_path(),
+        &domain.root.path,
         0,
-        &domain.policy.initial_ignore_rules(),
         &mut visited,
         files,
         diagnostics,
@@ -404,18 +381,16 @@ fn scan_root_directory(
 
 #[allow(clippy::too_many_arguments)]
 fn walk(
-    policy: &RootPolicy,
+    root: &RootSpec,
     scope: &ScanScope,
     current_path: &Path,
     depth: usize,
-    parent_ignore_rules: &[IgnoreRule],
     visited: &mut HashSet<PathBuf>,
     files: &mut Vec<DiscoveredFile>,
     diagnostics: &mut ScanDiagnostics,
     control: &BlockingControl,
 ) -> Result<(), HostError> {
     control.check()?;
-    let ignore_rules = policy.rules_with_gitignore(parent_ignore_rules, current_path);
     let Ok(read_directory) = fs::read_dir(current_path) else {
         return Ok(());
     };
@@ -425,18 +400,14 @@ fn walk(
     for entry in entries {
         control.check()?;
         let absolute_path = entry.path();
-        let relative_path = absolute_path
-            .strip_prefix(policy.root_path())
-            .map_err(|error| {
-                HostError::internal(format!("scanner produced an out-of-root path: {error}"))
-            })?;
-        let relative_display = normalize_relative_path(relative_path);
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative_path = absolute_path.strip_prefix(&root.path).map_err(|error| {
+            HostError::internal(format!("scanner produced an out-of-root path: {error}"))
+        })?;
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         let (is_directory, is_file) = if file_type.is_symlink() {
-            if !policy.root().discovery.follow {
+            if !root.follow {
                 continue;
             }
             fs::metadata(&absolute_path).map_or((false, false), |metadata| {
@@ -450,18 +421,9 @@ fn walk(
             if !scope.intersects_directory(&absolute_path) {
                 continue;
             }
-            if !policy.root().recursive
-                || policy
-                    .root()
-                    .discovery
-                    .max_depth
-                    .is_some_and(|maximum| depth + 1 >= maximum)
-                || !policy.path_can_be_scanned(&relative_display, &name, true, &ignore_rules)
-            {
-                continue;
-            }
-            if is_nested_git_repository_directory(&absolute_path)
-                && !policy.nested_git_repository_explicitly_included(&relative_display)
+            if !root.recursive
+                || root.max_depth.is_some_and(|maximum| depth + 1 >= maximum)
+                || !root.policy.can_descend(&absolute_path)?
             {
                 continue;
             }
@@ -472,11 +434,10 @@ fn walk(
                 continue;
             }
             walk(
-                policy,
+                root,
                 scope,
                 &absolute_path,
                 depth + 1,
-                &ignore_rules,
                 visited,
                 files,
                 diagnostics,
@@ -488,17 +449,13 @@ fn walk(
             continue;
         }
         if !is_file
-            || policy
-                .root()
-                .discovery
-                .max_depth
-                .is_some_and(|maximum| depth + 1 > maximum)
-            || !policy.path_can_be_scanned(&relative_display, &name, false, &ignore_rules)
+            || root.max_depth.is_some_and(|maximum| depth + 1 > maximum)
+            || !root.policy.includes_file(&absolute_path)?
         {
             continue;
         }
         if let Some(file) =
-            read_file_info(policy, &absolute_path, relative_path, diagnostics, control)?
+            read_file_info(root, &absolute_path, relative_path, diagnostics, control)?
         {
             files.push(file);
         }
@@ -507,7 +464,7 @@ fn walk(
 }
 
 fn read_file_info(
-    policy: &RootPolicy,
+    root: &RootSpec,
     absolute_path: &Path,
     relative_path: &Path,
     diagnostics: &mut ScanDiagnostics,
@@ -530,7 +487,7 @@ fn read_file_info(
         );
         return Ok(None);
     }
-    if let Some(maximum) = policy.root().discovery.max_file_size_bytes
+    if let Some(maximum) = root.max_file_size_bytes
         && metadata.len() > maximum
     {
         record_skipped(
@@ -545,7 +502,7 @@ fn read_file_info(
     let modified_epoch_ms = modified_epoch_ms(&metadata);
     let source_fingerprint = source_fingerprint(metadata.len(), modified_epoch_ms);
     Ok(Some(DiscoveredFile {
-        root: policy.root_path().to_path_buf(),
+        root: root.path.clone(),
         relative_path: relative_path.to_path_buf(),
         size_bytes: metadata.len(),
         modified_epoch_ms,
@@ -706,10 +663,6 @@ fn record_skipped(
             limit_bytes,
         });
     }
-}
-
-fn is_nested_git_repository_directory(path: &Path) -> bool {
-    fs::metadata(path.join(".git")).is_ok_and(|metadata| metadata.is_file() || metadata.is_dir())
 }
 
 #[cfg(test)]

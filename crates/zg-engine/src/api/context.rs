@@ -5,7 +5,7 @@ pub use result::ContextResult;
 
 /// Options accepted by [`crate::ZvecGrep::context`].
 pub mod options {
-    pub use crate::domain::SymbolType;
+    pub use crate::domain::{FileCategory, FileFilter, FileFormat, GlobRule, SymbolType};
     pub use crate::pipelines::search::types::{
         SearchRoute as ContextRoute, SearchRouteMode as ContextRouteMode,
     };
@@ -15,6 +15,7 @@ pub mod options {
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
     #[allow(clippy::struct_excessive_bools)]
     pub struct ContextOptions {
         pub query: Option<String>,
@@ -34,8 +35,10 @@ pub mod options {
         pub trace: bool,
         pub prefer_symbol: bool,
         pub symbol_types: Vec<SymbolType>,
-        pub include_paths: Vec<String>,
-        pub exclude_paths: Vec<String>,
+        /// Temporary filter over indexed files; does not alter workspace selection.
+        #[serde(default)]
+        pub filter: FileFilter,
+        /// Filesystem glob options for the independent rg backend only.
         pub globs: Vec<String>,
         pub insensitive_globs: Vec<String>,
         pub file_types: Vec<String>,
@@ -71,6 +74,35 @@ pub mod options {
         pub signal: Option<tokio_util::sync::CancellationToken>,
     }
 
+    impl ContextOptions {
+        pub(crate) fn validate_file_selection(&self) -> crate::EngineResult<()> {
+            if self.rg {
+                if self.filter != FileFilter::default() {
+                    return Err(crate::EngineError::invalid_argument(
+                        "indexed file filters cannot be combined with rg; use rg glob and type options",
+                    ));
+                }
+            } else if !self.globs.is_empty()
+                || !self.insensitive_globs.is_empty()
+                || !self.file_types.is_empty()
+                || !self.excluded_file_types.is_empty()
+                || self.hidden
+                || self.no_ignore
+                || self.follow
+                || !self.ignore_files.is_empty()
+                || self.max_depth.is_some()
+                || self.max_file_size_bytes.is_some()
+                || !self.rg_paths.is_empty()
+                || self.rg_options != RgOptions::default()
+            {
+                return Err(crate::EngineError::invalid_argument(
+                    "rg filesystem options require rg mode; use filter for indexed queries and index to change scanning settings",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     impl Default for ContextOptions {
         fn default() -> Self {
             Self {
@@ -88,8 +120,7 @@ pub mod options {
                 trace: false,
                 prefer_symbol: false,
                 symbol_types: Vec::new(),
-                include_paths: Vec::new(),
-                exclude_paths: Vec::new(),
+                filter: FileFilter::default(),
                 globs: Vec::new(),
                 insensitive_globs: Vec::new(),
                 file_types: Vec::new(),
@@ -162,6 +193,34 @@ pub mod options {
     pub struct RgGlob {
         pub pattern: String,
         pub case_insensitive: bool,
+    }
+
+    #[cfg(test)]
+    mod selection_tests {
+        use super::*;
+
+        #[test]
+        fn query_modes_reject_each_others_selection_contract() {
+            let indexed = ContextOptions {
+                hidden: true,
+                ..Default::default()
+            };
+            assert!(indexed.validate_file_selection().is_err());
+            let rg = ContextOptions {
+                rg: true,
+                filter: FileFilter {
+                    globs: vec!["*.rs".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(rg.validate_file_selection().is_err());
+            let indexed = ContextOptions {
+                filter: rg.filter,
+                ..Default::default()
+            };
+            assert!(indexed.validate_file_selection().is_ok());
+        }
     }
 }
 

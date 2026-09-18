@@ -16,7 +16,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zg_engine::{
     EngineError, ErrorReport,
-    api::index::{IndexOptions, IndexResult},
+    api::index::{
+        IndexOptions, IndexResult,
+        options::{FileFilterUpdate, ScanOptionsUpdate},
+    },
     api::info::InfoOptions,
 };
 
@@ -170,6 +173,10 @@ impl IndexJobScheduler {
         if reason == JobReason::Watch {
             options.name = None;
         }
+        // Changing the saved corpus can affect paths outside a narrow watcher batch.
+        if has_selection_update(&options) {
+            options.changes.clear();
+        }
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(SchedulerError::Closed);
         }
@@ -184,7 +191,8 @@ impl IndexJobScheduler {
             let needs_followup = reason == JobReason::Watch
                 || active_snapshot.reason == JobReason::Watch
                 || options.rebuild
-                || options.name.is_some();
+                || options.name.is_some()
+                || has_selection_update(&options);
             if needs_followup && active_snapshot.state == JobState::Queued {
                 let queued_full_manual = active_snapshot.reason == JobReason::Manual
                     && reason == JobReason::Watch
@@ -537,22 +545,67 @@ fn finish_job(inner: &Arc<SchedulerInner>, job: &Arc<ScheduledJob>) {
     mark_finished(job);
 }
 
+fn has_selection_update(options: &IndexOptions) -> bool {
+    options.reset_paths
+        || options.filter != FileFilterUpdate::default()
+        || options.scan != ScanOptionsUpdate::default()
+}
+
 fn merge_options(current: &mut Option<IndexOptions>, mut incoming: IndexOptions) {
     let Some(current) = current.as_mut() else {
         return;
     };
-    // An omitted name leaves a pending explicit rename intact. Only another
-    // explicit name replaces it, including when the request updates narrow paths.
-    if let Some(name) = incoming.name.take() {
-        current.name = Some(name);
+    let full_scan = current.changes.is_empty()
+        || incoming.changes.is_empty()
+        || has_selection_update(current)
+        || has_selection_update(&incoming);
+    // A later reset discards earlier pending selection changes. Otherwise every
+    // explicitly supplied field wins, including false, empty lists and null limits.
+    if incoming.reset_paths {
+        current.filter = FileFilterUpdate::default();
+        current.scan = ScanOptionsUpdate::default();
     }
+    current.reset_paths |= incoming.reset_paths;
+    current.rebuild |= incoming.rebuild;
+    merge_update(&mut current.filter.globs, incoming.filter.globs.take());
+    merge_update(&mut current.filter.formats, incoming.filter.formats.take());
+    merge_update(
+        &mut current.filter.excluded_formats,
+        incoming.filter.excluded_formats.take(),
+    );
+    merge_update(
+        &mut current.filter.categories,
+        incoming.filter.categories.take(),
+    );
+    merge_update(
+        &mut current.filter.excluded_categories,
+        incoming.filter.excluded_categories.take(),
+    );
+    merge_update(&mut current.scan.hidden, incoming.scan.hidden.take());
+    merge_update(&mut current.scan.no_ignore, incoming.scan.no_ignore.take());
+    merge_update(&mut current.scan.follow, incoming.scan.follow.take());
+    merge_update(
+        &mut current.scan.nested_git,
+        incoming.scan.nested_git.take(),
+    );
+    merge_update(
+        &mut current.scan.ignore_files,
+        incoming.scan.ignore_files.take(),
+    );
+    merge_update(&mut current.scan.max_depth, incoming.scan.max_depth.take());
+    merge_update(
+        &mut current.scan.max_file_size_bytes,
+        incoming.scan.max_file_size_bytes.take(),
+    );
+    merge_runtime_options(current, &mut incoming);
+    // An omitted name leaves a pending explicit rename intact.
+    merge_update(&mut current.name, incoming.name.take());
     if incoming.changes.is_empty() {
-        incoming.name = current.name.take();
-        *current = incoming;
+        current.changes.clear();
         return;
     }
-    if current.changes.is_empty() {
-        current.changes = incoming.changes;
+    if full_scan {
+        current.changes.clear();
         return;
     }
     if incoming.changes.iter().any(|change| {
@@ -579,6 +632,44 @@ fn merge_options(current: &mut Option<IndexOptions>, mut incoming: IndexOptions)
                 .retain(|existing| change_path(existing) != Some(path));
         }
         current.changes.push(change);
+    }
+}
+
+fn merge_runtime_options(current: &mut IndexOptions, incoming: &mut IndexOptions) {
+    let destination_changed = incoming
+        .embedding
+        .as_ref()
+        .is_some_and(|model| current.embedding.as_ref() != Some(model))
+        || incoming
+            .endpoint
+            .as_ref()
+            .is_some_and(|endpoint| current.endpoint.as_ref() != Some(endpoint));
+    if destination_changed {
+        current.allow_remote = incoming.allow_remote;
+        current.api_key = None;
+        current.endpoint = None;
+    }
+    // Runtime/model settings are explicit updates too. A filter-only request
+    // must not erase the model or credentials of an already queued manual job.
+    merge_update(&mut current.root, incoming.root.take());
+    merge_update(&mut current.embedding, incoming.embedding.take());
+    merge_update(&mut current.api_key, incoming.api_key.take());
+    merge_update(&mut current.endpoint, incoming.endpoint.take());
+    merge_update(&mut current.device, incoming.device.take());
+    merge_update(&mut current.model_cache, incoming.model_cache.take());
+    merge_update(
+        &mut current.embedding_concurrency,
+        incoming.embedding_concurrency.take(),
+    );
+    merge_update(&mut current.signal, incoming.signal.take());
+    merge_update(&mut current.on_progress, incoming.on_progress.take());
+    // Consent is scoped to this coalesced job. Runtime watch templates clear it.
+    current.allow_remote |= incoming.allow_remote;
+}
+
+fn merge_update<T>(current: &mut Option<T>, incoming: Option<T>) {
+    if incoming.is_some() {
+        *current = incoming;
     }
 }
 
@@ -747,7 +838,10 @@ mod tests {
     use tokio::sync::Notify;
     use zg_engine::{
         EngineError,
-        api::index::{IndexOptions, IndexResult, options::WorkspaceChange},
+        api::index::{
+            IndexOptions, IndexResult,
+            options::{FileCategory, FileFilterUpdate, ScanOptionsUpdate, WorkspaceChange},
+        },
     };
 
     use super::{
@@ -958,6 +1052,302 @@ mod tests {
                 PathBuf::from("src/lib.rs")
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn selection_updates_survive_queued_and_running_manual_jobs_and_watch_merges() {
+        for queued in [false, true] {
+            let executor = Arc::new(RecordingExecutor {
+                calls: Mutex::new(Vec::new()),
+                started: Notify::new(),
+                releases: tokio::sync::Semaphore::new(0),
+            });
+            let scheduler = IndexJobScheduler::new(
+                executor.clone(),
+                SchedulerConfig {
+                    concurrency: 1,
+                    queue_capacity: 8,
+                },
+            );
+            if queued {
+                scheduler
+                    .submit(
+                        PathBuf::from("/blocker"),
+                        IndexOptions::default(),
+                        JobReason::Manual,
+                    )
+                    .expect("occupy worker");
+                executor.started.notified().await;
+            }
+            let root = PathBuf::from("/workspace");
+            let first = scheduler
+                .submit(root.clone(), IndexOptions::default(), JobReason::Manual)
+                .expect("initial index");
+            if !queued {
+                executor.started.notified().await;
+            }
+            let patch = scheduler
+                .submit(
+                    root.clone(),
+                    IndexOptions {
+                        filter: FileFilterUpdate {
+                            globs: Some(vec!["*.rs".into()]),
+                            categories: Some(vec![FileCategory::Code]),
+                            ..Default::default()
+                        },
+                        scan: ScanOptionsUpdate {
+                            hidden: Some(true),
+                            follow: Some(true),
+                            max_depth: Some(Some(3)),
+                            ..Default::default()
+                        },
+                        changes: vec![WorkspaceChange::Upsert("limited.rs".into())],
+                        ..Default::default()
+                    },
+                    JobReason::Manual,
+                )
+                .expect("selection update");
+            assert_eq!(patch.job.id == first.job.id, queued);
+            let merged = scheduler
+                .submit(
+                    root.clone(),
+                    IndexOptions {
+                        filter: FileFilterUpdate {
+                            globs: Some(Vec::new()),
+                            ..Default::default()
+                        },
+                        scan: ScanOptionsUpdate {
+                            hidden: Some(false),
+                            max_depth: Some(None),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    JobReason::Manual,
+                )
+                .expect("second update");
+            assert_eq!(merged.job.id, patch.job.id);
+            scheduler
+                .submit(
+                    root,
+                    IndexOptions {
+                        changes: vec![WorkspaceChange::Upsert("changed.rs".into())],
+                        ..Default::default()
+                    },
+                    JobReason::Watch,
+                )
+                .expect("watch update");
+            executor.releases.add_permits(1);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                executor.started.notified(),
+            )
+            .await
+            .expect("selection update reaches executor");
+            executor.releases.add_permits(1);
+            scheduler
+                .wait(patch.job.id)
+                .await
+                .expect("selection update completes");
+            {
+                let calls = executor.calls.lock().expect("recorded calls");
+                let applied = calls.last().expect("selection execution");
+                assert_merged_selection(applied);
+            }
+            scheduler.shutdown().await;
+        }
+    }
+
+    fn assert_merged_selection(applied: &IndexOptions) {
+        use zg_engine::api::index::options::FileCategory;
+
+        assert_eq!(applied.filter.globs, Some(Vec::new()));
+        assert_eq!(applied.filter.categories, Some(vec![FileCategory::Code]));
+        assert_eq!(applied.scan.hidden, Some(false));
+        assert_eq!(applied.scan.follow, Some(true));
+        assert_eq!(applied.scan.max_depth, Some(None));
+        assert!(
+            applied.changes.is_empty(),
+            "selection changes require a full scan"
+        );
+    }
+
+    #[test]
+    fn nested_git_updates_keep_false_and_omission_until_reset() {
+        let mut pending = Some(IndexOptions {
+            scan: ScanOptionsUpdate {
+                nested_git: Some(true),
+                ..ScanOptionsUpdate::default()
+            },
+            ..IndexOptions::default()
+        });
+        super::merge_options(
+            &mut pending,
+            IndexOptions {
+                scan: ScanOptionsUpdate {
+                    nested_git: Some(false),
+                    ..ScanOptionsUpdate::default()
+                },
+                ..IndexOptions::default()
+            },
+        );
+        super::merge_options(&mut pending, IndexOptions::default());
+        let update = pending.as_ref().expect("pending configuration");
+        assert_eq!(update.scan.nested_git, Some(false));
+        assert!(super::has_selection_update(update));
+        super::merge_options(
+            &mut pending,
+            IndexOptions {
+                reset_paths: true,
+                ..IndexOptions::default()
+            },
+        );
+        let reset = pending.expect("pending reset");
+        assert!(reset.reset_paths);
+        assert_eq!(reset.scan.nested_git, None);
+    }
+
+    #[test]
+    fn changing_remote_destination_does_not_inherit_pending_credentials_or_consent() {
+        use zg_engine::api::index::options::{Device, EmbeddingModelSpec};
+        for model_changed in [false, true] {
+            let mut pending = Some(IndexOptions {
+                api_key: Some("provider-a-key".into()),
+                endpoint: Some("https://a.test".into()),
+                allow_remote: true,
+                ..IndexOptions::default()
+            });
+            let incoming = if model_changed {
+                IndexOptions {
+                    embedding: Some(EmbeddingModelSpec {
+                        reference: "provider-b/model".into(),
+                        revision: None,
+                        cache_dir: None,
+                        endpoint: None,
+                        device: Device::Auto,
+                    }),
+                    ..IndexOptions::default()
+                }
+            } else {
+                IndexOptions {
+                    endpoint: Some("https://b.test".into()),
+                    ..IndexOptions::default()
+                }
+            };
+            super::merge_options(&mut pending, incoming);
+            let merged = pending.expect("merged destination");
+            assert!(!merged.allow_remote);
+            assert!(merged.api_key.is_none());
+            assert_eq!(
+                merged.endpoint.as_deref(),
+                if model_changed {
+                    None
+                } else {
+                    Some("https://b.test")
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn filter_updates_preserve_pending_model_runtime_settings_and_job_consent() {
+        use zg_engine::api::index::options::{Device, EmbeddingModelSpec};
+        let mut pending = Some(IndexOptions {
+            rebuild: true,
+            allow_remote: true,
+            api_key: Some("test-key".into()),
+            endpoint: Some("https://example.test/embeddings".into()),
+            device: Some(Device::Cpu),
+            model_cache: Some("/models".into()),
+            embedding_concurrency: Some(4),
+            embedding: Some(EmbeddingModelSpec {
+                reference: "qwen/new-model".into(),
+                revision: None,
+                cache_dir: None,
+                endpoint: None,
+                device: Device::Cpu,
+            }),
+            ..IndexOptions::default()
+        });
+        super::merge_options(
+            &mut pending,
+            IndexOptions {
+                filter: FileFilterUpdate {
+                    globs: Some(Vec::new()),
+                    ..FileFilterUpdate::default()
+                },
+                embedding_concurrency: Some(8),
+                ..IndexOptions::default()
+            },
+        );
+        let merged = pending.expect("merged request");
+        assert!(merged.rebuild && merged.allow_remote);
+        assert_eq!(
+            merged.embedding.expect("explicit model").reference,
+            "qwen/new-model"
+        );
+        assert_eq!(merged.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            merged.endpoint.as_deref(),
+            Some("https://example.test/embeddings")
+        );
+        assert_eq!(merged.device, Some(Device::Cpu));
+        assert_eq!(merged.model_cache, Some("/models".into()));
+        assert_eq!(merged.embedding_concurrency, Some(8));
+        assert_eq!(merged.filter.globs, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_later_reset_discards_pending_selection_updates_but_remains_pending_for_later_patches() {
+        use zg_engine::api::index::options::{FileFilterUpdate, ScanOptionsUpdate};
+
+        let mut pending = Some(IndexOptions {
+            filter: FileFilterUpdate {
+                globs: Some(vec!["old/**".into()]),
+                ..Default::default()
+            },
+            scan: ScanOptionsUpdate {
+                hidden: Some(true),
+                max_depth: Some(Some(3)),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        super::merge_options(
+            &mut pending,
+            IndexOptions {
+                reset_paths: true,
+                scan: ScanOptionsUpdate {
+                    follow: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let reset = pending.as_ref().expect("pending reset");
+        assert!(reset.reset_paths);
+        assert_eq!(reset.filter, FileFilterUpdate::default());
+        assert_eq!(reset.scan.hidden, None);
+        assert_eq!(reset.scan.max_depth, None);
+        super::merge_options(
+            &mut pending,
+            IndexOptions {
+                filter: FileFilterUpdate {
+                    globs: Some(Vec::new()),
+                    ..Default::default()
+                },
+                scan: ScanOptionsUpdate {
+                    max_depth: Some(None),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let update = pending.expect("pending update");
+        assert!(update.reset_paths);
+        assert_eq!(update.filter.globs, Some(Vec::new()));
+        assert_eq!(update.scan.follow, Some(false));
+        assert_eq!(update.scan.max_depth, Some(None));
     }
 
     #[tokio::test]

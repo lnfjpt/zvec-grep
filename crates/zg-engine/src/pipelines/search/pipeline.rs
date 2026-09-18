@@ -5,15 +5,15 @@ use std::{
 };
 
 use async_trait::async_trait;
-use globset::{GlobBuilder, GlobMatcher};
-use ignore::types::{Types, TypesBuilder};
 
 use crate::{
     EngineError,
     domain::{
-        Content, Entity, EntityFragment, EntityId, FileId, FileRecord, SymbolType,
+        Content, Entity, EntityFragment, EntityId, FileFilter, FileFormat, FileId, FileRecord,
+        SymbolType,
         model::{EmbeddingModelInfo, EmbeddingPurpose},
     },
+    file_selection::FileMatcher,
     models::{EmbeddingOptions, ModelError, ModelRuntimeLease},
     storage::spi::{
         StoragePathFilter, StorageSearchFilter, StorageSearchHit, StoredSearchData,
@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-    path_filter::GlobFilter,
+    path_filter::compile_path_filter,
     types::{
         MatchedBy, SearchFinalTrace, SearchFusionTrace, SearchHitTrace, SearchRecallTrace,
         SearchRoute, SearchRouteMode, TimingEntry,
@@ -44,12 +44,7 @@ pub(crate) struct SearchPlan {
     pub trace: bool,
     pub prefer_symbol: bool,
     pub symbol_types: Vec<SymbolType>,
-    pub include_paths: Vec<String>,
-    pub exclude_paths: Vec<String>,
-    pub globs: Vec<String>,
-    pub insensitive_globs: Vec<String>,
-    pub file_types: Vec<String>,
-    pub excluded_file_types: Vec<String>,
+    pub filter: FileFilter,
     pub modified_after_epoch_ms: Option<u64>,
     pub modified_before_epoch_ms: Option<u64>,
 }
@@ -666,35 +661,42 @@ fn search_plan_to_storage_filter(
     plan: &SearchPlan,
     storage: &dyn WorkspaceIndexStorage,
 ) -> Result<Option<StorageSearchFilter>, EngineError> {
-    let has_globs = !plan.globs.is_empty() || !plan.insensitive_globs.is_empty();
-    let glob_filter = GlobFilter::new(workspace_root, &plan.globs, &plan.insensitive_globs)?;
+    // Compile even when pushdown is available so invalid rules have one error path.
+    let matcher = FileMatcher::new(workspace_root, &plan.filter)?;
+    let has_globs = !plan.filter.globs.is_empty();
     let path = if has_globs {
-        glob_filter.pushdown(storage)?
+        compile_path_filter(&plan.filter.globs, storage)?
     } else {
         None
     };
-    let needs_file_filter = !plan.include_paths.is_empty()
-        || !plan.exclude_paths.is_empty()
-        || (has_globs && path.is_none())
-        || !plan.file_types.is_empty()
-        || !plan.excluded_file_types.is_empty()
+    let needs_attributes = plan.filter.has_format_constraints()
         || plan.modified_after_epoch_ms.is_some()
         || plan.modified_before_epoch_ms.is_some();
-    let file_ids = if !needs_file_filter {
-        None
-    } else if plan.modified_after_epoch_ms.is_some() || plan.modified_before_epoch_ms.is_some() {
-        Some(resolve_filtered_file_ids(
-            workspace_root,
-            plan,
-            &storage.list_files()?,
-        )?)
-    } else {
-        let paths = storage.list_file_paths()?;
+    let file_ids = if needs_attributes {
+        let attributes = storage.list_file_attributes()?;
         Some(resolve_filtered_paths(
-            workspace_root,
             plan,
-            paths.iter().map(|(id, path)| (*id, path.as_path(), None)),
-        )?)
+            &matcher,
+            attributes.iter().map(|file| {
+                (
+                    file.id,
+                    file.relative_path.as_path(),
+                    file.formats.as_slice(),
+                    file.modified_epoch_ms,
+                )
+            }),
+        ))
+    } else if has_globs && path.is_none() {
+        Some(
+            storage
+                .list_file_paths()?
+                .into_iter()
+                .filter(|(_, path)| matcher.matches_path(path))
+                .map(|(id, _)| id)
+                .collect(),
+        )
+    } else {
+        None
     };
     let symbol_types = (!plan.symbol_types.is_empty()).then(|| plan.symbol_types.clone());
     if file_ids.is_none() && symbol_types.is_none() && path.is_none() {
@@ -709,62 +711,16 @@ fn search_plan_to_storage_filter(
     }
 }
 
-fn resolve_filtered_file_ids(
-    workspace_root: &Path,
-    plan: &SearchPlan,
-    files: &[FileRecord],
-) -> Result<Vec<FileId>, EngineError> {
-    resolve_filtered_paths(
-        workspace_root,
-        plan,
-        files.iter().map(|file| {
-            (
-                file.id,
-                file.relative_path.as_path(),
-                file.snapshot.modified_epoch_ms,
-            )
-        }),
-    )
-}
-
 fn resolve_filtered_paths<'a>(
-    workspace_root: &Path,
     plan: &SearchPlan,
-    files: impl IntoIterator<Item = (FileId, &'a Path, Option<u64>)>,
-) -> Result<Vec<FileId>, EngineError> {
-    let include = plan
-        .include_paths
-        .iter()
-        .map(|pattern| PathMatcher::path(pattern))
-        .collect::<Result<Vec<_>, _>>()?;
-    let exclude = plan
-        .exclude_paths
-        .iter()
-        .map(|pattern| PathMatcher::path(pattern))
-        .collect::<Result<Vec<_>, _>>()?;
-    let globs = GlobFilter::new(workspace_root, &plan.globs, &plan.insensitive_globs)?;
-    let types = build_file_types(&plan.file_types, &plan.excluded_file_types)?;
-    Ok(files
+    matcher: &FileMatcher,
+    files: impl IntoIterator<Item = (FileId, &'a Path, &'a [FileFormat], Option<u64>)>,
+) -> Vec<FileId> {
+    files
         .into_iter()
-        .filter(|(_, relative, modified)| {
-            let absolute = workspace_root.join(relative);
-            (include.is_empty()
-                || include.iter().any(|matcher| {
-                    matcher.is_match(if matcher.absolute {
-                        &absolute
-                    } else {
-                        relative
-                    })
-                }))
-                && !exclude.iter().any(|matcher| {
-                    matcher.is_match(if matcher.absolute {
-                        &absolute
-                    } else {
-                        relative
-                    })
-                })
-                && globs.is_match(relative)
-                && !types.matched(relative, false).is_ignore()
+        .filter(|(_, relative, formats, modified)| {
+            matcher.matches_path(relative)
+                && matcher.matches_formats(formats)
                 && plan
                     .modified_after_epoch_ms
                     .is_none_or(|after| modified.is_some_and(|modified| modified >= after))
@@ -772,101 +728,29 @@ fn resolve_filtered_paths<'a>(
                     .modified_before_epoch_ms
                     .is_none_or(|before| modified.is_some_and(|modified| modified <= before))
         })
-        .map(|(id, _, _)| id)
-        .collect())
+        .map(|(id, _, _, _)| id)
+        .collect()
 }
 
-struct PathMatcher {
-    normalized: String,
-    matcher: Option<GlobMatcher>,
-    absolute: bool,
-}
-
-impl PathMatcher {
-    fn path(pattern: &str) -> Result<Self, EngineError> {
-        let normalized = normalize_pattern(pattern);
-        if normalized.is_empty() {
-            return Err(EngineError::invalid_argument(
-                "path filter must not be empty",
-            ));
-        }
-        let absolute = is_absolute_pattern(&normalized);
-        let matcher = has_glob(&normalized)
-            .then(|| compile_glob(&normalized, false))
-            .transpose()?;
-        Ok(Self {
-            normalized,
-            matcher,
-            absolute,
-        })
-    }
-
-    fn is_match(&self, path: &Path) -> bool {
-        if let Some(matcher) = &self.matcher {
-            return matcher.is_match(path)
-                || self
-                    .normalized
-                    .strip_suffix("/**")
-                    .is_some_and(|directory| {
-                        compile_glob(directory, false).is_ok_and(|matcher| matcher.is_match(path))
-                    });
-        }
-        path == Path::new(&self.normalized)
-            || path.starts_with(Path::new(self.normalized.trim_end_matches('/')))
-    }
-}
-
-fn compile_glob(pattern: &str, case_insensitive: bool) -> Result<GlobMatcher, EngineError> {
-    let normalized = normalize_pattern(pattern);
-    let pattern = if !normalized.contains('/') && normalized != "**" {
-        format!("**/{normalized}")
-    } else {
-        normalized
-    };
-    let mut builder = GlobBuilder::new(&pattern);
-    builder
-        .case_insensitive(case_insensitive)
-        .literal_separator(true)
-        .backslash_escape(false)
-        .allow_unclosed_class(true);
-    builder
-        .build()
-        .map(|glob| glob.compile_matcher())
-        .map_err(|error| {
-            EngineError::invalid_argument(format!("invalid glob {pattern:?}: {error}"))
-        })
-}
-
-fn build_file_types(included: &[String], excluded: &[String]) -> Result<Types, EngineError> {
-    let mut builder = TypesBuilder::new();
-    builder.add_defaults();
-    for name in included {
-        builder.select(&file_type_name(name));
-    }
-    for name in excluded {
-        builder.negate(&file_type_name(name));
-    }
-    builder.build().map_err(|error| {
-        EngineError::invalid_argument(format!("invalid ripgrep file type selection: {error}"))
-    })
-}
-
-fn file_type_name(name: &str) -> String {
-    let normalized = name.trim().trim_start_matches('.').to_ascii_lowercase();
-    match normalized.as_str() {
-        "bash" | "zsh" => "sh",
-        "cjs" | "jsx" | "mjs" => "js",
-        "cp" | "cc" | "cxx" => "cpp",
-        "hpp" | "hxx" | "hh" => "h",
-        "markdown" | "mdx" => "md",
-        "pyi" => "py",
-        "rb" => "ruby",
-        "rs" => "rust",
-        "tsx" => "ts",
-        "yml" => "yaml",
-        _ => &normalized,
-    }
-    .to_owned()
+#[cfg(test)]
+fn resolve_filtered_file_ids(
+    workspace_root: &Path,
+    plan: &SearchPlan,
+    files: &[FileRecord],
+) -> Result<Vec<FileId>, EngineError> {
+    let matcher = FileMatcher::new(workspace_root, &plan.filter)?;
+    Ok(resolve_filtered_paths(
+        plan,
+        &matcher,
+        files.iter().map(|file| {
+            (
+                file.id,
+                file.relative_path.as_path(),
+                file.formats.as_slice(),
+                file.snapshot.modified_epoch_ms,
+            )
+        }),
+    ))
 }
 
 fn filter_matches_no_files(filter: Option<&StorageSearchFilter>) -> bool {
@@ -874,33 +758,6 @@ fn filter_matches_no_files(filter: Option<&StorageSearchFilter>) -> bool {
         filter.file_ids.as_ref().is_some_and(Vec::is_empty)
             || filter.path == Some(StoragePathFilter::None)
     })
-}
-
-fn normalize_pattern(pattern: &str) -> String {
-    let mut normalized = pattern.trim().replace('\\', "/");
-    while normalized.contains("//") {
-        normalized = normalized.replace("//", "/");
-    }
-    if !is_absolute_pattern(&normalized) {
-        while let Some(stripped) = normalized.strip_prefix("./") {
-            normalized = stripped.to_owned();
-        }
-    }
-    normalized
-}
-
-#[cfg(test)]
-fn normalize_path(path: &Path) -> String {
-    normalize_pattern(&path.to_string_lossy())
-}
-
-fn is_absolute_pattern(pattern: &str) -> bool {
-    pattern.starts_with('/')
-        || pattern.as_bytes().get(1) == Some(&b':') && pattern.as_bytes().get(2) == Some(&b'/')
-}
-
-fn has_glob(pattern: &str) -> bool {
-    pattern.contains(['*', '?', '['])
 }
 
 fn rank_as_f64(rank: usize) -> f64 {
@@ -927,33 +784,23 @@ mod tests {
 
     use crate::{
         domain::{
-            Content, Entity, EntityContent, EntityFragment, EntityId, FileFormat, FileId,
-            FileIndexStatus, FileRecord, FileSnapshot, FragmentId, SourceRange, TextRange,
-            WindowFragment,
+            Content, Entity, EntityContent, EntityFragment, EntityId, FileCategory, FileFilter,
+            FileFormat, FileId, FileIndexStatus, FileRecord, FileSnapshot, FragmentId, GlobRule,
+            SourceRange, TextRange, WindowFragment,
             model::{EmbeddingModelInfo, Metric},
         },
         models::ModelError,
         storage::spi::{
             IndexedFragment, StoragePathFilter, StorageResult, StorageSearchFilter,
-            StorageSearchHit, StorageSearchPath, StoredEntity, StoredSearchData,
-            WorkspaceIndexStorage,
+            StorageSearchHit, StorageSearchPath, StoredEntity, StoredFileAttributes,
+            StoredSearchData, WorkspaceIndexStorage,
         },
     };
 
     use super::{
-        MatchedBy, SearchEmbeddingRuntime, SearchPlan, SearchRoute, SearchRouteMode,
-        file_type_name, normalize_path, search_workspace_index,
+        FileMatcher, MatchedBy, SearchEmbeddingRuntime, SearchPlan, SearchRoute, SearchRouteMode,
+        compile_path_filter, search_workspace_index,
     };
-
-    #[test]
-    fn normalizes_absolute_paths_and_ripgrep_file_type_aliases() {
-        assert_eq!(
-            normalize_path(Path::new("/workspace/src/lib.rs")),
-            "/workspace/src/lib.rs"
-        );
-        assert_eq!(file_type_name(".RS"), "rust");
-        assert_eq!(file_type_name("ALL"), "all");
-    }
 
     struct FixtureModel {
         info: EmbeddingModelInfo,
@@ -1046,12 +893,16 @@ mod tests {
         }
 
         fn list_files(&self) -> StorageResult<Vec<FileRecord>> {
+            panic!("query filters must not load complete file records")
+        }
+
+        fn list_file_attributes(&self) -> StorageResult<Vec<StoredFileAttributes>> {
+            assert!(!self.paths_only, "glob filters must only read paths");
             assert!(
-                !self.paths_only,
-                "path filters must only read the path projection"
+                !self.path_pushdown,
+                "pushdown must not enumerate attributes"
             );
-            assert!(!self.path_pushdown, "pushdown must not scan file records");
-            Ok(self.files.clone())
+            Ok(self.files.iter().map(StoredFileAttributes::from).collect())
         }
 
         fn list_file_paths(&self) -> StorageResult<Vec<(FileId, PathBuf)>> {
@@ -1343,8 +1194,8 @@ mod tests {
             mode: SearchRouteMode::Fts,
             query: "Service".to_owned(),
         }]);
-        plan.include_paths = vec!["src".to_owned()];
-        plan.file_types = vec!["rs".to_owned()];
+        plan.filter.globs = glob_rules(&["src/**"]);
+        plan.filter.formats = vec![FileFormat::Rust];
         plan.prefer_symbol = true;
 
         let result = search_workspace_index(Path::new("/workspace"), plan, &storage, None)
@@ -1369,44 +1220,25 @@ mod tests {
     }
 
     #[test]
-    fn resolves_absolute_and_relative_filters_against_the_current_workspace_root() {
+    fn resolves_globs_relative_to_the_current_workspace_root() {
         let source = file(1, "src/service.rs", "rust", 200);
         let files = [source.clone()];
-        let first_root = Path::new("/original/workspace");
-        let moved_root = Path::new("/moved/workspace");
         let mut plan = plan(Vec::new());
-
-        plan.include_paths = vec!["src/**/*.rs".to_owned()];
-        for root in [first_root, moved_root] {
+        plan.filter.globs = glob_rules(&["/src/**/*.rs"]);
+        for root in ["/original/workspace", "/moved/workspace"] {
             assert_eq!(
-                super::resolve_filtered_file_ids(root, &plan, &files).expect("relative filter"),
-                std::slice::from_ref(&source.id)
+                super::resolve_filtered_file_ids(Path::new(root), &plan, &files)
+                    .expect("relative glob"),
+                [source.id]
             );
         }
-
-        plan.include_paths = vec!["/moved/workspace/src/**/*.rs".to_owned()];
+        plan.filter.globs.push(GlobRule {
+            pattern: "!src/**".into(),
+            case_insensitive: false,
+        });
         assert!(
-            super::resolve_filtered_file_ids(first_root, &plan, &files)
-                .expect("old root filter")
-                .is_empty()
-        );
-        assert_eq!(
-            super::resolve_filtered_file_ids(moved_root, &plan, &files).expect("moved root filter"),
-            std::slice::from_ref(&source.id)
-        );
-
-        plan.include_paths.clear();
-        plan.globs = vec!["src/**/*.rs".to_owned()];
-        for root in [first_root, moved_root] {
-            assert_eq!(
-                super::resolve_filtered_file_ids(root, &plan, &files).expect("relative glob"),
-                std::slice::from_ref(&source.id)
-            );
-        }
-        plan.exclude_paths = vec!["/moved/workspace/src".to_owned()];
-        assert!(
-            super::resolve_filtered_file_ids(moved_root, &plan, &files)
-                .expect("absolute exclusion")
+            super::resolve_filtered_file_ids(Path::new("/moved/workspace"), &plan, &files)
+                .expect("excluded directory")
                 .is_empty()
         );
     }
@@ -1425,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn complex_globs_and_file_types_only_read_the_path_projection() {
+    fn complex_globs_only_read_the_path_projection() {
         let mut storage = pushdown_storage();
         storage.path_pushdown = false;
         storage.paths_only = true;
@@ -1435,12 +1267,92 @@ mod tests {
             file(3, "src/other/tests/a.md", "markdown", 10),
         ];
         let mut plan = plan(Vec::new());
-        plan.globs = vec!["src/*/tests/**".into()];
-        plan.file_types = vec!["rust".into()];
+        plan.filter.globs = glob_rules(&["src/*/tests/*.rs"]);
         let filter = super::search_plan_to_storage_filter(Path::new("/workspace"), &plan, &storage)
             .expect("path filter")
             .expect("filter present");
         assert_eq!(filter.file_ids, Some(vec![storage.files[0].id]));
+    }
+
+    #[test]
+    fn formats_and_categories_use_stored_attributes_with_any_exclusion_taking_precedence() {
+        let mut storage = pushdown_storage();
+        storage.path_pushdown = false;
+        storage.files = vec![
+            file(1, "src/header.h", "rust", 10),
+            file(2, "src/page.html", "rust", 20),
+            file(3, "src/data.json", "rust", 30),
+            file(4, "src/readme.md", "markdown", 40),
+            file(5, "src/source.txt", "rust", 50),
+        ];
+        storage.files[0].formats = vec![FileFormat::C, FileFormat::Cpp];
+        storage.files[1].formats = vec![FileFormat::Html];
+        storage.files[2].formats = vec![FileFormat::Json];
+        let mut plan = plan(Vec::new());
+        plan.filter.formats = vec![
+            FileFormat::Cpp,
+            FileFormat::Html,
+            FileFormat::Json,
+            FileFormat::Rust,
+        ];
+        plan.filter.categories = vec![FileCategory::Code, FileCategory::Data];
+        plan.filter.excluded_categories = vec![FileCategory::Document];
+        plan.filter.excluded_formats = vec![FileFormat::C];
+        // No source files exist at this root. The txt name must still match its stored Rust format.
+        let filter = super::search_plan_to_storage_filter(
+            Path::new("/nonexistent/workspace"),
+            &plan,
+            &storage,
+        )
+        .expect("stored attributes")
+        .expect("filter");
+        assert_eq!(filter.file_ids, Some(vec![FileId::new(3), FileId::new(5)]));
+    }
+
+    #[test]
+    fn modification_time_filters_use_light_attributes_and_exclude_unknown_times() {
+        let mut storage = pushdown_storage();
+        storage.path_pushdown = false;
+        storage.files = vec![
+            file(1, "old.rs", "rust", 0),
+            file(2, "new.rs", "rust", 20),
+            file(3, "unknown.rs", "rust", 30),
+        ];
+        storage.files[2].snapshot.modified_epoch_ms = None;
+        let mut plan = plan(Vec::new());
+        plan.modified_after_epoch_ms = Some(0);
+        plan.modified_before_epoch_ms = Some(20);
+        let filter = super::search_plan_to_storage_filter(
+            Path::new("/nonexistent/workspace"),
+            &plan,
+            &storage,
+        )
+        .expect("light time projection")
+        .expect("filter");
+        assert_eq!(filter.file_ids, Some(vec![FileId::new(1), FileId::new(2)]));
+        plan.modified_after_epoch_ms = Some(20);
+        let filter = super::search_plan_to_storage_filter(
+            Path::new("/nonexistent/workspace"),
+            &plan,
+            &storage,
+        )
+        .expect("inclusive time range")
+        .expect("filter");
+        assert_eq!(filter.file_ids, Some(vec![FileId::new(2)]));
+        plan.modified_after_epoch_ms = None;
+        plan.modified_before_epoch_ms = None;
+        plan.filter.categories = vec![FileCategory::Code];
+        let filter = super::search_plan_to_storage_filter(
+            Path::new("/nonexistent/workspace"),
+            &plan,
+            &storage,
+        )
+        .expect("unknown times need no exclusion without a time filter")
+        .expect("filter");
+        assert_eq!(
+            filter.file_ids,
+            Some(vec![FileId::new(1), FileId::new(2), FileId::new(3)])
+        );
     }
 
     #[test]
@@ -1496,10 +1408,7 @@ mod tests {
         ];
         for (patterns, expected) in cases {
             let mut plan = plan(Vec::new());
-            plan.globs = patterns
-                .iter()
-                .map(|pattern| (*pattern).to_owned())
-                .collect();
+            plan.filter.globs = glob_rules(&patterns);
             let result =
                 super::search_plan_to_storage_filter(Path::new("/workspace"), &plan, &storage)
                     .expect("planned filter")
@@ -1544,17 +1453,19 @@ mod tests {
             vec!["src/**", "!src/generated/**", "!docs/**"],
         ];
         for patterns in cases {
-            let patterns = patterns.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            let globs = super::GlobFilter::new(Path::new("/workspace"), &patterns, &[])
-                .expect("valid fixture");
-            let predicate = globs
-                .pushdown(&storage)
+            let filter = FileFilter {
+                globs: glob_rules(&patterns),
+                ..FileFilter::default()
+            };
+            let matcher =
+                FileMatcher::new(Path::new("/workspace"), &filter).expect("valid fixture");
+            let predicate = compile_path_filter(&filter.globs, &storage)
                 .expect("valid fixture")
                 .expect("pushdown");
             for path in paths {
                 assert_eq!(
                     predicate_matches(&predicate, Path::new(path)),
-                    globs.is_match(Path::new(path)),
+                    matcher.matches_path(Path::new(path)),
                     "patterns={patterns:?}, path={path}",
                 );
             }
@@ -1602,11 +1513,14 @@ mod tests {
         for first in positives {
             for second in positives {
                 for exclusion in [None, Some("!src/generated/**"), Some("!docs/**")] {
-                    let mut patterns = vec![first.to_owned(), second.to_owned()];
-                    patterns.extend(exclusion.map(str::to_owned));
-                    let globs = super::GlobFilter::new(root.path(), &patterns, &[]).expect("globs");
-                    let predicate = globs
-                        .pushdown(&storage)
+                    let mut patterns = vec![first, second];
+                    patterns.extend(exclusion);
+                    let filter = FileFilter {
+                        globs: glob_rules(&patterns),
+                        ..FileFilter::default()
+                    };
+                    let matcher = FileMatcher::new(root.path(), &filter).expect("globs");
+                    let predicate = compile_path_filter(&filter.globs, &storage)
                         .expect("planner")
                         .expect("pushdown");
                     let mut overrides = ignore::overrides::OverrideBuilder::new(root.path());
@@ -1637,7 +1551,7 @@ mod tests {
                     assert_eq!(selected, expected, "{patterns:?}");
                     for path in paths {
                         assert_eq!(
-                            globs.is_match(Path::new(path)),
+                            matcher.matches_path(Path::new(path)),
                             expected.contains(Path::new(path)),
                             "{patterns:?}, {path}"
                         );
@@ -1696,15 +1610,9 @@ mod tests {
         ];
         for (patterns, expected) in cases {
             let mut plan = plan(Vec::new());
-            plan.globs = patterns
-                .iter()
-                .map(|pattern| (*pattern).to_owned())
-                .collect();
-            let globs = super::GlobFilter::new(Path::new("/workspace"), &plan.globs, &[])
-                .expect("valid fixture");
+            plan.filter.globs = glob_rules(&patterns);
             assert!(
-                globs
-                    .pushdown(&pushdown_storage())
+                compile_path_filter(&plan.filter.globs, &pushdown_storage())
                     .expect("valid fixture")
                     .is_none(),
                 "{patterns:?}"
@@ -1720,27 +1628,37 @@ mod tests {
     }
 
     #[test]
-    fn fallback_preserves_glob_escaping_case_and_invalid_pattern_errors() {
-        let patterns = [r"\!literal.rs".to_owned()];
-        let globs =
-            super::GlobFilter::new(Path::new("/workspace"), &patterns, &[]).expect("valid fixture");
-        assert!(globs.is_match(Path::new("nested/!literal.rs")));
-        assert!(!globs.is_match(Path::new("literal.rs")));
+    fn fallback_preserves_glob_escaping_case_order_and_invalid_pattern_errors() {
+        let mut filter = FileFilter {
+            globs: glob_rules(&[r"\!literal.rs"]),
+            ..FileFilter::default()
+        };
+        let matcher = FileMatcher::new(Path::new("/workspace"), &filter).expect("valid fixture");
+        assert!(matcher.matches_path(Path::new("nested/!literal.rs")));
+        assert!(!matcher.matches_path(Path::new("literal.rs")));
 
-        let patterns = ["*.RS".to_owned()];
-        let sensitive =
-            super::GlobFilter::new(Path::new("/workspace"), &patterns, &[]).expect("valid fixture");
-        assert!(!sensitive.is_match(Path::new("src/main.rs")));
+        filter.globs = glob_rules(&["*.RS"]);
+        let sensitive = FileMatcher::new(Path::new("/workspace"), &filter).expect("valid fixture");
+        assert!(!sensitive.matches_path(Path::new("src/main.rs")));
+        filter.globs[0].case_insensitive = true;
         let insensitive =
-            super::GlobFilter::new(Path::new("/workspace"), &[], &patterns).expect("valid fixture");
-        assert!(insensitive.is_match(Path::new("src/main.rs")));
+            FileMatcher::new(Path::new("/workspace"), &filter).expect("valid fixture");
+        assert!(insensitive.matches_path(Path::new("src/main.rs")));
         assert!(
-            insensitive
-                .pushdown(&pushdown_storage())
-                .expect("valid fixture")
+            compile_path_filter(&filter.globs, &pushdown_storage())
+                .expect("planner")
                 .is_none()
         );
-        assert!(super::GlobFilter::new(Path::new("/workspace"), &["[".to_owned()], &[]).is_err());
+
+        filter.globs.extend(glob_rules(&["!main.rs"]));
+        let excluded = FileMatcher::new(Path::new("/workspace"), &filter).expect("mixed rules");
+        assert!(!excluded.matches_path(Path::new("src/main.rs")));
+        filter.globs.reverse();
+        let included = FileMatcher::new(Path::new("/workspace"), &filter).expect("reversed rules");
+        assert!(included.matches_path(Path::new("src/main.rs")));
+
+        filter.globs = glob_rules(&["["]);
+        assert!(FileMatcher::new(Path::new("/workspace"), &filter).is_err());
     }
 
     #[cfg(unix)]
@@ -1754,32 +1672,42 @@ mod tests {
                 .expect("source path");
         let mut storage = pushdown_storage();
         storage.files = vec![source.clone()];
-        let name_patterns = ["*.rs".to_owned()];
-        let names =
-            super::GlobFilter::new(Path::new("/workspace"), &name_patterns, &[]).expect("glob");
-        assert!(names.pushdown(&storage).expect("planner").is_none());
-        let directory_patterns = ["src/**".to_owned()];
-        let directory = super::GlobFilter::new(Path::new("/workspace"), &directory_patterns, &[])
-            .expect("glob");
+        let name_patterns = glob_rules(&["*.rs"]);
+        assert!(
+            compile_path_filter(&name_patterns, &storage)
+                .expect("planner")
+                .is_none()
+        );
+        let directory_patterns = glob_rules(&["src/**"]);
         assert_eq!(
-            directory.pushdown(&storage).expect("planner"),
+            compile_path_filter(&directory_patterns, &storage).expect("planner"),
             Some(StoragePathFilter::Directory(
                 crate::domain::SourcePath::new("src").expect("directory")
             ))
         );
         let mut plan = plan(Vec::new());
-        plan.globs = vec!["*.rs".into()];
+        plan.filter.globs = glob_rules(&["*.rs"]);
         assert_eq!(
             super::resolve_filtered_file_ids(Path::new("/workspace"), &plan, &[source.clone()])
                 .expect("valid fixture"),
             vec![source.id]
         );
-        plan.globs = vec!["*\u{fffd}.rs".into()];
+        plan.filter.globs = glob_rules(&["*\u{fffd}.rs"]);
         assert!(
             super::resolve_filtered_file_ids(Path::new("/workspace"), &plan, &[source])
                 .expect("valid fixture")
                 .is_empty()
         );
+    }
+
+    fn glob_rules(patterns: &[&str]) -> Vec<GlobRule> {
+        patterns
+            .iter()
+            .map(|pattern| GlobRule {
+                pattern: (*pattern).to_owned(),
+                case_insensitive: false,
+            })
+            .collect()
     }
 
     fn plan(routes: Vec<SearchRoute>) -> SearchPlan {
@@ -1789,12 +1717,7 @@ mod tests {
             trace: true,
             prefer_symbol: false,
             symbol_types: Vec::new(),
-            include_paths: Vec::new(),
-            exclude_paths: Vec::new(),
-            globs: Vec::new(),
-            insensitive_globs: Vec::new(),
-            file_types: Vec::new(),
-            excluded_file_types: Vec::new(),
+            filter: FileFilter::default(),
             modified_after_epoch_ms: None,
             modified_before_epoch_ms: None,
         }

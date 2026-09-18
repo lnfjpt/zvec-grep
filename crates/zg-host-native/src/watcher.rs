@@ -1,4 +1,6 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
@@ -10,7 +12,8 @@ use std::{
 use async_trait::async_trait;
 use notify::{
     Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
-    Watcher, event::RemoveKind,
+    Watcher,
+    event::{ModifyKind, RemoveKind, RenameMode},
 };
 use tokio::{
     sync::{Mutex, Notify, mpsc, oneshot},
@@ -23,12 +26,10 @@ use tracing::warn;
 use crate::{
     HostError,
     api::{
-        TaskControl, WatchRequest, WorkspaceChange, WorkspaceChangeBatch,
+        RootSpec, TaskControl, WatchRequest, WorkspaceChange, WorkspaceChangeBatch,
         WorkspaceWatchSessionPort, WorkspaceWatcherFactoryPort,
     },
     change_set::ChangeSet,
-    pattern::normalize_relative_path,
-    policy::{FileTypeResolver, PathInterest, RootPolicy},
 };
 
 const DEFAULT_RAW_EVENT_CAPACITY: usize = 4_096;
@@ -66,7 +67,6 @@ impl Default for NativeWatcherConfig {
 
 #[derive(Clone, Debug)]
 pub struct NativeWatcherFactory {
-    resolver: FileTypeResolver,
     config: NativeWatcherConfig,
 }
 
@@ -74,7 +74,6 @@ impl NativeWatcherFactory {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            resolver: FileTypeResolver::new(),
             config: NativeWatcherConfig::default(),
         }
     }
@@ -101,30 +100,22 @@ impl WorkspaceWatcherFactoryPort for NativeWatcherFactory {
     ) -> Result<Arc<dyn WorkspaceWatchSessionPort>, HostError> {
         check_control(control)?;
         let root = request.root.clone();
-        let resolver = self.resolver.clone();
-        let policy_task = tokio::task::spawn_blocking(move || RootPolicy::new(root, &resolver));
-        let policy = tokio::select! {
-            () = control.cancellation.cancelled() => {
-                return Err(HostError::cancelled("workspace watcher initialization was cancelled"));
-            },
-            () = deadline_wait(control.deadline) => {
-                return Err(HostError::deadline_exceeded(
-                    "workspace watcher initialization exceeded its deadline",
-                ));
-            },
-            result = policy_task => result
-                .map_err(|error| HostError::internal(format!("watch policy worker failed: {error}")))??,
-        };
-        let metadata = std::fs::metadata(policy.root_path()).map_err(|error| {
+        if !root.path.is_absolute() {
+            return Err(HostError::invalid_argument(format!(
+                "watch root must be absolute: {}",
+                root.path.display()
+            )));
+        }
+        let metadata = fs::metadata(&root.path).map_err(|error| {
             HostError::invalid_argument(format!(
                 "watch root {} could not be inspected: {error}",
-                policy.root_path().display()
+                root.path.display()
             ))
         })?;
         if !metadata.is_file() && !metadata.is_dir() {
             return Err(HostError::invalid_argument(format!(
                 "watch root {} must be a file or directory",
-                policy.root_path().display()
+                root.path.display()
             )));
         }
 
@@ -132,20 +123,33 @@ impl WorkspaceWatcherFactoryPort for NativeWatcherFactory {
         let (raw_sender, raw_receiver) = mpsc::channel(config.raw_event_capacity);
         let overflowed = Arc::new(AtomicBool::new(false));
         let overflow_notify = Arc::new(Notify::new());
-        let watcher = create_watcher(
-            policy.root_path(),
-            policy.root().recursive,
-            &raw_sender,
-            &overflowed,
-            &overflow_notify,
-            config.poll_interval,
-        )?;
+        let watcher_root = root.clone();
+        let watcher_sender = raw_sender.clone();
+        let watcher_overflow = Arc::clone(&overflowed);
+        let watcher_notify = Arc::clone(&overflow_notify);
+        let root_is_file = metadata.is_file();
+        let poll_interval = config.poll_interval;
+        let initialization = tokio::task::spawn_blocking(move || {
+            create_watcher(
+                &watcher_root,
+                root_is_file,
+                &watcher_sender,
+                &watcher_overflow,
+                &watcher_notify,
+                poll_interval,
+            )
+        });
+        let watcher = tokio::select! {
+            () = control.cancellation.cancelled() => return Err(HostError::cancelled("watcher initialization was cancelled")),
+            () = deadline_wait(control.deadline) => return Err(HostError::deadline_exceeded("watcher initialization exceeded its deadline")),
+            result = initialization => result.map_err(watcher_error)??,
+        };
         let (batch_sender, batch_receiver) = mpsc::channel(config.batch_capacity);
         let close = CancellationToken::new();
         let (flush_sender, flush_receiver) = mpsc::channel(1);
         let task = tokio::spawn(watch_loop(WatchLoop {
             flush_receiver,
-            policy,
+            root,
             root_is_file: metadata.is_file(),
             config,
             watcher: Some(watcher),
@@ -243,7 +247,7 @@ impl WorkspaceWatchSessionPort for NativeWatchSession {
 
 struct WatchLoop {
     flush_receiver: mpsc::Receiver<oneshot::Sender<()>>,
-    policy: RootPolicy,
+    root: RootSpec,
     root_is_file: bool,
     config: NativeWatcherConfig,
     watcher: Option<NativeWatcher>,
@@ -275,10 +279,12 @@ async fn watch_loop(mut state: WatchLoop) {
     let mut recovery_reconcile_pending = false;
 
     loop {
+        let mut refresh_registration = false;
         tokio::select! {
             () = state.close.cancelled() => break,
             Some(acknowledge) = state.flush_receiver.recv() => {
                 // Reconciliation covers native events still pending delivery or normalization.
+                refresh_registration = true;
                 changes.require_full_rescan();
                 if !flush_changes(&mut changes, &state.batch_sender, &state.close).await {
                     break;
@@ -302,6 +308,7 @@ async fn watch_loop(mut state: WatchLoop) {
                 max_wait_deadline = None;
             }
             () = sleep_until_option(reconcile_deadline) => {
+                refresh_registration = true;
                 changes.require_full_rescan();
                 schedule_flush(&state.config, &mut debounce_deadline, &mut max_wait_deadline);
                 reconcile_deadline = state.config.reconcile_interval.map(|interval| Instant::now() + interval);
@@ -309,6 +316,7 @@ async fn watch_loop(mut state: WatchLoop) {
             () = sleep_until_option(resume_deadline) => {
                 let now = Instant::now();
                 if now.duration_since(last_resume_check) > state.config.resume_threshold {
+                    refresh_registration = true;
                     changes.require_full_rescan();
                     schedule_flush(&state.config, &mut debounce_deadline, &mut max_wait_deadline);
                 }
@@ -321,18 +329,23 @@ async fn watch_loop(mut state: WatchLoop) {
                 stable_deadline = None;
             }
             () = sleep_until_option(retry_deadline) => {
-                match create_watcher(
-                    state.policy.root_path(),
-                    state.policy.root().recursive,
-                    &state.raw_sender,
-                    &state.overflowed,
-                    &state.overflow_notify,
-                    state.config.poll_interval,
-                ) {
+                let root = state.root.clone();
+                let root_is_file = state.root_is_file;
+                let sender = state.raw_sender.clone();
+                let overflowed = Arc::clone(&state.overflowed);
+                let notify = Arc::clone(&state.overflow_notify);
+                let interval = state.config.poll_interval;
+                let recovered = tokio::task::spawn_blocking(move || create_watcher(
+                    &root, root_is_file, &sender, &overflowed, &notify, interval,
+                )).await.map_err(watcher_error).and_then(|result| result);
+                match recovered {
                     Ok(watcher) => {
                         state.watcher = Some(watcher);
                         retry_deadline = None;
                         stable_deadline = Some(Instant::now() + Duration::from_secs(1));
+                        // Reconcile changes missed between backend failure and recovery.
+                        changes.require_full_rescan();
+                        schedule_flush(&state.config, &mut debounce_deadline, &mut max_wait_deadline);
                     }
                     Err(error) => {
                         warn!(%error, "failed to recover native watcher");
@@ -343,6 +356,7 @@ async fn watch_loop(mut state: WatchLoop) {
             }
             () = state.overflow_notify.notified() => {
                 if state.overflowed.swap(false, Ordering::AcqRel) {
+                    refresh_registration = true;
                     changes.require_full_rescan();
                     schedule_flush(&state.config, &mut debounce_deadline, &mut max_wait_deadline);
                 }
@@ -351,22 +365,49 @@ async fn watch_loop(mut state: WatchLoop) {
                 let Some(raw) = raw else { break; };
                 match raw {
                     Ok(event) => {
-                        let policy = state.policy.clone();
+                        let root = state.root.clone();
                         let root_is_file = state.root_is_file;
-                        match tokio::task::spawn_blocking(move || normalize_event(&policy, root_is_file, &event)).await {
-                            Ok(event_changes) => {
+                        let watcher = state.watcher.take();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let mut watcher = watcher;
+                            let events = watcher.as_ref().map_or_else(|| vec![event.clone()], |watcher| watcher.aliases.translated_events(&event));
+                            let result = events.iter().try_fold(NormalizedEvent { changes: Vec::new(), refresh_registration: false }, |mut combined, translated| {
+                                let normalized = normalize_event(&root, root_is_file, translated)?;
+                                combined.changes.extend(normalized.changes);
+                                combined.refresh_registration |= normalized.refresh_registration;
+                                Ok::<_, HostError>(combined)
+                            });
+                            let result = result.and_then(|normalized| {
+                                if let Some(watcher) = &mut watcher
+                                    && (normalized.refresh_registration || watcher.registered_path_changed(&event)) {
+                                    root.policy.invalidate()?;
+                                    watcher.refresh(&root, root_is_file)?;
+                                }
+                                Ok(normalized.changes)
+                            });
+                            (watcher, result)
+                        }).await;
+                        match result {
+                            Ok((watcher, Ok(event_changes))) => {
+                                state.watcher = watcher;
                                 for change in event_changes {
                                     changes.add(change);
                                 }
-                                if !changes.is_empty() {
-                                    schedule_flush(&state.config, &mut debounce_deadline, &mut max_wait_deadline);
-                                }
+                            }
+                            Ok((watcher, Err(error))) => {
+                                warn!(%error, "native watcher event policy failed");
+                                state.watcher = watcher;
+                                retry_deadline = Some(Instant::now() + retry_delay(consecutive_errors));
+                                changes.require_full_rescan();
                             }
                             Err(error) => {
                                 warn!(%error, "native watcher event worker failed");
+                                retry_deadline = Some(Instant::now() + retry_delay(consecutive_errors));
                                 changes.require_full_rescan();
-                                schedule_flush(&state.config, &mut debounce_deadline, &mut max_wait_deadline);
                             }
+                        }
+                        if !changes.is_empty() {
+                            schedule_flush(&state.config, &mut debounce_deadline, &mut max_wait_deadline);
                         }
                     }
                     Err(error) => {
@@ -384,18 +425,43 @@ async fn watch_loop(mut state: WatchLoop) {
                 }
             }
         }
+        if refresh_registration && let Err(error) = refresh_watcher(&mut state).await {
+            warn!(%error, "could not reconcile watcher registrations");
+            consecutive_errors = consecutive_errors.saturating_add(1);
+            retry_deadline = Some(Instant::now() + retry_delay(consecutive_errors));
+        }
     }
     state.watcher.take();
 }
 
+async fn refresh_watcher(state: &mut WatchLoop) -> Result<(), HostError> {
+    let Some(mut watcher) = state.watcher.take() else {
+        return Ok(());
+    };
+    let root = state.root.clone();
+    let root_is_file = state.root_is_file;
+    let (watcher, result) = tokio::task::spawn_blocking(move || {
+        let result = root
+            .policy
+            .invalidate()
+            .and_then(|()| watcher.refresh(&root, root_is_file));
+        (watcher, result)
+    })
+    .await
+    .map_err(watcher_error)?;
+    state.watcher = Some(watcher);
+    result
+}
+
 fn create_watcher(
-    root: &Path,
-    recursive: bool,
+    root: &RootSpec,
+    root_is_file: bool,
     raw_sender: &mpsc::Sender<notify::Result<Event>>,
     overflowed: &Arc<AtomicBool>,
     overflow_notify: &Arc<Notify>,
     poll_interval: Option<Duration>,
 ) -> Result<NativeWatcher, HostError> {
+    root.policy.invalidate()?;
     let sender = raw_sender.clone();
     let overflowed = Arc::clone(overflowed);
     let overflow_notify = Arc::clone(overflow_notify);
@@ -405,204 +471,513 @@ fn create_watcher(
             overflow_notify.notify_one();
         }
     };
-    let recursive_mode = if recursive {
-        RecursiveMode::Recursive
+    let backend = if let Some(interval) = poll_interval {
+        WatchBackend::Poll(
+            PollWatcher::new(
+                handler,
+                NotifyConfig::default()
+                    .with_poll_interval(interval)
+                    .with_compare_contents(true)
+                    .with_follow_symlinks(root.follow),
+            )
+            .map_err(watcher_error)?,
+        )
     } else {
-        RecursiveMode::NonRecursive
-    };
-    let watch_error = |error| {
-        HostError::storage_failure(
-            "native-watcher",
-            format!("could not watch {}: {error}", root.display()),
+        WatchBackend::Recommended(
+            RecommendedWatcher::new(
+                handler,
+                NotifyConfig::default().with_follow_symlinks(root.follow),
+            )
+            .map_err(watcher_error)?,
         )
     };
+    let mut watcher = NativeWatcher {
+        backend,
+        registrations: BTreeMap::new(),
+        aliases: WatchAliases::default(),
+    };
+    watcher.refresh(root, root_is_file)?;
+    Ok(watcher)
+}
 
-    if let Some(interval) = poll_interval {
-        let mut watcher = PollWatcher::new(
-            handler,
-            NotifyConfig::default()
-                .with_poll_interval(interval)
-                .with_compare_contents(true),
-        )
-        .map_err(|error| HostError::storage_failure("native-watcher", error.to_string()))?;
-        watcher.watch(root, recursive_mode).map_err(watch_error)?;
-        Ok(NativeWatcher::Poll { _watcher: watcher })
+fn watcher_error(error: impl std::fmt::Display) -> HostError {
+    HostError::storage_failure("native-watcher", error.to_string())
+}
+
+struct NativeWatcher {
+    backend: WatchBackend,
+    registrations: BTreeMap<PathBuf, DirectoryIdentity>,
+    aliases: WatchAliases,
+}
+
+#[derive(Default)]
+struct WatchAliases {
+    directories: BTreeMap<PathBuf, PathBuf>,
+    files: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+}
+
+impl WatchAliases {
+    fn translated_events(&self, event: &Event) -> Vec<Event> {
+        if event.paths.is_empty() {
+            return vec![event.clone()];
+        }
+        event
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut translated = event.clone();
+                if matches!(
+                    event.kind,
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+                ) {
+                    translated.kind = EventKind::Modify(ModifyKind::Name(if index == 0 {
+                        RenameMode::From
+                    } else {
+                        RenameMode::To
+                    }));
+                }
+                let mut paths = BTreeSet::new();
+                let directory_alias = self
+                    .directories
+                    .iter()
+                    .filter(|(target, _)| path.starts_with(target))
+                    .max_by_key(|(target, _)| target.components().count());
+                if let Some((target, alias)) = directory_alias {
+                    paths.insert(
+                        alias.join(path.strip_prefix(target).expect("matched directory prefix")),
+                    );
+                } else {
+                    paths.insert(path.clone());
+                }
+                if let Some(aliases) = self.files.get(path) {
+                    paths.extend(aliases.iter().cloned());
+                }
+                if is_topology_event(event.kind) {
+                    // A missing target's ancestors are watched until its parent reappears.
+                    for (target, aliases) in &self.files {
+                        if target.starts_with(path) {
+                            paths.extend(aliases.iter().cloned());
+                        }
+                    }
+                    for (target, alias) in &self.directories {
+                        if target.starts_with(path) {
+                            paths.insert(alias.clone());
+                        }
+                    }
+                }
+                translated.paths = paths.into_iter().collect();
+                translated
+            })
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct WatchPlan {
+    directories: BTreeSet<PathBuf>,
+    aliases: WatchAliases,
+}
+
+/// Stable directory identity without retaining an extra OS file handle per watch.
+#[derive(Eq, PartialEq)]
+struct DirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl DirectoryIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                created: metadata.created().ok(),
+            }
+        }
+    }
+}
+
+enum WatchBackend {
+    Recommended(RecommendedWatcher),
+    Poll(PollWatcher),
+}
+
+impl NativeWatcher {
+    fn registered_path_changed(&self, event: &Event) -> bool {
+        is_topology_event(event.kind)
+            && event.paths.iter().any(|path| {
+                self.registrations.contains_key(path)
+                    || self
+                        .aliases
+                        .directories
+                        .iter()
+                        .any(|(target, alias)| target.starts_with(path) || alias == path)
+                    || self
+                        .aliases
+                        .files
+                        .iter()
+                        .any(|(target, aliases)| target.starts_with(path) || aliases.contains(path))
+            })
+    }
+
+    fn refresh(&mut self, root: &RootSpec, root_is_file: bool) -> Result<(), HostError> {
+        let desired = watch_directories(root, root_is_file, &mut |path| self.register(path))?;
+        let stale: Vec<_> = self
+            .registrations
+            .keys()
+            .filter(|path| !desired.directories.contains(*path))
+            .cloned()
+            .collect();
+        for path in stale {
+            self.unregister(&path);
+        }
+        self.aliases = desired.aliases;
+        Ok(())
+    }
+
+    fn unregister(&mut self, path: &Path) {
+        // Removed directories can have already been dropped by the backend.
+        let _ = match &mut self.backend {
+            WatchBackend::Recommended(watcher) => watcher.unwatch(path),
+            WatchBackend::Poll(watcher) => watcher.unwatch(path),
+        };
+        self.registrations.remove(path);
+    }
+
+    fn register(&mut self, path: &Path) -> Result<(), HostError> {
+        let identity = match fs::metadata(path) {
+            Ok(metadata) => DirectoryIdentity::from_metadata(&metadata),
+            Err(_) if !path.exists() => return Ok(()),
+            Err(error) => return Err(watcher_error(error)),
+        };
+        if self.registrations.get(path) == Some(&identity) {
+            return Ok(());
+        }
+        if self.registrations.contains_key(path) {
+            self.unregister(path);
+        }
+        let result = match &mut self.backend {
+            WatchBackend::Recommended(watcher) => watcher.watch(path, RecursiveMode::NonRecursive),
+            WatchBackend::Poll(watcher) => watcher.watch(path, RecursiveMode::NonRecursive),
+        };
+        match result {
+            Ok(()) => {
+                self.registrations.insert(path.to_path_buf(), identity);
+                Ok(())
+            }
+            Err(_) if !path.exists() => Ok(()),
+            Err(error) => Err(watcher_error(format!(
+                "could not watch {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+}
+
+/// Discover only traversable directories before asking the OS to allocate watches.
+fn watch_directories(
+    root: &RootSpec,
+    root_is_file: bool,
+    register: &mut impl FnMut(&Path) -> Result<(), HostError>,
+) -> Result<WatchPlan, HostError> {
+    let mut plan = WatchPlan::default();
+    // Watching the parent preserves root replacement and recreation detection.
+    add_existing_parent(&root.path, &mut plan.directories);
+    for control_path in root.policy.control_paths() {
+        add_existing_parent(&control_path, &mut plan.directories);
+    }
+    for path in &plan.directories {
+        register(path)?;
+    }
+    if root_is_file {
+        if fs::symlink_metadata(&root.path).is_ok_and(|metadata| metadata.is_symlink()) {
+            add_file_link(root, &root.path, &mut plan, register)?;
+        }
     } else {
-        let mut watcher = notify::recommended_watcher(handler)
-            .map_err(|error| HostError::storage_failure("native-watcher", error.to_string()))?;
-        watcher.watch(root, recursive_mode).map_err(watch_error)?;
-        Ok(NativeWatcher::Recommended { _watcher: watcher })
+        let mut visited = BTreeSet::new();
+        collect_watch_directories(root, &root.path, 0, &mut visited, &mut plan, register)?;
+    }
+    // Traversal may discover additional rule files (including symlink targets).
+    for control in root.policy.control_paths() {
+        let mut parents = BTreeSet::new();
+        add_existing_parent(&control, &mut parents);
+        for parent in parents {
+            if plan.directories.insert(parent.clone()) {
+                register(&parent)?;
+            }
+        }
+    }
+    Ok(plan)
+}
+
+fn add_existing_parent(path: &Path, directories: &mut BTreeSet<PathBuf>) {
+    let mut parent = path.parent();
+    while let Some(path) = parent {
+        if path.is_dir() {
+            directories.insert(path.to_path_buf());
+            break;
+        }
+        parent = path.parent();
     }
 }
 
-enum NativeWatcher {
-    Recommended { _watcher: RecommendedWatcher },
-    Poll { _watcher: PollWatcher },
-}
-
-fn normalize_event(policy: &RootPolicy, root_is_file: bool, event: &Event) -> Vec<WorkspaceChange> {
-    match event.kind {
-        EventKind::Access(_) => Vec::new(),
-        EventKind::Any | EventKind::Other => vec![WorkspaceChange::Rescan],
-        EventKind::Remove(RemoveKind::File) => event
-            .paths
-            .iter()
-            .filter_map(|path| normalize_removed_path(policy, root_is_file, path, false))
-            .collect(),
-        EventKind::Remove(_) => event
-            .paths
-            .iter()
-            .filter_map(|path| normalize_removed_path(policy, root_is_file, path, true))
-            .collect(),
-        EventKind::Create(_) | EventKind::Modify(_) => event
-            .paths
-            .iter()
-            .filter_map(|path| normalize_present_or_removed_path(policy, root_is_file, path))
-            .collect(),
-    }
-}
-
-fn normalize_present_or_removed_path(
-    policy: &RootPolicy,
-    root_is_file: bool,
+fn collect_watch_directories(
+    root: &RootSpec,
     path: &Path,
-) -> Option<WorkspaceChange> {
-    normalize_present_or_removed_path_with(policy, root_is_file, path, |path| {
-        std::fs::metadata(path).ok()
-    })
+    depth: usize,
+    visited: &mut BTreeSet<PathBuf>,
+    plan: &mut WatchPlan,
+    register: &mut impl FnMut(&Path) -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    if !path.is_dir() || !root.policy.can_descend(path)? {
+        return Ok(());
+    }
+    let Ok(canonical) = fs::canonicalize(path) else {
+        return Ok(());
+    };
+    if !visited.insert(canonical.clone()) {
+        return Ok(());
+    }
+    if canonical != path {
+        plan.aliases
+            .directories
+            .insert(canonical, path.to_path_buf());
+    }
+    // Register before enumerating children so concurrent directory creation is queued.
+    if plan.directories.insert(path.to_path_buf()) {
+        register(path)?;
+    }
+    if root.max_depth.is_some_and(|maximum| depth + 1 > maximum) {
+        return Ok(());
+    }
+    let descend = root.recursive && root.max_depth.is_none_or(|maximum| depth + 1 < maximum);
+    let Ok(entries) = fs::read_dir(path) else {
+        return Ok(());
+    };
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() && descend {
+            collect_watch_directories(root, &entry.path(), depth + 1, visited, plan, register)?;
+        } else if root.follow && file_type.is_symlink() {
+            if entry.path().is_dir() {
+                if descend {
+                    collect_watch_directories(
+                        root,
+                        &entry.path(),
+                        depth + 1,
+                        visited,
+                        plan,
+                        register,
+                    )?;
+                }
+            } else {
+                add_file_link(root, &entry.path(), plan, register)?;
+            }
+        }
+    }
+    Ok(())
 }
 
-fn normalize_present_or_removed_path_with(
-    policy: &RootPolicy,
-    root_is_file: bool,
-    path: &Path,
-    metadata: impl FnOnce(&Path) -> Option<std::fs::Metadata>,
-) -> Option<WorkspaceChange> {
-    if path == policy.root_path() && !root_is_file {
-        return Some(WorkspaceChange::Rescan);
+fn add_file_link(
+    root: &RootSpec,
+    alias: &Path,
+    plan: &mut WatchPlan,
+    register: &mut impl FnMut(&Path) -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    if !root.policy.includes_file(alias)? && !root.policy.can_descend(alias)? {
+        return Ok(());
     }
-    match normalize_gitignore_change(policy, root_is_file, path) {
-        GitignoreChange::NotGitignore => {}
-        GitignoreChange::Ignored => return None,
-        GitignoreChange::Reconcile(change) => return Some(change),
+    let Ok(link) = fs::read_link(alias) else {
+        return Ok(());
+    };
+    let target = alias.parent().unwrap_or(&root.path).join(link);
+    // Resolve as much as exists, preserving missing target components for recreation.
+    let Some(target) = resolve_missing_path(&target) else {
+        return Ok(());
+    };
+    plan.aliases
+        .files
+        .entry(target.clone())
+        .or_default()
+        .insert(alias.to_path_buf());
+    let mut parents = BTreeSet::new();
+    add_existing_parent(&target, &mut parents);
+    for parent in parents {
+        if plan.directories.insert(parent.clone()) {
+            register(&parent)?;
+        }
     }
-    let interest = policy.classify_path_interest(path);
-    if interest.is_empty() {
-        return None;
+    Ok(())
+}
+
+fn resolve_missing_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = fs::canonicalize(ancestor) {
+            return Some(canonical.join(path.strip_prefix(ancestor).ok()?));
+        }
     }
-    let metadata = metadata(path);
-    if metadata.is_none() {
-        return normalize_removed_path_with_interest(policy, root_is_file, path, true, interest);
-    }
-    normalize_present_path(
-        policy,
-        root_is_file,
-        path,
-        metadata.is_some_and(|value| value.is_dir()),
-        interest,
+    None
+}
+
+fn is_topology_event(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
     )
 }
 
-fn normalize_present_path(
-    policy: &RootPolicy,
+#[derive(Default)]
+struct NormalizedEvent {
+    changes: Vec<WorkspaceChange>,
+    refresh_registration: bool,
+}
+
+fn normalize_event(
+    root: &RootSpec,
     root_is_file: bool,
+    event: &Event,
+) -> Result<NormalizedEvent, HostError> {
+    let mut normalized = NormalizedEvent::default();
+    if matches!(event.kind, EventKind::Access(_)) {
+        return Ok(normalized);
+    }
+    if event.need_rescan() || matches!(event.kind, EventKind::Any | EventKind::Other) {
+        root.policy.invalidate()?;
+        normalized.changes.push(WorkspaceChange::Rescan);
+        normalized.refresh_registration = true;
+        return Ok(normalized);
+    }
+    let topology_event = is_topology_event(event.kind);
+    let control_paths = root.policy.control_paths();
+    for (index, path) in event.paths.iter().enumerate() {
+        if let Some(change) = normalize_policy_change(root, path, topology_event, &control_paths)? {
+            normalized.changes.push(change);
+            normalized.refresh_registration = true;
+            continue;
+        }
+        if path == &root.path && !root_is_file {
+            normalized.changes.push(WorkspaceChange::Rescan);
+            normalized.refresh_registration |= topology_event;
+            continue;
+        }
+        let Some(relative) = relative_change_path(root, root_is_file, path) else {
+            continue;
+        };
+        // Rename sources and deletions must clear formerly indexed entries even if
+        // current rules reject the path, or it cannot be inspected any more.
+        if is_removed_path(event.kind, index) {
+            normalized.changes.push(
+                if matches!(event.kind, EventKind::Remove(RemoveKind::File)) {
+                    WorkspaceChange::Delete(relative)
+                } else {
+                    WorkspaceChange::DeletePrefix(relative)
+                },
+            );
+            continue;
+        }
+        let metadata = fs::symlink_metadata(path).ok();
+        let Some(metadata) = metadata else {
+            normalized
+                .changes
+                .push(WorkspaceChange::DeletePrefix(relative));
+            continue;
+        };
+        let metadata = if metadata.is_symlink() {
+            normalized.refresh_registration |= topology_event;
+            if !root.follow {
+                continue;
+            }
+            let Ok(metadata) = fs::metadata(path) else {
+                normalized
+                    .changes
+                    .push(WorkspaceChange::DeletePrefix(relative));
+                continue;
+            };
+            metadata
+        } else {
+            metadata
+        };
+        let depth = relative.components().count();
+        if metadata.is_dir() {
+            normalized.refresh_registration |= topology_event;
+            if root.recursive
+                && root.max_depth.is_none_or(|maximum| depth < maximum)
+                && root.policy.can_descend(path)?
+            {
+                normalized
+                    .changes
+                    .push(WorkspaceChange::RescanDirectory(relative));
+            }
+        } else if metadata.is_file()
+            && (root.recursive || depth <= 1)
+            && root.max_depth.is_none_or(|maximum| depth <= maximum)
+            && root.policy.includes_file(path)?
+        {
+            // Do not suppress empty/oversized files: rescanning removes their
+            // previous indexed contents when they stop satisfying size limits.
+            normalized.changes.push(WorkspaceChange::Upsert(relative));
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_policy_change(
+    root: &RootSpec,
     path: &Path,
-    is_directory: bool,
-    interest: PathInterest,
-) -> Option<WorkspaceChange> {
-    let relative = relative_change_path(policy, root_is_file, path)?;
-    if !policy.path_interest_can_affect_index(path, is_directory, interest) {
-        return None;
+    topology_event: bool,
+    control_paths: &[PathBuf],
+) -> Result<Option<WorkspaceChange>, HostError> {
+    if topology_event && path.is_dir() {
+        // A replacement directory must not inherit its predecessor's cached rules.
+        root.policy.invalidate()?;
     }
-    Some(if is_directory {
-        WorkspaceChange::RescanDirectory(relative)
-    } else {
-        WorkspaceChange::Upsert(relative)
-    })
+    if topology_event
+        && ((root.path.starts_with(path) && path != root.path)
+            || control_paths
+                .iter()
+                .any(|control| control != path && control.starts_with(path)))
+    {
+        root.policy.invalidate()?;
+        return Ok(Some(WorkspaceChange::Rescan));
+    }
+    // Rule changes precede ordinary hidden/ignored-file checks.
+    Ok(root
+        .policy
+        .control_file_changed(path)?
+        .map(WorkspaceChange::RescanDirectory))
 }
 
-fn normalize_removed_path(
-    policy: &RootPolicy,
-    root_is_file: bool,
-    path: &Path,
-    prefix: bool,
-) -> Option<WorkspaceChange> {
-    if path == policy.root_path() && !root_is_file {
-        return Some(WorkspaceChange::Rescan);
-    }
-    match normalize_gitignore_change(policy, root_is_file, path) {
-        GitignoreChange::NotGitignore => {}
-        GitignoreChange::Ignored => return None,
-        GitignoreChange::Reconcile(change) => return Some(change),
-    }
-    let interest = policy.classify_path_interest(path);
-    if interest.is_empty() {
-        return None;
-    }
-    normalize_removed_path_with_interest(policy, root_is_file, path, prefix, interest)
+fn is_removed_path(kind: EventKind, index: usize) -> bool {
+    matches!(
+        kind,
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From))
+    ) || (matches!(kind, EventKind::Modify(ModifyKind::Name(RenameMode::Both))) && index == 0)
 }
 
-fn normalize_removed_path_with_interest(
-    policy: &RootPolicy,
-    root_is_file: bool,
-    path: &Path,
-    prefix: bool,
-    interest: PathInterest,
-) -> Option<WorkspaceChange> {
-    let relative = relative_change_path(policy, root_is_file, path)?;
-    if !policy.path_interest_can_affect_index(path, false, interest) {
-        return None;
+fn relative_change_path(root: &RootSpec, root_is_file: bool, path: &Path) -> Option<PathBuf> {
+    if root_is_file && path == root.path {
+        return root.path.file_name().map(PathBuf::from);
     }
-    Some(if prefix {
-        WorkspaceChange::DeletePrefix(relative)
-    } else {
-        WorkspaceChange::Delete(relative)
-    })
-}
-
-enum GitignoreChange {
-    NotGitignore,
-    Ignored,
-    Reconcile(WorkspaceChange),
-}
-
-fn normalize_gitignore_change(
-    policy: &RootPolicy,
-    root_is_file: bool,
-    path: &Path,
-) -> GitignoreChange {
-    if path.file_name().is_none_or(|name| name != ".gitignore") {
-        return GitignoreChange::NotGitignore;
-    }
-    if root_is_file && path == policy.root_path() {
-        return GitignoreChange::Reconcile(WorkspaceChange::RescanDirectory(PathBuf::new()));
-    }
-    let Some(parent) = path.parent() else {
-        return GitignoreChange::Ignored;
-    };
-    if !policy.path_can_affect_index(parent, true) {
-        return GitignoreChange::Ignored;
-    }
-    policy.invalidate_gitignore_rules(parent);
-    relative_change_path(policy, root_is_file, path).map_or(GitignoreChange::Ignored, |relative| {
-        GitignoreChange::Reconcile(WorkspaceChange::RescanDirectory(parent_scope(&relative)))
-    })
-}
-
-fn relative_change_path(policy: &RootPolicy, root_is_file: bool, path: &Path) -> Option<PathBuf> {
-    if root_is_file && path == policy.root_path() {
-        return policy.root_path().file_name().map(PathBuf::from);
-    }
-    path.strip_prefix(policy.root_path())
+    path.strip_prefix(&root.path)
         .ok()
-        .and_then(|relative| {
-            (!relative.as_os_str().is_empty())
-                .then(|| PathBuf::from(normalize_relative_path(relative)))
-        })
-}
-
-fn parent_scope(path: &Path) -> PathBuf {
-    path.parent().unwrap_or_else(|| Path::new("")).to_path_buf()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(Path::to_path_buf)
 }
 
 fn schedule_flush(
@@ -686,124 +1061,286 @@ fn lock_task(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+    use super::*;
+    use crate::PathPolicy;
+    use notify::event::CreateKind;
+    use std::sync::atomic::AtomicUsize;
 
-    use tempfile::tempdir;
+    #[derive(Debug)]
+    struct TestPolicy {
+        excluded: PathBuf,
+        control_file: PathBuf,
+        control_changes: AtomicUsize,
+        invalidations: AtomicUsize,
+    }
 
-    use crate::{DiscoveryOptions, RootSpec};
+    impl PathPolicy for TestPolicy {
+        fn includes_file(&self, path: &Path) -> Result<bool, HostError> {
+            Ok(!path.starts_with(&self.excluded) && path != self.control_file)
+        }
 
-    use super::{FileTypeResolver, RootPolicy, normalize_present_or_removed_path_with};
+        fn can_descend(&self, path: &Path) -> Result<bool, HostError> {
+            Ok(!path.starts_with(&self.excluded))
+        }
 
-    #[test]
-    fn definitely_ignored_watcher_paths_skip_metadata() {
-        let root = tempdir().expect("watch root");
-        let ignored = root.path().join("node_modules/pkg/index.js");
-        let policy = RootPolicy::new(
-            RootSpec {
-                path: root.path().to_path_buf(),
-                recursive: true,
-                discovery: DiscoveryOptions::default(),
-            },
-            &FileTypeResolver::new(),
+        fn control_file_changed(&self, path: &Path) -> Result<Option<PathBuf>, HostError> {
+            if path != self.control_file {
+                return Ok(None);
+            }
+            self.control_changes.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(PathBuf::new()))
+        }
+
+        fn control_paths(&self) -> Vec<PathBuf> {
+            vec![self.control_file.clone()]
+        }
+
+        fn invalidate(&self) -> Result<(), HostError> {
+            self.invalidations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn test_root(path: &Path, control_file: PathBuf) -> RootSpec {
+        RootSpec::new(
+            path.to_path_buf(),
+            Arc::new(TestPolicy {
+                excluded: path.join("blocked"),
+                control_file,
+                control_changes: AtomicUsize::new(0),
+                invalidations: AtomicUsize::new(0),
+            }),
         )
-        .expect("watch policy");
-        let metadata_calls = AtomicUsize::new(0);
-
-        let change = normalize_present_or_removed_path_with(&policy, false, &ignored, |_| {
-            metadata_calls.fetch_add(1, Ordering::AcqRel);
-            None
-        });
-
-        assert!(change.is_none());
-        assert_eq!(metadata_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn ignored_gitignore_changes_do_not_schedule_reconcile_or_read_metadata() {
-        let root = tempdir().expect("watch root");
-        let ignored = root.path().join("node_modules/pkg/.gitignore");
-        let policy = RootPolicy::new(
-            RootSpec {
-                path: root.path().to_path_buf(),
-                recursive: true,
-                discovery: DiscoveryOptions::default(),
-            },
-            &FileTypeResolver::new(),
-        )
-        .expect("watch policy");
-        let metadata_calls = AtomicUsize::new(0);
-
-        let change = normalize_present_or_removed_path_with(&policy, false, &ignored, |_| {
-            metadata_calls.fetch_add(1, Ordering::AcqRel);
-            None
-        });
-
-        assert!(change.is_none());
-        assert_eq!(metadata_calls.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn explicit_includes_keep_ignored_directory_files_watchable() {
-        let root = tempdir().expect("watch root");
-        let included = root.path().join("node_modules/pkg/index.js");
-        fs::create_dir_all(included.parent().expect("included parent")).expect("included parent");
-        fs::write(&included, "module.exports = 1;\n").expect("included fixture");
-        let policy = RootPolicy::new(
-            RootSpec {
-                path: root.path().to_path_buf(),
-                recursive: true,
-                discovery: DiscoveryOptions {
-                    include_paths: vec!["node_modules/pkg/index.js".to_owned()],
-                    ..DiscoveryOptions::default()
-                },
-            },
-            &FileTypeResolver::new(),
-        )
-        .expect("watch policy");
-        let metadata_calls = AtomicUsize::new(0);
-
-        let change = normalize_present_or_removed_path_with(&policy, false, &included, |path| {
-            metadata_calls.fetch_add(1, Ordering::AcqRel);
-            fs::metadata(path).ok()
-        });
-
-        assert_eq!(
-            change,
-            Some(crate::WorkspaceChange::Upsert(
-                "node_modules/pkg/index.js".into()
-            ))
+    fn watch_registration_prunes_excluded_trees_and_preserves_external_controls() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let root = temporary.path().join("workspace");
+        fs::create_dir_all(root.join("selected/deeper")).expect("selected directories");
+        fs::create_dir_all(root.join("blocked/deep/deeper")).expect("excluded directories");
+        fs::create_dir_all(temporary.path().join("config")).expect("external config directory");
+        let spec = test_root(&root, temporary.path().join("config/missing/.ignore"));
+        let mut registered = Vec::new();
+        let plan = watch_directories(&spec, false, &mut |path| {
+            registered.push(path.to_path_buf());
+            Ok(())
+        })
+        .expect("watch paths");
+        let paths = plan.directories;
+        assert!(paths.contains(&root));
+        assert!(paths.contains(&root.join("selected/deeper")));
+        assert!(paths.contains(&temporary.path().join("config")));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.starts_with(root.join("blocked")))
         );
-        assert_eq!(metadata_calls.load(Ordering::Acquire), 1);
+        let parent = registered
+            .iter()
+            .position(|path| path == &root.join("selected"))
+            .expect("parent watch");
+        let child = registered
+            .iter()
+            .position(|path| path == &root.join("selected/deeper"))
+            .expect("child watch");
+        assert!(parent < child, "register before visiting children");
     }
 
     #[test]
-    fn root_gitignore_changes_reconcile_without_reading_target_metadata() {
-        let root = tempdir().expect("watch root");
-        let gitignore = root.path().join(".gitignore");
-        let policy = RootPolicy::new(
-            RootSpec {
-                path: root.path().to_path_buf(),
-                recursive: true,
-                discovery: DiscoveryOptions::default(),
-            },
-            &FileTypeResolver::new(),
-        )
-        .expect("watch policy");
-        let metadata_calls = AtomicUsize::new(0);
-
-        let change = normalize_present_or_removed_path_with(&policy, false, &gitignore, |_| {
-            metadata_calls.fetch_add(1, Ordering::AcqRel);
-            None
-        });
-
+    fn removed_or_renamed_sources_are_not_lost_to_current_selection_rules() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let spec = test_root(temporary.path(), temporary.path().join(".rules"));
+        let old = temporary.path().join("blocked/old.rs");
+        fs::create_dir_all(old.parent().expect("old parent")).expect("blocked directory");
+        // A rename source can already have been recreated before delivery.
+        fs::write(&old, "replacement").expect("replacement file");
+        let destination = temporary.path().join("new.rs");
+        fs::write(&destination, "renamed source").expect("destination");
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(old.clone())
+            .add_path(destination);
         assert_eq!(
-            change,
-            Some(crate::WorkspaceChange::RescanDirectory(PathBuf::new()))
+            normalize_event(&spec, false, &event)
+                .expect("rename")
+                .changes,
+            vec![
+                WorkspaceChange::DeletePrefix(PathBuf::from("blocked/old.rs")),
+                WorkspaceChange::Upsert(PathBuf::from("new.rs")),
+            ]
         );
-        assert_eq!(metadata_calls.load(Ordering::Acquire), 0);
+        let event = Event::new(EventKind::Remove(RemoveKind::File)).add_path(old);
+        assert_eq!(
+            normalize_event(&spec, false, &event)
+                .expect("deletion")
+                .changes,
+            vec![WorkspaceChange::Delete(PathBuf::from("blocked/old.rs"))]
+        );
+    }
+
+    #[test]
+    fn external_control_changes_invalidate_policy_before_normal_filtering() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let root = temporary.path().join("workspace");
+        let control = temporary.path().join("external.ignore");
+        let spec = test_root(&root, control.clone());
+        let event = Event::new(EventKind::Remove(RemoveKind::File)).add_path(control);
+        let result = normalize_event(&spec, false, &event).expect("control change");
+        assert!(result.refresh_registration);
+        assert_eq!(
+            result.changes,
+            vec![WorkspaceChange::RescanDirectory(PathBuf::new())]
+        );
+    }
+
+    #[test]
+    fn ordinary_file_creation_does_not_reenumerate_all_watch_directories() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let path = temporary.path().join("new.rs");
+        fs::write(&path, "fn new() {}").expect("new file");
+        let spec = test_root(temporary.path(), temporary.path().join(".rules"));
+        let event = Event::new(EventKind::Create(CreateKind::File)).add_path(path);
+        let result = normalize_event(&spec, false, &event).expect("creation");
+        assert!(!result.refresh_registration);
+        assert_eq!(
+            result.changes,
+            vec![WorkspaceChange::Upsert(PathBuf::from("new.rs"))]
+        );
+    }
+    #[test]
+    fn unknown_events_discard_cached_rules_before_reconciliation() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let policy = Arc::new(TestPolicy {
+            excluded: temporary.path().join("blocked"),
+            control_file: temporary.path().join(".rules"),
+            control_changes: AtomicUsize::new(0),
+            invalidations: AtomicUsize::new(0),
+        });
+        let spec = RootSpec::new(temporary.path().to_path_buf(), policy.clone());
+        let result = normalize_event(&spec, false, &Event::new(EventKind::Any)).expect("reconcile");
+        assert_eq!(policy.invalidations.load(Ordering::Relaxed), 1);
+        assert!(result.refresh_registration);
+        assert_eq!(result.changes, vec![WorkspaceChange::Rescan]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn canonical_directory_events_and_rename_sources_use_the_discovered_alias() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let root = temporary.path().canonicalize().expect("root");
+        let real = root.join("z-real");
+        fs::create_dir(&real).expect("target directory");
+        std::os::unix::fs::symlink(&real, root.join("a-alias")).expect("directory alias");
+        let mut spec = RootSpec::new(root.clone(), Arc::new(crate::AllowAllPaths));
+        spec.follow = true;
+        let plan = watch_directories(&spec, false, &mut |_| Ok(())).expect("watch plan");
+        assert!(plan.directories.contains(&root.join("a-alias")));
+        assert!(!plan.directories.contains(&real));
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(real.join("old.rs"))
+            .add_path(real.join("new.rs"));
+        let translated = plan.aliases.translated_events(&event);
+        assert_eq!(translated.len(), 2);
+        assert_eq!(
+            translated[0].kind,
+            EventKind::Modify(ModifyKind::Name(RenameMode::From))
+        );
+        assert_eq!(translated[0].paths, vec![root.join("a-alias/old.rs")]);
+        assert_eq!(
+            translated[1].kind,
+            EventKind::Modify(ModifyKind::Name(RenameMode::To))
+        );
+        assert_eq!(translated[1].paths, vec![root.join("a-alias/new.rs")]);
+    }
+
+    #[test]
+    fn replacement_directories_discard_cached_ignore_rules_before_matching() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let replacement = temporary.path().join("replacement");
+        fs::create_dir(&replacement).expect("replacement directory");
+        let policy = Arc::new(TestPolicy {
+            excluded: temporary.path().join("blocked"),
+            control_file: temporary.path().join(".rules"),
+            control_changes: AtomicUsize::new(0),
+            invalidations: AtomicUsize::new(0),
+        });
+        let spec = RootSpec::new(temporary.path().to_path_buf(), policy.clone());
+        let event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(replacement);
+        let result = normalize_event(&spec, false, &event).expect("new directory");
+        assert_eq!(policy.invalidations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            result.changes,
+            vec![WorkspaceChange::RescanDirectory("replacement".into())]
+        );
+    }
+    #[derive(Debug)]
+    struct MarkerPolicy {
+        directory: PathBuf,
+        marker: PathBuf,
+        controls: StdMutex<Vec<PathBuf>>,
+    }
+
+    impl PathPolicy for MarkerPolicy {
+        fn includes_file(&self, path: &Path) -> Result<bool, HostError> {
+            self.can_descend(path)
+        }
+
+        fn can_descend(&self, path: &Path) -> Result<bool, HostError> {
+            if path.starts_with(&self.directory) && self.marker.exists() {
+                *self.controls.lock().expect("controls") = vec![self.marker.clone()];
+                return Ok(false);
+            }
+            Ok(!path.starts_with(&self.marker))
+        }
+
+        fn control_paths(&self) -> Vec<PathBuf> {
+            self.controls.lock().expect("controls").clone()
+        }
+    }
+
+    #[test]
+    fn a_dynamically_discovered_marker_keeps_only_the_rejected_directory_watch() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let directory = temporary.path().join("nested");
+        let marker = directory.join(".git");
+        fs::create_dir_all(marker.join("objects/deep")).expect("marker subtree");
+        fs::create_dir_all(directory.join("src/deep")).expect("source subtree");
+        let policy = Arc::new(MarkerPolicy {
+            directory: directory.clone(),
+            marker: marker.clone(),
+            controls: StdMutex::new(Vec::new()),
+        });
+        let spec = RootSpec::new(temporary.path().to_path_buf(), policy);
+        let (sender, _receiver) = mpsc::channel(32);
+        let mut watcher = create_watcher(
+            &spec,
+            false,
+            &sender,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Notify::new()),
+            Some(Duration::from_secs(60)),
+        )
+        .expect("watcher");
+        assert!(
+            watcher.registrations.contains_key(&directory),
+            "retain marker observation"
+        );
+        assert!(!watcher.registrations.contains_key(&marker));
+        assert!(!watcher.registrations.contains_key(&directory.join("src")));
+        fs::remove_dir_all(&marker).expect("remove directory marker");
+        watcher.refresh(&spec, false).expect("reopen subtree");
+        assert!(
+            watcher
+                .registrations
+                .contains_key(&directory.join("src/deep"))
+        );
+        fs::write(&marker, "marker file").expect("create file marker");
+        watcher.refresh(&spec, false).expect("close subtree again");
+        assert!(watcher.registrations.contains_key(&directory));
+        assert!(!watcher.registrations.contains_key(&directory.join("src")));
+        assert!(
+            !watcher
+                .registrations
+                .contains_key(&directory.join("src/deep"))
+        );
     }
 }

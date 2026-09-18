@@ -58,7 +58,7 @@ fn source_file_projection_preserves_paths_and_directory_membership_for_all_statu
 }
 
 #[test]
-fn path_enumeration_reads_the_complete_projection_without_decoding_payloads() {
+fn query_projections_read_all_paths_formats_and_optional_times_without_decoding_payloads() {
     super::super::backend::initialize().expect("initialize zvec");
     let temporary = tempfile::tempdir().expect("temporary storage");
     let storage_path = temporary.path().join("storage");
@@ -81,16 +81,28 @@ fn path_enumeration_reads_the_complete_projection_without_decoding_payloads() {
     )
     .expect("open storage");
     let mut expected = Vec::new();
+    let mut expected_attributes = Vec::new();
     let mut docs = Vec::new();
     for index in 1..=WRITE_BATCH + 7 {
-        let source = file(
+        let mut source = file(
             u32::try_from(index).expect("ID"),
             format!("file-{index}.rs"),
         );
+        source.formats = if index % 2 == 0 {
+            vec![FileFormat::C, FileFormat::Cpp]
+        } else {
+            vec![FileFormat::Html]
+        };
+        source.snapshot.modified_epoch_ms = match index % 3 {
+            0 => None,
+            1 => Some(0),
+            _ => Some(u64::try_from(index).expect("modification time")),
+        };
         let mut doc = encode_file_doc(&source, &[]).expect("encode source");
         doc.add_string("payload", "invalid full file payload")
             .expect("replace payload");
         docs.push(doc);
+        expected_attributes.push(StoredFileAttributes::from(&source));
         expected.push((source.id, source.relative_path.into_path_buf()));
     }
     write_docs(&store.files, &docs, "write source").expect("write projections");
@@ -98,6 +110,12 @@ fn path_enumeration_reads_the_complete_projection_without_decoding_payloads() {
     actual.sort_unstable();
     expected.sort_unstable();
     assert_eq!(actual, expected);
+    let mut attributes = store
+        .list_file_attributes()
+        .expect("read light file attributes");
+    attributes.sort_unstable_by_key(|file| file.id);
+    expected_attributes.sort_unstable_by_key(|file| file.id);
+    assert_eq!(attributes, expected_attributes);
     assert!(store.list_files().is_err());
 }
 

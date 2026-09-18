@@ -10,12 +10,13 @@ use crate::{EngineError, EngineResult};
 mod catalog;
 mod sniff;
 
-pub(crate) use catalog::FileFormat;
+pub use catalog::FileFormat;
 
 const HEADER_BYTES: usize = 1024;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum FileCategory {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileCategory {
     Unknown,
     Archive,
     Data,
@@ -25,6 +26,53 @@ pub(crate) enum FileCategory {
     Video,
     Code,
     Binary,
+}
+
+impl FileCategory {
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "unknown" => Some(Self::Unknown),
+            "archive" => Some(Self::Archive),
+            "data" => Some(Self::Data),
+            "document" => Some(Self::Document),
+            "image" => Some(Self::Image),
+            "audio" => Some(Self::Audio),
+            "video" => Some(Self::Video),
+            "code" => Some(Self::Code),
+            "binary" => Some(Self::Binary),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Archive => "archive",
+            Self::Data => "data",
+            Self::Document => "document",
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Code => "code",
+            Self::Binary => "binary",
+        }
+    }
+}
+
+impl serde::Serialize for FileFormat {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FileFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::parse(&name)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown file format {name:?}")))
+    }
 }
 
 impl FileFormat {

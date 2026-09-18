@@ -15,7 +15,7 @@ use std::{
 };
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 use zg_engine::api::{
     context::{
@@ -24,7 +24,10 @@ use zg_engine::api::{
     },
     index::{
         IndexOptions,
-        options::{Device, DiscoveryOptions, EmbeddingModelSpec},
+        options::{
+            Device, EmbeddingModelSpec, FileCategory, FileFilterUpdate, FileFormat, GlobRule,
+            ScanOptionsUpdate,
+        },
     },
     info::InfoOptions,
 };
@@ -284,58 +287,102 @@ pub struct FileSelectionArgs {
     pub globs: Vec<String>,
     #[arg(long = "iglob", value_name = "GLOB")]
     pub insensitive_globs: Vec<String>,
-    #[arg(short = 't', long = "type", value_name = "TYPE")]
+    #[arg(skip)]
+    pub glob_rules: Vec<GlobRule>,
+    #[arg(short = 't', long = "type", value_name = "FORMAT")]
     pub file_types: Vec<String>,
-    #[arg(short = 'T', long = "type-not", value_name = "TYPE")]
+    #[arg(short = 'T', long = "type-not", value_name = "FORMAT")]
     pub excluded_file_types: Vec<String>,
-    #[arg(long)]
-    pub hidden: bool,
-    #[arg(long = "no-ignore")]
-    pub no_ignore: bool,
+    #[arg(long = "category", value_name = "CATEGORY")]
+    pub categories: Vec<String>,
+    #[arg(long = "category-not", value_name = "CATEGORY")]
+    pub excluded_categories: Vec<String>,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub hidden: Option<bool>,
+    #[arg(long = "no-ignore", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub no_ignore: Option<bool>,
+    #[arg(long = "nested-git", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub nested_git: Option<bool>,
     #[arg(long = "ignore-file", value_name = "PATH")]
     pub ignore_files: Vec<PathBuf>,
     #[arg(long = "max-depth", value_parser = parse_non_negative_usize)]
     pub max_depth: Option<usize>,
     #[arg(long = "max-filesize", value_parser = parse_byte_size)]
     pub max_file_size_bytes: Option<u64>,
-    #[arg(short = 'L', long)]
-    pub follow: bool,
+    #[arg(short = 'L', long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub follow: Option<bool>,
 }
 
 impl FileSelectionArgs {
-    fn discovery(&self) -> DiscoveryOptions {
-        DiscoveryOptions {
-            globs: self.globs.clone(),
-            insensitive_globs: self.insensitive_globs.clone(),
-            file_types: self.file_types.clone(),
-            excluded_file_types: self.excluded_file_types.clone(),
+    fn filter_update(&self) -> Result<FileFilterUpdate, CliError> {
+        Ok(FileFilterUpdate {
+            globs: (!self.glob_rules.is_empty()).then(|| self.glob_rules.clone()),
+            formats: optional_formats(&self.file_types)?,
+            excluded_formats: optional_formats(&self.excluded_file_types)?,
+            categories: optional_categories(&self.categories)?,
+            excluded_categories: optional_categories(&self.excluded_categories)?,
+        })
+    }
+
+    fn scan_update(&self) -> ScanOptionsUpdate {
+        ScanOptionsUpdate {
             hidden: self.hidden,
             no_ignore: self.no_ignore,
-            ignore_files: self.ignore_files.clone(),
-            max_depth: self.max_depth,
-            max_file_size_bytes: self.max_file_size_bytes,
+            nested_git: self.nested_git,
+            ignore_files: (!self.ignore_files.is_empty()).then(|| self.ignore_files.clone()),
+            max_depth: self.max_depth.map(Some),
+            max_file_size_bytes: self.max_file_size_bytes.map(Some),
             follow: self.follow,
-            ..DiscoveryOptions::default()
         }
     }
 
-    fn apply_context(&self, request: &mut ContextOptions) {
-        request.globs.extend(self.globs.iter().cloned());
-        request
-            .insensitive_globs
-            .extend(self.insensitive_globs.iter().cloned());
-        request.file_types.extend(self.file_types.iter().cloned());
-        request
-            .excluded_file_types
-            .extend(self.excluded_file_types.iter().cloned());
-        request.hidden |= self.hidden;
-        request.no_ignore |= self.no_ignore;
-        request
-            .ignore_files
-            .extend(self.ignore_files.iter().cloned());
-        request.max_depth = self.max_depth.or(request.max_depth);
-        request.max_file_size_bytes = self.max_file_size_bytes.or(request.max_file_size_bytes);
-        request.follow |= self.follow;
+    fn apply_context(&self, request: &mut ContextOptions) -> Result<(), CliError> {
+        if self.nested_git.is_some() {
+            return Err(CliError::NestedGitRequiresIndex);
+        }
+        if request.rg {
+            if !self.categories.is_empty() || !self.excluded_categories.is_empty() {
+                return Err(CliError::RgWithIndexedOptions);
+            }
+            request.globs.extend(self.globs.iter().cloned());
+            request
+                .insensitive_globs
+                .extend(self.insensitive_globs.iter().cloned());
+            request.file_types.extend(self.file_types.iter().cloned());
+            request
+                .excluded_file_types
+                .extend(self.excluded_file_types.iter().cloned());
+            if let Some(value) = self.hidden {
+                request.hidden = value;
+            }
+            if let Some(value) = self.no_ignore {
+                request.no_ignore = value;
+            }
+            if let Some(value) = self.follow {
+                request.follow = value;
+            }
+            request
+                .ignore_files
+                .extend(self.ignore_files.iter().cloned());
+            request.max_depth = self.max_depth.or(request.max_depth);
+            request.max_file_size_bytes = self.max_file_size_bytes.or(request.max_file_size_bytes);
+        } else {
+            if self.has_scan_options() {
+                return Err(CliError::IndexedScanOptions);
+            }
+            self.filter_update()?.apply(&mut request.filter);
+        }
+        Ok(())
+    }
+
+    fn has_scan_options(&self) -> bool {
+        self.hidden.is_some()
+            || self.no_ignore.is_some()
+            || self.nested_git.is_some()
+            || self.follow.is_some()
+            || !self.ignore_files.is_empty()
+            || self.max_depth.is_some()
+            || self.max_file_size_bytes.is_some()
     }
 
     fn is_empty(&self) -> bool {
@@ -343,13 +390,57 @@ impl FileSelectionArgs {
             && self.insensitive_globs.is_empty()
             && self.file_types.is_empty()
             && self.excluded_file_types.is_empty()
-            && !self.hidden
-            && !self.no_ignore
-            && self.ignore_files.is_empty()
-            && self.max_depth.is_none()
-            && self.max_file_size_bytes.is_none()
-            && !self.follow
+            && self.categories.is_empty()
+            && self.excluded_categories.is_empty()
+            && !self.has_scan_options()
     }
+}
+
+fn optional_formats(values: &[String]) -> Result<Option<Vec<FileFormat>>, CliError> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    values
+        .iter()
+        .map(|value| {
+            FileFormat::parse(value).ok_or_else(|| CliError::InvalidFileFormat(value.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn optional_categories(values: &[String]) -> Result<Option<Vec<FileCategory>>, CliError> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    values
+        .iter()
+        .map(|value| {
+            FileCategory::parse(value).ok_or_else(|| CliError::InvalidFileCategory(value.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn ordered_glob_rules(matches: &clap::ArgMatches) -> Vec<GlobRule> {
+    let mut rules = Vec::new();
+    for (name, case_insensitive) in [("globs", false), ("insensitive_globs", true)] {
+        if let (Some(indices), Some(patterns)) =
+            (matches.indices_of(name), matches.get_many::<String>(name))
+        {
+            rules.extend(indices.zip(patterns).map(|(index, pattern)| {
+                (
+                    index,
+                    GlobRule {
+                        pattern: pattern.clone(),
+                        case_insensitive,
+                    },
+                )
+            }));
+        }
+    }
+    rules.sort_by_key(|(index, _)| *index);
+    rules.into_iter().map(|(_, rule)| rule).collect()
 }
 
 #[derive(Debug, Args)]
@@ -592,6 +683,16 @@ pub enum CliError {
     RgWithIndexedRoutes,
     #[error("--rg cannot be combined with indexed preview, trace, refresh, or symbol options")]
     RgWithIndexedOptions,
+    #[error(
+        "filesystem scanning options apply to index or --rg; use index to change saved scanning settings"
+    )]
+    IndexedScanOptions,
+    #[error("--nested-git can only be used with zg index")]
+    NestedGitRequiresIndex,
+    #[error("unknown indexed file format: {0}")]
+    InvalidFileFormat(String),
+    #[error("unknown indexed file category: {0}")]
+    InvalidFileCategory(String),
     #[error("--force-direct requires --mode direct")]
     ForceDirectMode,
     #[error("--json has been removed; use the default agent markdown output or --human")]
@@ -639,7 +740,19 @@ impl Cli {
     {
         let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
         let arguments = normalize_help_and_version(arguments)?;
-        <Self as Parser>::try_parse_from(normalize_query_argument_order(arguments))
+        let matches =
+            Self::command().try_get_matches_from(normalize_query_argument_order(arguments))?;
+        let mut cli = Self::from_arg_matches(&matches)?;
+        match (&mut cli.command, matches.subcommand()) {
+            (Some(CommandLine::Index(args)), Some((_, submatches))) => {
+                args.files.glob_rules = ordered_glob_rules(submatches);
+            }
+            (Some(CommandLine::Query(args)), Some((_, submatches))) => {
+                args.files.glob_rules = ordered_glob_rules(submatches);
+            }
+            _ => {}
+        }
+        Ok(cli)
     }
 
     /// Converts terminal arguments into a transport-independent execution plan.
@@ -817,6 +930,7 @@ fn query_option_without_value(value: &str) -> bool {
             | "--allow-remote"
             | "--hidden"
             | "--no-ignore"
+            | "--nested-git"
             | "--follow"
             | "-L"
     )
@@ -846,6 +960,8 @@ fn query_option_with_value(value: &str) -> bool {
             | "--type"
             | "-t"
             | "--type-not"
+            | "--category"
+            | "--category-not"
             | "-T"
             | "--ignore-file"
             | "--max-depth"
@@ -873,6 +989,12 @@ fn query_attached_option(value: &str) -> bool {
         || value.starts_with("--iglob=")
         || value.starts_with("--type=")
         || value.starts_with("--type-not=")
+        || value.starts_with("--category=")
+        || value.starts_with("--category-not=")
+        || value.starts_with("--hidden=")
+        || value.starts_with("--no-ignore=")
+        || value.starts_with("--nested-git=")
+        || value.starts_with("--follow=")
         || value.starts_with("--ignore-file=")
         || value.starts_with("--max-depth=")
         || value.starts_with("--max-filesize=")
@@ -1014,7 +1136,7 @@ fn query_plan(args: QueryArgs, current_dir: PathBuf) -> Result<CliPlan, CliError
         return Err(CliError::InvalidModifiedRange);
     }
     request.root = Some(current_dir);
-    args.files.apply_context(&mut request);
+    args.files.apply_context(&mut request)?;
     request.ignore_files = request
         .ignore_files
         .into_iter()
@@ -1073,12 +1195,14 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             output,
         });
     }
-    let mut discovery = args.files.discovery();
-    discovery.ignore_files = discovery
-        .ignore_files
-        .into_iter()
-        .map(|path| resolve_from(current_dir, Some(&path)))
-        .collect();
+    let filter = args.files.filter_update()?;
+    let mut scan = args.files.scan_update();
+    scan.ignore_files = scan.ignore_files.map(|paths| {
+        paths
+            .into_iter()
+            .map(|path| resolve_from(current_dir, Some(&path)))
+            .collect()
+    });
     let embedding = args.embedding.map(|reference| EmbeddingModelSpec {
         reference,
         revision: None,
@@ -1094,7 +1218,8 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             name: args.name,
             rebuild: args.rebuild,
             reset_paths: args.reset_paths,
-            discovery,
+            filter,
+            scan,
             embedding,
             allow_remote: args.allow_remote,
             api_key: args.api_key,
@@ -1393,6 +1518,114 @@ mod tests {
     }
 
     #[test]
+    fn indexed_filters_keep_mixed_glob_order_and_parse_engine_formats() {
+        let CliPlan::Query { request, .. } = Cli::try_parse_from([
+            "zg",
+            "query",
+            "needle",
+            "--iglob",
+            "*.RS",
+            "-g",
+            "!test.rs",
+            "-g",
+            " notes/** ",
+            "--type",
+            "rust",
+            "--category",
+            "code",
+        ])
+        .expect("valid test fixture")
+        .into_plan(PathBuf::from("/workspace"))
+        .expect("valid test fixture") else {
+            panic!("query");
+        };
+        assert_eq!(
+            request
+                .filter
+                .globs
+                .iter()
+                .map(|rule| (rule.pattern.as_str(), rule.case_insensitive))
+                .collect::<Vec<_>>(),
+            [("*.RS", true), ("!test.rs", false), (" notes/** ", false)]
+        );
+        assert_eq!(request.filter.formats[0].as_str(), "rust");
+        assert_eq!(request.filter.categories[0].as_str(), "code");
+        assert!(request.globs.is_empty() && request.file_types.is_empty());
+    }
+
+    #[test]
+    fn nested_git_is_an_index_only_option_with_explicit_false_and_omission() {
+        let cases: &[(&[&str], Option<bool>)] = &[
+            (&[], None),
+            (&["--nested-git"], Some(true)),
+            (&["--nested-git=false"], Some(false)),
+        ];
+        for (flags, expected) in cases {
+            let args = ["zg", "index"].into_iter().chain(flags.iter().copied());
+            let CliPlan::Index {
+                operation: IndexOperation::Build(request),
+                ..
+            } = Cli::try_parse_from(args)
+                .expect("index arguments")
+                .into_plan(PathBuf::from("/workspace"))
+                .expect("index plan")
+            else {
+                panic!("index");
+            };
+            assert_eq!(request.scan.nested_git, *expected);
+        }
+        for args in [
+            vec!["zg", "query", "needle", "--nested-git"],
+            vec!["zg", "query", "--rg", "needle", "--nested-git=false"],
+        ] {
+            assert!(matches!(
+                Cli::try_parse_from(args)
+                    .expect("query syntax")
+                    .into_plan(PathBuf::from("/workspace")),
+                Err(super::CliError::NestedGitRequiresIndex)
+            ));
+        }
+    }
+
+    #[test]
+    fn index_scan_flags_distinguish_false_from_omission() {
+        let CliPlan::Index {
+            operation: IndexOperation::Build(request),
+            ..
+        } = Cli::try_parse_from([
+            "zg",
+            "index",
+            "--hidden=false",
+            "--follow=false",
+            "--no-ignore=false",
+        ])
+        .expect("valid test fixture")
+        .into_plan(PathBuf::from("/workspace"))
+        .expect("valid test fixture")
+        else {
+            panic!("index");
+        };
+        assert_eq!(request.scan.hidden, Some(false));
+        assert_eq!(request.scan.follow, Some(false));
+        assert_eq!(request.scan.no_ignore, Some(false));
+        assert_eq!(request.filter.globs, None);
+        assert_eq!(request.scan.ignore_files, None);
+        assert_eq!(request.scan.max_depth, None);
+    }
+
+    #[test]
+    fn indexed_query_rejects_scan_options_and_unknown_formats() {
+        for options in [["--hidden", "needle"], ["--type", "not-a-format"]] {
+            assert!(
+                Cli::try_parse_from(["zg", "query", "needle", options[0], options[1]])
+                    .expect("valid test fixture")
+                    .into_plan(PathBuf::from("/workspace"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn config_builds_an_executable_plan() {
         let plan = Cli::try_parse_from([
             "zg",
@@ -1472,8 +1705,14 @@ mod tests {
         assert_eq!(request.root, Some(PathBuf::from("/workspace/repo")));
         assert_eq!(request.name.as_deref(), Some("search-engine"));
         assert_eq!(request.embedding_concurrency, Some(4));
-        assert_eq!(request.discovery.globs, ["src/**"]);
-        assert_eq!(request.discovery.max_file_size_bytes, Some(2 * 1024 * 1024));
+        assert_eq!(
+            request.filter.globs.as_ref().expect("valid test fixture")[0].pattern,
+            "src/**"
+        );
+        assert_eq!(
+            request.scan.max_file_size_bytes,
+            Some(Some(2 * 1024 * 1024))
+        );
     }
 
     #[test]

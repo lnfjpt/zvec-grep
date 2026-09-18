@@ -6,6 +6,6 @@ mod range;
 
 pub(crate) use directory::{DirectoryId, DirectoryRecord};
 pub(crate) use file::{FileId, FileIndexStatus, FileRecord, FileSnapshot};
-pub(crate) use format::{FileCategory, FileFormat};
+pub use format::{FileCategory, FileFormat};
 pub(crate) use path::SourcePath;
 pub(crate) use range::{ByteRange, SourceRange, TextRange};

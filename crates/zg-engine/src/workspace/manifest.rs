@@ -3,7 +3,8 @@ use crate::domain::model::ModelConfig;
 use crate::domain::model::{Device, Metric};
 use crate::{
     EngineError,
-    domain::{FileSelection, IndexDescriptor, IndexState, Workspace, model::EmbeddingModelInfo},
+    domain::{FileFilter, IndexDescriptor, IndexState, Workspace, model::EmbeddingModelInfo},
+    file_selection::ScanOptions,
     utils::{atomic_write, sync_directory},
 };
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ pub(crate) const CURRENT_MANIFEST_VERSION: u32 = 4;
 pub(crate) struct WorkspaceManifest {
     pub manifest_version: u32,
     pub workspace: Workspace,
+    pub scan: ScanOptions,
     /// Root recorded on disk before resolving a moved workspace.
     pub recorded_root: PathBuf,
     pub path: PathBuf,
@@ -49,7 +51,9 @@ struct ManifestData {
     #[serde(skip_serializing_if = "Option::is_none")]
     root: Option<PathBuf>,
     #[serde(default)]
-    discovery: ManifestDiscovery,
+    filter: FileFilter,
+    #[serde(default)]
+    scan: ScanOptions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root_paths: Option<Vec<LegacyRootPath>>,
     index_policy: IndexPolicy,
@@ -67,27 +71,26 @@ struct ManifestData {
 struct LegacyRootPath {
     absolute_path: PathBuf,
     recursive: bool,
-    #[serde(flatten)]
-    discovery: ManifestDiscovery,
 }
 
 impl TryFrom<ManifestData> for WorkspaceManifest {
     type Error = String;
     fn try_from(input: ManifestData) -> Result<Self, Self::Error> {
-        let (root, discovery) = match (input.root, input.root_paths) {
-            (Some(root), None) => (root, input.discovery),
+        let mut scan = input.scan;
+        let root = match (input.root, input.root_paths) {
+            (Some(root), None) => root,
             (None, Some(mut roots)) => {
                 if roots.len() != 1 {
                     return Err("legacy rootPaths must contain exactly one workspace root; multiple-root workspaces are unsupported".into());
                 }
-                let mut root = roots.remove(0);
+                let root = roots.remove(0);
                 if input.path.parent() != Some(root.absolute_path.as_path()) {
                     return Err("legacy source root differs from the workspace directory; recreate the index with one workspace root".into());
                 }
                 if !root.recursive {
-                    root.discovery.max_depth = Some(root.discovery.max_depth.unwrap_or(1).min(1));
+                    scan.max_depth = Some(scan.max_depth.unwrap_or(1).min(1));
                 }
-                (root.absolute_path, root.discovery)
+                root.absolute_path
             }
             (Some(_), Some(_)) => return Err("specify root or legacy rootPaths, not both".into()),
             (None, None) => return Err("workspace root is missing".into()),
@@ -109,11 +112,12 @@ impl TryFrom<ManifestData> for WorkspaceManifest {
             workspace: Workspace {
                 name: input.name,
                 root,
-                file_selection: discovery.into(),
+                filter: input.filter,
                 index,
                 created_epoch_ms: input.created_time,
                 updated_epoch_ms: input.updated_time,
             },
+            scan,
             path: input.path,
             index_version: input.index_version,
             storage_generation: input.storage_generation,
@@ -132,7 +136,8 @@ impl From<WorkspaceManifest> for ManifestData {
             name: workspace.name,
             path: manifest.path,
             root: Some(workspace.root),
-            discovery: workspace.file_selection.into(),
+            filter: workspace.filter,
+            scan: manifest.scan,
             root_paths: None,
             index_policy: match &workspace.index {
                 IndexState::Uninitialized => IndexPolicy::Uninitialized,
@@ -164,6 +169,7 @@ impl WorkspaceManifest {
             path: home,
             recorded_root: workspace.root.clone(),
             workspace,
+            scan: ScanOptions::default(),
             index_version,
             storage_generation: None,
             embedding_runtime,
@@ -209,73 +215,6 @@ impl WorkspaceManifest {
         self.workspace
             .validate()
             .map_err(|error| invalid_manifest(error.message()))
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ManifestDiscovery {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub include: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exclude: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub globs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub insensitive_globs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub file_types: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub excluded_file_types: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub hidden: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub no_ignore: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ignore_files: Vec<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_depth: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_file_size_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub follow: bool,
-}
-
-impl From<FileSelection> for ManifestDiscovery {
-    fn from(discovery: FileSelection) -> Self {
-        Self {
-            include: discovery.include_paths,
-            exclude: discovery.exclude_paths,
-            globs: discovery.globs,
-            insensitive_globs: discovery.insensitive_globs,
-            file_types: discovery.file_types,
-            excluded_file_types: discovery.excluded_file_types,
-            hidden: discovery.hidden,
-            no_ignore: discovery.no_ignore,
-            ignore_files: discovery.ignore_files,
-            max_depth: discovery.max_depth,
-            max_file_size_bytes: discovery.max_file_size_bytes,
-            follow: discovery.follow,
-        }
-    }
-}
-
-impl From<ManifestDiscovery> for FileSelection {
-    fn from(discovery: ManifestDiscovery) -> Self {
-        Self {
-            include_paths: discovery.include,
-            exclude_paths: discovery.exclude,
-            globs: discovery.globs,
-            insensitive_globs: discovery.insensitive_globs,
-            file_types: discovery.file_types,
-            excluded_file_types: discovery.excluded_file_types,
-            hidden: discovery.hidden,
-            no_ignore: discovery.no_ignore,
-            ignore_files: discovery.ignore_files,
-            max_depth: discovery.max_depth,
-            max_file_size_bytes: discovery.max_file_size_bytes,
-            follow: discovery.follow,
-        }
     }
 }
 
@@ -345,14 +284,6 @@ pub(crate) fn delete_workspace_manifest(home: &Path) -> Result<(), EngineError> 
     }
 }
 
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde skip_serializing_if predicates receive references"
-)]
-const fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[track_caller]
 fn invalid_manifest(message: impl Into<String>) -> EngineError {
     EngineError::storage_failure(format!("invalid workspace manifest: {}", message.into()))
@@ -380,10 +311,9 @@ mod tests {
             Workspace {
                 name: "fixture".to_owned(),
                 root: home.parent().expect("workspace root").to_path_buf(),
-                file_selection: FileSelection {
+                filter: FileFilter {
                     globs: vec!["*.rs".into()],
-                    hidden: true,
-                    ..FileSelection::default()
+                    ..FileFilter::default()
                 },
                 index: IndexState::Enabled(IndexDescriptor {
                     fts: crate::domain::FTS_CONFIG,
@@ -475,7 +405,7 @@ mod tests {
         assert!(json.get("id").is_none());
         assert!(json.get("rootPaths").is_none());
         assert_eq!(json["root"], directory.path().to_string_lossy().as_ref());
-        assert_eq!(json["discovery"]["globs"][0], "*.rs");
+        assert_eq!(json["filter"]["globs"][0]["pattern"], "*.rs");
         assert_eq!(json["embeddingRuntime"]["device"], "cpu");
         assert!(json.get("generation").is_none());
         assert_eq!(
@@ -507,13 +437,7 @@ mod tests {
             .expect("manifest object")
             .remove("root")
             .expect("root");
-        let mut discovery = json
-            .as_object_mut()
-            .expect("manifest object")
-            .remove("discovery")
-            .expect("discovery");
-        discovery["absolutePath"] = root;
-        discovery["recursive"] = true.into();
+        let discovery = serde_json::json!({"absolutePath":root,"recursive":true});
         json["rootPaths"] = serde_json::json!([discovery.clone()]);
         fs::create_dir(&home).expect("workspace home");
         fs::write(
@@ -536,7 +460,7 @@ mod tests {
         shallow["rootPaths"][0]["recursive"] = false.into();
         let shallow: WorkspaceManifest =
             serde_json::from_value(shallow).expect("nonrecursive legacy workspace");
-        assert_eq!(shallow.workspace.file_selection.max_depth, Some(1));
+        assert_eq!(shallow.scan.max_depth, Some(1));
 
         json["rootPaths"] = serde_json::json!([discovery.clone(), discovery]);
         fs::write(

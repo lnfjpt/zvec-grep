@@ -10,6 +10,7 @@ pub mod config;
 mod domain;
 mod error;
 mod extraction;
+mod file_selection;
 mod lexical;
 mod models;
 mod pipelines;
@@ -67,6 +68,45 @@ impl ZvecGrep {
             .info(options)
             .await
             .map_err(|error| error.report_here())
+    }
+
+    /// Watches a workspace using its saved, resolved file selection.
+    /// The caller owns the returned session and schedules incremental indexing.
+    pub async fn watch_workspace(
+        &self,
+        root: &std::path::Path,
+        control: &zg_host_native::TaskControl,
+    ) -> EngineResult<std::sync::Arc<dyn zg_host_native::WorkspaceWatchSessionPort>> {
+        use zg_host_native::WorkspaceWatcherFactoryPort;
+
+        let info = self
+            .info(InfoOptions {
+                root: Some(root.to_path_buf()),
+                include_status: false,
+            })
+            .await?;
+        if !info.indexed {
+            return Err(EngineError::invalid_argument(
+                "workspace must have an index before it can be watched",
+            ));
+        }
+        let workspace = info
+            .workspace_index
+            .ok_or_else(|| EngineError::invalid_argument("workspace configuration is missing"))?;
+        if workspace.index_version != Some(crate::workspace::CURRENT_INDEX_VERSION) {
+            return Err(EngineError::storage_failure(
+                "workspace index version is incompatible; rebuild it with `zg index --rebuild`",
+            ));
+        }
+        let root = file_selection::ScanPolicy::root_spec(
+            &workspace.root,
+            &workspace.filter,
+            &workspace.scan,
+        )?;
+        zg_host_native::NativeWatcherFactory::default()
+            .watch(&zg_host_native::WatchRequest { root }, control)
+            .await
+            .map_err(pipelines::indexing::pipeline::map_host_error)
     }
 
     pub async fn drop_index(&self, options: InfoOptions) -> EngineResult<bool> {

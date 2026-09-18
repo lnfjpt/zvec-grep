@@ -62,8 +62,8 @@ pub fn configure_remote_model(root: &Path, address: SocketAddr) -> std::io::Resu
     // keeps one globally unique name, including when its root is later moved.
     let name = format!("fixture-{}", uuid::Uuid::new_v4());
     let manifest = json!({
-        "manifestVersion": 1, "id": "fixture-workspace", "name": name, "path": home,
-        "rootPaths": [{ "absolutePath": root, "recursive": true }],
+        "manifestVersion": 4, "name": name, "path": home,
+        "root": root, "filter": {}, "scan": {},
         "indexPolicy": "enabled", "embedding": { "model": { "provider": "qwen", "name": "text-embedding-v4", "endpoint": format!("http://{address}/embeddings") }, "dimension": 1024, "metric": "cosine", "maxBatchSize": 10, "maxInputTokens": 8192, "maxImageBytes": null },
         "indexVersion": null, "createdTime": 1, "updatedTime": 1,
         "embeddingRuntime": { "apiKey": "local-test-key", "endpoint": format!("http://{address}/embeddings") }

@@ -1,32 +1,87 @@
-use std::{fmt, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::HostError;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct DiscoveryOptions {
-    pub include_paths: Vec<String>,
-    pub exclude_paths: Vec<String>,
-    pub globs: Vec<String>,
-    pub insensitive_globs: Vec<String>,
-    pub file_types: Vec<String>,
-    pub excluded_file_types: Vec<String>,
-    pub hidden: bool,
-    pub no_ignore: bool,
-    pub ignore_files: Vec<PathBuf>,
-    pub max_depth: Option<usize>,
-    pub max_file_size_bytes: Option<u64>,
-    pub follow: bool,
+/// Selection decisions supplied by the engine, shared by scanning and watching.
+pub trait PathPolicy: Send + Sync + fmt::Debug {
+    /// Whether a candidate file belongs in discovery.
+    ///
+    /// # Errors
+    /// Returns an error when selection rules cannot be evaluated.
+    fn includes_file(&self, absolute_path: &Path) -> Result<bool, HostError>;
+
+    /// Whether traversal or watch registration may enter a directory.
+    ///
+    /// # Errors
+    /// Returns an error when selection rules cannot be evaluated.
+    fn can_descend(&self, absolute_path: &Path) -> Result<bool, HostError>;
+
+    /// Invalidate changed selection rules and return a root-relative rescan scope.
+    ///
+    /// # Errors
+    /// Returns an error when changed rules cannot be reloaded.
+    fn control_file_changed(&self, _absolute_path: &Path) -> Result<Option<PathBuf>, HostError> {
+        Ok(None)
+    }
+
+    /// Rule files that must remain observable, including files outside the root.
+    fn control_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    /// Discard cached rules when event loss or reconciliation requires a fresh view.
+    ///
+    /// # Errors
+    /// Returns an error when the policy cannot invalidate its cached state.
+    fn invalidate(&self) -> Result<(), HostError> {
+        Ok(())
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A policy for callers that do not need path filtering.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllowAllPaths;
+
+impl PathPolicy for AllowAllPaths {
+    fn includes_file(&self, _absolute_path: &Path) -> Result<bool, HostError> {
+        Ok(true)
+    }
+
+    fn can_descend(&self, _absolute_path: &Path) -> Result<bool, HostError> {
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct RootSpec {
     pub path: PathBuf,
     pub recursive: bool,
-    pub discovery: DiscoveryOptions,
+    pub follow: bool,
+    pub max_depth: Option<usize>,
+    pub max_file_size_bytes: Option<u64>,
+    pub policy: Arc<dyn PathPolicy>,
+}
+
+impl RootSpec {
+    #[must_use]
+    pub fn new(path: PathBuf, policy: Arc<dyn PathPolicy>) -> Self {
+        Self {
+            path,
+            recursive: true,
+            follow: false,
+            max_depth: None,
+            max_file_size_bytes: None,
+            policy,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,7 +137,7 @@ pub trait ClockPort: Send + Sync {
     fn now_epoch_ms(&self) -> u64;
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct ScanRequest {
     pub roots: Vec<RootSpec>,
     /// Absolute file or directory paths that bound discovery within `roots`.
@@ -154,7 +209,7 @@ pub trait WorkspaceScannerPort: Send + Sync {
     ) -> Result<Vec<SourceFile>, HostError>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct WatchRequest {
     pub root: RootSpec,
 }

@@ -839,7 +839,8 @@ async fn version_four_requires_explicit_rebuild_to_version_five() -> TestResult 
     for field in [
         "name",
         "root",
-        "discovery",
+        "filter",
+        "scan",
         "embeddingRuntime",
         "createdTime",
     ] {

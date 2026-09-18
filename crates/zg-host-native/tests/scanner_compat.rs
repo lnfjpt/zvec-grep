@@ -3,126 +3,92 @@ use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
 
 use tempfile::tempdir;
-use tokio_util::sync::CancellationToken;
 use zg_host_native::{
-    DiscoveredFile, DiscoveryOptions, NativeScanner, ReadBatchRequest, RootSpec, ScanRequest,
-    ScanSnapshot, SkippedFileReason, TaskControl, WorkspaceScannerPort,
+    AllowAllPaths, DiscoveredFile, HostError, NativeScanner, PathPolicy, ReadBatchRequest,
+    RootSpec, ScanRequest, ScanSnapshot, SkippedFileReason, TaskControl, WorkspaceScannerPort,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+#[derive(Debug)]
+struct TestPolicy {
+    blocked_directory: PathBuf,
+    excluded_file: PathBuf,
+    inspected_files: Mutex<Vec<PathBuf>>,
+}
+
+impl PathPolicy for TestPolicy {
+    fn includes_file(&self, path: &Path) -> Result<bool, HostError> {
+        self.inspected_files
+            .lock()
+            .expect("record file")
+            .push(path.to_path_buf());
+        Ok(path != self.excluded_file)
+    }
+
+    fn can_descend(&self, path: &Path) -> Result<bool, HostError> {
+        Ok(!path.starts_with(&self.blocked_directory))
+    }
+}
+
 #[tokio::test]
-async fn scanner_matches_typescript_ignore_hidden_nested_git_and_path_filters() -> TestResult {
+async fn scanner_delegates_selection_and_prunes_directories_before_visiting_files() -> TestResult {
     let temporary = tempdir()?;
     let root = temporary.path();
-    mkdir(root, "src/nested/.git")?;
-    mkdir(root, "node_modules/pkg")?;
-    mkdir(root, "dist")?;
-    mkdir(root, ".hidden")?;
-    mkdir(root, "vendor")?;
-    write(
-        root,
-        ".gitignore",
-        "ignored.txt\nvendor/\n!vendor/keep.ts\n",
-    )?;
-    write(root, "src/main.ts", "export const main = 1;\n")?;
-    write(root, "src/skip.log", "skip\n")?;
-    write(root, "src/nested/child.ts", "nested\n")?;
-    write(root, "ignored.txt", "ignored\n")?;
-    write(root, "vendor/keep.ts", "export {};\n")?;
-    write(root, "node_modules/pkg/index.js", "ignored\n")?;
-    write(root, "dist/output.js", "ignored\n")?;
-    write(root, ".hidden/secret.ts", "hidden\n")?;
-
+    fs::create_dir_all(root.join("blocked/deep"))?;
+    fs::create_dir_all(root.join("nested/.git"))?;
+    fs::write(root.join("tracked.rs"), "fn tracked() {}\n")?;
+    fs::write(root.join("excluded.txt"), "excluded\n")?;
+    fs::write(root.join("blocked/deep/file.rs"), "blocked\n")?;
+    fs::write(root.join("nested/child.rs"), "nested\n")?;
+    let policy = Arc::new(TestPolicy {
+        blocked_directory: root.join("blocked"),
+        excluded_file: root.join("excluded.txt"),
+        inspected_files: Mutex::new(Vec::new()),
+    });
     let scanner = NativeScanner::default();
-    let snapshot = discover(
-        &scanner,
-        root,
-        DiscoveryOptions {
-            include_paths: vec!["src/**".to_owned(), "vendor/keep.ts".to_owned()],
-            exclude_paths: vec!["**/*.log".to_owned()],
-            ..DiscoveryOptions::default()
-        },
-    )
-    .await?;
+    let snapshot = discover(&scanner, RootSpec::new(root.to_path_buf(), policy.clone())).await?;
     assert_eq!(
         relative_paths(&snapshot.files),
         BTreeSet::from([
-            PathBuf::from("src/main.ts"),
-            PathBuf::from("src/nested/child.ts"),
-            PathBuf::from("vendor/keep.ts"),
+            PathBuf::from("nested/child.rs"),
+            PathBuf::from("tracked.rs"),
         ])
     );
-    assert_eq!(snapshot.files[0].size_bytes, 23);
-    assert_eq!(
-        snapshot.files[0].source_fingerprint,
-        metadata_fingerprint(&root.join("src/main.ts"))?,
+    assert!(
+        !policy
+            .inspected_files
+            .lock()
+            .expect("inspected files")
+            .iter()
+            .any(|path| path.starts_with(root.join("blocked")))
     );
-
+    let tracked = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == Path::new("tracked.rs"))
+        .expect("tracked file");
+    assert_eq!(
+        tracked.source_fingerprint,
+        metadata_fingerprint(&root.join("tracked.rs"))?
+    );
     let sources = scanner
         .read_batch(
             &ReadBatchRequest {
                 files: snapshot.files,
             },
-            &control(),
+            &TaskControl::default(),
         )
         .await?;
     assert!(
         sources
             .iter()
-            .any(|file| file.bytes == b"export const main = 1;\n")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn scanner_matches_typescript_defaults_and_explicit_includes() -> TestResult {
-    let temporary = tempdir()?;
-    let root = temporary.path();
-    mkdir(root, "src")?;
-    mkdir(root, "locales")?;
-    mkdir(root, ".github/workflows")?;
-    write(root, "src/main.ts", "export const main = true;\n")?;
-    write(root, "locales/en.json", "{\"hello\":\"Hello\"}\n")?;
-    write(root, "package-lock.json", "{\"lockfileVersion\":3}\n")?;
-    write(root, "client.pb.go", "package client\n")?;
-    write(root, "logo.png", "not-a-real-image")?;
-    write(root, ".github/workflows/ci.yml", "name: CI\n")?;
-    write(root, ".env.example", "TOKEN=replace-me\n")?;
-
-    let scanner = NativeScanner::default();
-    let defaults = discover(&scanner, root, DiscoveryOptions::default()).await?;
-    assert_eq!(
-        relative_paths(&defaults.files),
-        BTreeSet::from([PathBuf::from("src/main.ts")])
-    );
-
-    let explicit = discover(
-        &scanner,
-        root,
-        DiscoveryOptions {
-            include_paths: vec![
-                "locales/en.json".to_owned(),
-                "package-lock.json".to_owned(),
-                "client.pb.go".to_owned(),
-                "logo.png".to_owned(),
-            ],
-            ..DiscoveryOptions::default()
-        },
-    )
-    .await?;
-    assert_eq!(
-        relative_paths(&explicit.files),
-        BTreeSet::from([
-            PathBuf::from("client.pb.go"),
-            PathBuf::from("locales/en.json"),
-            PathBuf::from("logo.png"),
-            PathBuf::from("package-lock.json"),
-        ])
+            .any(|file| file.bytes == b"fn tracked() {}\n")
     );
     Ok(())
 }
@@ -131,21 +97,18 @@ async fn scanner_matches_typescript_defaults_and_explicit_includes() -> TestResu
 async fn scanner_limits_discovery_to_requested_scope_paths() -> TestResult {
     let temporary = tempdir()?;
     let root = temporary.path();
-    mkdir(root, "unrelated/deep")?;
-    write(root, "changed.txt", "changed\n")?;
-    write(root, "unrelated/deep/untouched.txt", "untouched\n")?;
-
-    let scanner = NativeScanner::default();
-    let snapshot = scanner
+    fs::create_dir_all(root.join("unrelated/deep"))?;
+    fs::write(root.join("changed.txt"), "changed\n")?;
+    fs::write(root.join("unrelated/deep/untouched.txt"), "untouched\n")?;
+    let snapshot = NativeScanner::default()
         .discover(
             &ScanRequest {
                 roots: vec![root_spec(root)],
                 scope_paths: vec![root.join("changed.txt")],
             },
-            &control(),
+            &TaskControl::default(),
         )
         .await?;
-
     assert_eq!(
         relative_paths(&snapshot.files),
         BTreeSet::from([PathBuf::from("changed.txt")])
@@ -154,95 +117,49 @@ async fn scanner_limits_discovery_to_requested_scope_paths() -> TestResult {
 }
 
 #[tokio::test]
-async fn scanner_applies_path_filters_and_explicit_size_limits_without_classifying_contents()
--> TestResult {
+async fn scanner_applies_depth_and_size_limits_without_classifying_contents() -> TestResult {
     let temporary = tempdir()?;
     let root = temporary.path();
-    mkdir(root, "src/deep")?;
-    mkdir(root, ".hidden")?;
-    write(root, ".gitignore", "ignored.ts\n")?;
-    write(root, "root.ts", "export const root = 1;\n")?;
-    write(root, "ignored.ts", "export const ignored = 1;\n")?;
-    write(root, "root.py", "root = 1\n")?;
-    write(root, "skip.test.ts", "export const skip = 1;\n")?;
-    write(root, ".hidden/secret.ts", "export const secret = 1;\n")?;
-    write(root, "src/child.ts", "export const child = 1;\n")?;
-    write(root, "src/deep/grand.ts", "export const grand = 1;\n")?;
+    fs::create_dir_all(root.join("src/deep"))?;
+    fs::write(root.join("root.ts"), "export const root = 1;\n")?;
+    fs::write(root.join("src/child.ts"), "export const child = 1;\n")?;
+    fs::write(root.join("src/deep/grand.ts"), "export const grand = 1;\n")?;
     fs::write(root.join("binary.md"), [0_u8, 1, 2, 0, 3])?;
-    fs::write(root.join("archive.zip"), [0_u8, 1, 2, 3])?;
     fs::write(root.join("empty.txt"), [])?;
-    fs::write(root.join("large.ts"), vec![b'x'; 1024 * 1024 + 1])?;
-
+    fs::write(root.join("large.ts"), vec![b'x'; 1025])?;
     let scanner = NativeScanner::default();
-    let filtered = discover(
-        &scanner,
-        root,
-        DiscoveryOptions {
-            globs: vec!["**".to_owned(), "!**/*.test.ts".to_owned()],
-            file_types: vec!["ts".to_owned()],
-            hidden: true,
-            no_ignore: true,
-            max_depth: Some(2),
-            max_file_size_bytes: Some(1024 * 1024),
-            ..DiscoveryOptions::default()
-        },
-    )
-    .await?;
+    let mut root_spec = root_spec(root);
+    root_spec.max_depth = Some(2);
+    root_spec.max_file_size_bytes = Some(1024);
+    let filtered = discover(&scanner, root_spec).await?;
     assert_eq!(
         relative_paths(&filtered.files),
         BTreeSet::from([
-            PathBuf::from(".hidden/secret.ts"),
-            PathBuf::from("ignored.ts"),
+            PathBuf::from("binary.md"),
             PathBuf::from("root.ts"),
             PathBuf::from("src/child.ts"),
         ])
     );
     assert_eq!(filtered.diagnostics.skipped_by_reason.too_large, 1);
-
-    let unrestricted = discover(
-        &scanner,
-        root,
-        DiscoveryOptions {
-            include_paths: vec![
-                "binary.md".to_owned(),
-                "archive.zip".to_owned(),
-                "large.ts".to_owned(),
-                "empty.txt".to_owned(),
-            ],
-            no_ignore: true,
-            ..DiscoveryOptions::default()
-        },
-    )
-    .await?;
-    assert_eq!(
-        relative_paths(&unrestricted.files),
-        BTreeSet::from([
-            PathBuf::from("archive.zip"),
-            PathBuf::from("binary.md"),
-            PathBuf::from("large.ts"),
-        ])
+    assert_eq!(filtered.diagnostics.skipped_by_reason.empty, 1);
+    assert!(
+        filtered
+            .diagnostics
+            .skipped_samples
+            .iter()
+            .any(|sample| sample.reason == SkippedFileReason::Empty)
     );
-    assert_eq!(unrestricted.diagnostics.skipped_files, 1);
-    assert_eq!(unrestricted.diagnostics.skipped_by_reason.empty, 1);
-    assert_eq!(
-        unrestricted.diagnostics.skipped_samples[0].reason,
-        SkippedFileReason::Empty,
-    );
-    let binary = unrestricted
+    let binary = filtered
         .files
         .iter()
         .find(|file| file.relative_path == Path::new("binary.md"))
         .expect("binary content is discovered without probing");
-    assert_eq!(
-        binary.source_fingerprint,
-        metadata_fingerprint(&root.join("binary.md"))?
-    );
     let sources = scanner
         .read_batch(
             &ReadBatchRequest {
                 files: vec![binary.clone()],
             },
-            &control(),
+            &TaskControl::default(),
         )
         .await?;
     assert_eq!(sources[0].bytes, [0_u8, 1, 2, 0, 3]);
@@ -253,15 +170,14 @@ async fn scanner_applies_path_filters_and_explicit_size_limits_without_classifyi
 async fn scanner_rejects_overlapping_roots() -> TestResult {
     let temporary = tempdir()?;
     let root = temporary.path();
-    mkdir(root, "child")?;
-    let scanner = NativeScanner::default();
-    let error = scanner
+    fs::create_dir_all(root.join("child"))?;
+    let error = NativeScanner::default()
         .discover(
             &ScanRequest {
                 roots: vec![root_spec(root), root_spec(&root.join("child"))],
                 scope_paths: Vec::new(),
             },
-            &control(),
+            &TaskControl::default(),
         )
         .await
         .expect_err("recursive nested roots must overlap");
@@ -269,32 +185,39 @@ async fn scanner_rejects_overlapping_roots() -> TestResult {
     Ok(())
 }
 
-async fn discover(
-    scanner: &NativeScanner,
-    root: &Path,
-    discovery: DiscoveryOptions,
-) -> TestResult<ScanSnapshot> {
+#[cfg(unix)]
+#[tokio::test]
+async fn scanner_follows_links_without_visiting_the_same_directory_twice() -> TestResult {
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    fs::create_dir(root.join("child"))?;
+    fs::write(root.join("child/source.rs"), "fn source() {}")?;
+    std::os::unix::fs::symlink(root, root.join("child/cycle"))?;
+    std::os::unix::fs::symlink(root.join("child"), root.join("linked"))?;
+    let mut spec = root_spec(root);
+    spec.follow = true;
+    let snapshot = discover(&NativeScanner::default(), spec).await?;
+    assert_eq!(
+        relative_paths(&snapshot.files),
+        BTreeSet::from([PathBuf::from("child/source.rs")])
+    );
+    Ok(())
+}
+
+async fn discover(scanner: &NativeScanner, root: RootSpec) -> TestResult<ScanSnapshot> {
     Ok(scanner
         .discover(
             &ScanRequest {
-                roots: vec![RootSpec {
-                    path: root.to_path_buf(),
-                    recursive: true,
-                    discovery,
-                }],
+                roots: vec![root],
                 scope_paths: Vec::new(),
             },
-            &control(),
+            &TaskControl::default(),
         )
         .await?)
 }
 
 fn root_spec(root: &Path) -> RootSpec {
-    RootSpec {
-        path: root.to_path_buf(),
-        recursive: true,
-        discovery: DiscoveryOptions::default(),
-    }
+    RootSpec::new(root.to_path_buf(), Arc::new(AllowAllPaths))
 }
 
 fn relative_paths(files: &[DiscoveredFile]) -> BTreeSet<PathBuf> {
@@ -302,18 +225,6 @@ fn relative_paths(files: &[DiscoveredFile]) -> BTreeSet<PathBuf> {
         .iter()
         .map(|file| file.relative_path.clone())
         .collect()
-}
-
-fn control() -> TaskControl {
-    TaskControl::new(CancellationToken::new())
-}
-
-fn mkdir(root: &Path, path: &str) -> std::io::Result<()> {
-    fs::create_dir_all(root.join(path))
-}
-
-fn write(root: &Path, path: &str, content: &str) -> std::io::Result<()> {
-    fs::write(root.join(path), content)
 }
 
 fn metadata_fingerprint(path: &Path) -> TestResult<String> {

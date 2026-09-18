@@ -67,6 +67,7 @@ impl EngineService {
         options: ContextOptions,
     ) -> Result<ContextResult, EngineError> {
         self.ensure_open()?;
+        options.validate_file_selection()?;
         let root = resolve_root(options.root.as_deref())?;
         let normalized = normalize_context_request(&options)?;
         if !options.rg {

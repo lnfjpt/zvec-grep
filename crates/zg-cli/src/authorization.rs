@@ -153,7 +153,10 @@ mod tests {
                 query: "vector".into(),
             }],
             limit: Some(7),
-            globs: vec!["*.rs".into()],
+            filter: zg_engine::api::index::options::FileFilter {
+                globs: vec!["*.rs".into()],
+                ..Default::default()
+            },
             fuse: true,
             refresh: Some(RefreshPolicy::Wait),
             ..ContextOptions::default()
@@ -175,7 +178,7 @@ mod tests {
                 .all(|r| r.mode == ContextRouteMode::Fts)
         );
         assert_eq!(request.limit, Some(7));
-        assert_eq!(request.globs, ["*.rs"]);
+        assert_eq!(request.filter.globs[0].pattern, "*.rs");
         assert!(request.fuse);
         assert!(!request.auto_update && !request.allow_remote);
         assert_eq!(request.refresh, Some(RefreshPolicy::Off));

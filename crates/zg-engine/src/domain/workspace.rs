@@ -1,16 +1,14 @@
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use crate::{EngineError, EngineResult};
 
-use super::{SourcePath, model::EmbeddingModelInfo};
+use super::{FileFilter, SourcePath, model::EmbeddingModelInfo};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Workspace {
     pub name: String,
     pub root: PathBuf,
-    pub file_selection: FileSelection,
+    pub filter: FileFilter,
     pub index: IndexState,
     pub created_epoch_ms: u64,
     pub updated_epoch_ms: u64,
@@ -55,23 +53,6 @@ impl Workspace {
     pub(crate) fn index_enabled(&self) -> bool {
         matches!(self.index, IndexState::Enabled(_))
     }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct FileSelection {
-    pub include_paths: Vec<String>,
-    pub exclude_paths: Vec<String>,
-    pub globs: Vec<String>,
-    pub insensitive_globs: Vec<String>,
-    pub file_types: Vec<String>,
-    pub excluded_file_types: Vec<String>,
-    pub hidden: bool,
-    pub no_ignore: bool,
-    pub ignore_files: Vec<PathBuf>,
-    pub max_depth: Option<usize>,
-    pub max_file_size_bytes: Option<u64>,
-    pub follow: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

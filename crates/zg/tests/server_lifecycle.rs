@@ -719,8 +719,7 @@ fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<
         "jsonrpc": "2.0", "id": 8, "method": "tools/call",
         "params": { "name": "zvec_grep_search", "arguments": {
             "root": workspace.path(), "fts": "freshnessbarrier",
-            "autoUpdate": false, "freshness": "wait_for_fresh",
-            "endpoint": format!("http://{}/embeddings", embedding.address)
+            "autoUpdate": false, "freshness": "wait_for_fresh"
         } }
     });
     let response = post_json(port, Some(&session), &wait_search.to_string())?;
@@ -732,8 +731,7 @@ fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<
     let background_search = json!({
         "jsonrpc": "2.0", "id": 9, "method": "tools/call",
         "params": { "name": "zvec_grep_search", "arguments": {
-            "root": workspace.path(), "fts": "freshnessbarrier",
-            "endpoint": format!("http://{}/embeddings", embedding.address)
+            "root": workspace.path(), "fts": "freshnessbarrier"
         } }
     });
     let response = post_json(port, Some(&session), &background_search.to_string())?;

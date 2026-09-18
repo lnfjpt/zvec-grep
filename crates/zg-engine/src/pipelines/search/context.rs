@@ -188,12 +188,7 @@ pub(crate) async fn context_from_index(
                     trace: options.trace,
                     prefer_symbol: options.prefer_symbol,
                     symbol_types: options.symbol_types.clone(),
-                    include_paths: options.include_paths.clone(),
-                    exclude_paths: options.exclude_paths.clone(),
-                    globs: options.globs.clone(),
-                    insensitive_globs: options.insensitive_globs.clone(),
-                    file_types: options.file_types.clone(),
-                    excluded_file_types: options.excluded_file_types.clone(),
+                    filter: options.filter.clone(),
                     modified_after_epoch_ms: options.modified_after_epoch_ms,
                     modified_before_epoch_ms: options.modified_before_epoch_ms,
                 },
@@ -750,9 +745,9 @@ mod tests {
     fn resolves_context_paths_and_freshness_after_workspace_relocation() {
         use crate::{
             domain::{
-                Content, Entity, EntityContent, EntityId, FileFormat, FileId, FileIndexStatus,
-                FileRecord, FileSelection, FileSnapshot, IndexDescriptor, IndexState, SourceRange,
-                TextRange, Workspace,
+                Content, Entity, EntityContent, EntityId, FileFilter, FileFormat, FileId,
+                FileIndexStatus, FileRecord, FileSnapshot, IndexDescriptor, IndexState,
+                SourceRange, TextRange, Workspace,
                 model::{EmbeddingModelInfo, Metric},
             },
             pipelines::search::pipeline::{SearchHit, SearchPlanResult},
@@ -813,7 +808,7 @@ mod tests {
         let mut workspace = Workspace {
             name: "workspace".to_owned(),
             root: original_root.clone(),
-            file_selection: FileSelection::default(),
+            filter: FileFilter::default(),
             index: IndexState::Enabled(IndexDescriptor {
                 fts: crate::domain::FTS_CONFIG,
                 embedding: EmbeddingModelInfo {

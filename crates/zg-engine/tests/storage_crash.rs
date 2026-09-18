@@ -22,7 +22,7 @@ use zg_engine::{
     api::{
         context::{
             ContextOptions,
-            options::{ContextRoute, ContextRouteMode},
+            options::{ContextRoute, ContextRouteMode, FileFilter},
         },
         index::{
             IndexOptions,
@@ -450,7 +450,7 @@ async fn search_paths(
     engine: &ZvecGrep,
     root: &Path,
     mode: ContextRouteMode,
-    include_paths: Vec<String>,
+    selected_paths: Vec<String>,
 ) -> TestResult<BTreeSet<String>> {
     Ok(engine
         .context(ContextOptions {
@@ -460,7 +460,14 @@ async fn search_paths(
                 query: "orchard".to_owned(),
             }],
             limit: Some(TOTAL_FILES),
-            include_paths,
+            filter: FileFilter {
+                // These are concrete fixture file names; anchor them to the root.
+                globs: selected_paths
+                    .into_iter()
+                    .map(|path| format!("/{}", path.replace(std::path::MAIN_SEPARATOR, "/")).into())
+                    .collect(),
+                ..FileFilter::default()
+            },
             auto_update: false,
             allow_remote: true,
             ..ContextOptions::default()
