@@ -30,7 +30,9 @@ pub use metadata::{CodeMetadata, EntityMetadata, MarkdownMetadata, SymbolType};
 // Fragments.
 pub(crate) use entity::{EntityFragment, FragmentId, WindowFragment, validate_fragments};
 
+// Workspaces.
 pub use workspace::FileSelection;
-pub(crate) use workspace::{IndexDescriptor, IndexState, Workspace};
+pub(crate) use workspace::{FTS_CONFIG, FtsConfig, IndexDescriptor, IndexState, Workspace};
 
-pub(crate) use model::{EmbeddingMetric, EmbeddingSchema};
+// Models.
+pub(crate) use model::{EmbeddingModelInfo, Metric};

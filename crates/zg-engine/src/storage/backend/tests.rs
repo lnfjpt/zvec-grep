@@ -296,13 +296,137 @@ fn recovery_validates_source_record_owners_before_mutating_any_collection() {
     assert_eq!(native.list_files().expect("no mutation").len(), 2);
     assert!(home.join("storage").join(pending::NAME).exists());
 }
-fn schema() -> EmbeddingSchema {
-    EmbeddingSchema {
-        provider: "fixture".to_owned(),
-        model: "fixture-model".to_owned(),
+fn schema() -> EmbeddingModelInfo {
+    EmbeddingModelInfo {
+        model: crate::domain::model::ModelInfo {
+            provider: "fixture".to_owned(),
+            name: "fixture-model".to_owned(),
+            endpoint: None,
+        },
         dimension: 3,
-        metric: EmbeddingMetric::Cosine,
+        metric: Metric::Cosine,
+        max_batch_size: 32,
+        max_input_tokens: None,
+        max_image_bytes: None,
     }
+}
+
+#[test]
+fn stored_model_info_preserves_metadata_and_only_checks_index_fields() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let home = directory.path();
+    let mut original = schema();
+    original.model.endpoint = Some("https://models.example.test/embeddings".into());
+    original.metric = Metric::DotProduct;
+    original.max_input_tokens = Some(8192);
+    original.max_image_bytes = Some(1_048_576);
+    let factory = ZvecStorageFactory::new();
+    factory
+        .open(WorkspaceIndexStorageOptions::ReadWrite {
+            storage_path: home.to_owned(),
+            embedding: original.clone(),
+        })
+        .expect("create index")
+        .close()
+        .expect("close index");
+    let descriptor = home.join("storage/schema.json");
+    let persisted = fs::read(&descriptor).expect("read descriptor");
+    let record: serde_json::Value = serde_json::from_slice(&persisted).expect("descriptor JSON");
+    assert!(record.get("version").is_none());
+    assert_eq!(
+        read_json::<SchemaRecord>(&descriptor)
+            .expect("read model info")
+            .embedding()
+            .expect("valid model info"),
+        original
+    );
+
+    let mut current = original.clone();
+    current.model.endpoint = Some("https://new.example.test/embeddings".into());
+    current.max_batch_size = 64;
+    current.max_input_tokens = Some(4096);
+    current.max_image_bytes = None;
+    factory
+        .open(WorkspaceIndexStorageOptions::ReadWrite {
+            storage_path: home.to_owned(),
+            embedding: current.clone(),
+        })
+        .expect("runtime metadata changes do not invalidate an index")
+        .close()
+        .expect("close reused index");
+
+    let mut invalid = current.clone();
+    invalid.max_batch_size = 0;
+    let error = factory
+        .open(WorkspaceIndexStorageOptions::ReadWrite {
+            storage_path: home.to_owned(),
+            embedding: invalid,
+        })
+        .err()
+        .expect("reopening must validate incoming metadata too");
+    assert_eq!(error.code(), EngineError::INVALID_ARGUMENT);
+    assert!(error.message().contains("max_batch_size"));
+
+    for field in ["provider", "name", "dimension", "metric"] {
+        let mut changed = current.clone();
+        match field {
+            "provider" => changed.model.provider = "other".into(),
+            "name" => changed.model.name = "other".into(),
+            "dimension" => changed.dimension += 1,
+            "metric" => changed.metric = Metric::Cosine,
+            _ => unreachable!(),
+        }
+        let error = factory
+            .open(WorkspaceIndexStorageOptions::ReadWrite {
+                storage_path: home.to_owned(),
+                embedding: changed,
+            })
+            .err()
+            .expect("index fields must match");
+        assert!(error.message().contains("rebuild the index"), "{field}");
+    }
+    assert_eq!(
+        fs::read(descriptor).expect("unchanged descriptor"),
+        persisted
+    );
+}
+
+#[test]
+fn rejects_corrupt_embedding_limits_before_opening_native_storage() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let path = directory.path().join("storage");
+    fs::create_dir(&path).expect("storage directory");
+    for field in ["maxBatchSize", "maxInputTokens", "maxImageBytes"] {
+        let mut record =
+            serde_json::to_value(SchemaRecord::new(&schema())).expect("descriptor JSON");
+        record["embedding"][field] = serde_json::json!(0);
+        fs::write(
+            path.join("schema.json"),
+            serde_json::to_vec(&record).expect("encode descriptor"),
+        )
+        .expect("write corrupt descriptor");
+        for options in [
+            WorkspaceIndexStorageOptions::ReadOnly {
+                storage_path: directory.path().to_owned(),
+            },
+            WorkspaceIndexStorageOptions::ReadWrite {
+                storage_path: directory.path().to_owned(),
+                embedding: schema(),
+            },
+        ] {
+            let error = ZvecStorageFactory::new()
+                .open(options)
+                .err()
+                .expect("corrupt metadata");
+            assert_eq!(error.code(), EngineError::STORAGE_FAILURE);
+            assert!(
+                error
+                    .message()
+                    .contains("invalid stored embedding model information")
+            );
+        }
+    }
+    assert_eq!(fs::read_dir(path).expect("storage files").count(), 1);
 }
 
 fn open(path: &Path, read_only: bool) -> Box<dyn WorkspaceIndexStorage> {
@@ -1420,46 +1544,6 @@ fn native_replacements_require_a_consistent_complete_file_state() {
             .is_empty()
     );
     assert_eq!(native.list_files().expect("reindex marker"), vec![file]);
-}
-
-#[test]
-fn rejects_legacy_schemas_before_opening_collections() {
-    let directory = tempfile::tempdir().expect("fixture directory");
-    let home = directory.path();
-    let path = home.join("storage");
-    fs::create_dir(&path).expect("storage directory");
-    for version in 1..VERSION {
-        let mut record = SchemaRecord::new(&schema());
-        record.version = version;
-        let mut record = serde_json::to_value(record).expect("legacy record");
-        record["dictionary_cache"] = serde_json::json!(home.join("legacy-dictionary"));
-        fs::write(
-            path.join("schema.json"),
-            serde_json::to_vec(&record).expect("legacy schema"),
-        )
-        .expect("write legacy schema");
-        for options in [
-            WorkspaceIndexStorageOptions::ReadOnly {
-                storage_path: home.to_owned(),
-            },
-            WorkspaceIndexStorageOptions::ReadWrite {
-                storage_path: home.to_owned(),
-                embedding: schema(),
-            },
-        ] {
-            let error = ZvecStorageFactory::new()
-                .open(options)
-                .err()
-                .expect("legacy schema is incompatible");
-            assert!(
-                error
-                    .message()
-                    .contains(&format!("unsupported storage schema version {version}"))
-            );
-            assert!(error.message().contains("rebuild the index"));
-        }
-    }
-    assert_eq!(fs::read_dir(path).expect("storage files").count(), 1);
 }
 
 #[test]

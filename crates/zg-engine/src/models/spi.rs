@@ -118,6 +118,9 @@ pub(crate) fn validate_inputs(
     inputs: &[Vec<Content>],
     accepts: impl Fn(&Content) -> bool,
 ) -> Result<(), ModelError> {
+    info.validate().map_err(|error| {
+        ModelError::internal("Embedding model returned invalid metadata").with_cause(error)
+    })?;
     if inputs.is_empty() {
         return Err(ModelError::new(
             crate::EngineError::INVALID_ARGUMENT,
@@ -264,7 +267,7 @@ pub(crate) fn validate_result(
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{Content, FileFormat, ImageContent, TableContent, model::EmbeddingMetric};
+    use crate::domain::{Content, FileFormat, ImageContent, TableContent, model::Metric};
 
     use super::*;
 
@@ -275,6 +278,21 @@ mod tests {
         super::validate_inputs(info, inputs, |content| {
             matches!(content, Content::Text(_) | Content::Image(_))
         })
+    }
+
+    #[test]
+    fn invalid_model_info_is_not_reported_as_a_bad_embedding_request() {
+        let mut info = fixture_info();
+        info.max_batch_size = 0;
+        let error = validate_inputs(&info, &[vec![Content::Text("valid input".into())]])
+            .expect_err("model metadata must be checked before request limits");
+        assert_eq!(error.code(), crate::EngineError::INTERNAL);
+        assert!(
+            error
+                .cause()
+                .expect("validation detail")
+                .contains("max_batch_size")
+        );
     }
 
     #[test]
@@ -426,7 +444,7 @@ mod tests {
                 endpoint: None,
             },
             dimension: 2,
-            metric: EmbeddingMetric::Cosine,
+            metric: Metric::Cosine,
             max_batch_size: 2,
             max_input_tokens: None,
             max_image_bytes: Some(3),

@@ -300,16 +300,12 @@ async fn embed_vector_routes(
     routes: &[ResolvedSearchRoute],
     model: &dyn SearchEmbeddingRuntime,
 ) -> Result<HashMap<String, Vec<f32>>, EngineError> {
+    model.info().validate()?;
     let vector_routes = routes
         .iter()
         .filter(|route| route.mode == SearchRouteMode::Vector)
         .collect::<Vec<_>>();
     let maximum = model.info().max_batch_size;
-    if maximum == 0 {
-        return Err(EngineError::internal(
-            "embedding model has a zero query batch limit",
-        ));
-    }
     let mut vectors = HashMap::new();
     for batch in vector_routes.chunks(maximum) {
         let queries = batch
@@ -934,7 +930,7 @@ mod tests {
             Content, Entity, EntityContent, EntityFragment, EntityId, FileFormat, FileId,
             FileIndexStatus, FileRecord, FileSnapshot, FragmentId, SourceRange, TextRange,
             WindowFragment,
-            model::{EmbeddingMetric, EmbeddingModelInfo},
+            model::{EmbeddingModelInfo, Metric},
         },
         models::ModelError,
         storage::spi::{
@@ -974,7 +970,7 @@ mod tests {
                         endpoint: None,
                     },
                     dimension: 2,
-                    metric: EmbeddingMetric::Cosine,
+                    metric: Metric::Cosine,
                     max_batch_size: 8,
                     max_input_tokens: None,
                     max_image_bytes: None,

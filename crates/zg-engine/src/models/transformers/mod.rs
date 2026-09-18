@@ -1502,7 +1502,7 @@ mod tests {
         assert_eq!(merged.attention_mask, [1, 1, 0, 1, 1, 1, 1, 1, 0]);
         assert_eq!(merged.truncated, [0, 2]);
     }
-    use crate::domain::model::EmbeddingMetric;
+    use crate::domain::model::Metric;
 
     fn entry(pooling: &'static str, normalize: bool) -> TransformersConfig {
         TransformersConfig {
@@ -1513,7 +1513,7 @@ mod tests {
             revision: "0123456789abcdef",
             dtype: "q8",
             dimension: 3,
-            metric: EmbeddingMetric::Cosine,
+            metric: Metric::Cosine,
             pooling,
             normalize,
             query_prefix: Some("query: "),

@@ -158,6 +158,9 @@ impl ModelRuntimeManager {
             // so this guarantees a single instance without blocking on I/O.
             let model =
                 (self.inner.factory)(&reference, options, self.inner.compute_runtime.clone())?;
+            model.info().validate().map_err(|error| {
+                ModelError::internal("Embedding model returned invalid metadata").with_cause(error)
+            })?;
             let entry = Arc::new(ModelRuntimeEntry {
                 runtime: Arc::new(ModelRuntime {
                     model,
@@ -392,7 +395,7 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::{Barrier, Semaphore as TokioSemaphore};
 
-    use crate::domain::model::EmbeddingMetric;
+    use crate::domain::model::Metric;
 
     use super::*;
     use crate::domain::model::EmbeddingPurpose;
@@ -414,7 +417,7 @@ mod tests {
                         endpoint: None,
                     },
                     dimension: 1,
-                    metric: EmbeddingMetric::Cosine,
+                    metric: Metric::Cosine,
                     max_batch_size: 8,
                     max_input_tokens: Some(32),
                     max_image_bytes: None,
@@ -547,6 +550,52 @@ mod tests {
                 vectors: inputs.iter().map(|_| vec![1.0]).collect(),
                 truncated: Vec::new(),
             })
+        }
+    }
+
+    #[test]
+    fn invalid_model_info_is_rejected_before_caching_or_leasing() {
+        for field in [
+            "provider",
+            "name",
+            "dimension",
+            "max_batch_size",
+            "max_input_tokens",
+            "max_image_bytes",
+        ] {
+            let creations = Arc::new(AtomicUsize::new(0));
+            let observed_creations = Arc::clone(&creations);
+            let manager = ModelRuntimeManager::with_factory(move |_, _, _| {
+                let mut model = ConcurrentFixtureModel::new();
+                if observed_creations.fetch_add(1, Ordering::AcqRel) == 0 {
+                    match field {
+                        "provider" => model.info.model.provider = " ".to_owned(),
+                        "name" => model.info.model.name.clear(),
+                        "dimension" => model.info.dimension = 0,
+                        "max_batch_size" => model.info.max_batch_size = 0,
+                        "max_input_tokens" => model.info.max_input_tokens = Some(0),
+                        "max_image_bytes" => model.info.max_image_bytes = Some(0),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    // Optional limits may be absent; this does not invalidate the model.
+                    model.info.max_input_tokens = None;
+                    model.info.max_image_bytes = None;
+                }
+                Ok(Arc::new(model))
+            });
+            let request =
+                || ModelRuntimeRequest::new("local/fixture", ModelConfig::default(), None);
+            let error = manager.acquire(request()).err().expect("invalid metadata");
+            assert_eq!(error.code(), crate::EngineError::INTERNAL);
+            assert!(error.cause().expect("validation detail").contains(field));
+            assert_eq!(manager.snapshot(), ModelRuntimeSnapshot::default());
+            let lease = manager
+                .acquire(request())
+                .expect("retry constructs a valid model");
+            assert_eq!(creations.load(Ordering::Acquire), 2);
+            assert_eq!(manager.snapshot().active_leases, 1);
+            assert_eq!(lease.info().model.reference(), "local/fixture");
         }
     }
 

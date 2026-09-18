@@ -5,7 +5,6 @@ use crate::{
     models::{EmbeddingCatalogEntry, get_embedding_model_catalog_entry},
     utils::{atomic_write, sync_directory},
     workspace::{
-        build::{has_build, read_build},
         layout::{find_nearest_workspace, workspace_index_location},
         manifest::{WorkspaceManifest, read_workspace_manifest},
     },
@@ -44,12 +43,7 @@ pub fn index_authorization(
         None => workspace_index_location(&requested_root)?,
     };
     let existing = read_workspace_manifest(&location.home)?;
-    let pending = read_build(&location.home)?;
-    let existing = pending
-        .as_ref()
-        .map(|build| &build.target)
-        .or(existing.as_ref());
-    authorization_for_manifest(options, &location.root, existing)
+    authorization_for_manifest(options, &location.root, existing.as_ref())
 }
 
 fn authorization_for_manifest(
@@ -133,10 +127,6 @@ pub fn query_authorization(
     let Some(manifest) = read_workspace_manifest(&location.home)? else {
         return Ok(None);
     };
-    let workspace_content = workspace_content && !has_build(&location.home);
-    if !query_text && !workspace_content {
-        return Ok(None);
-    }
     if manifest.embedding().is_none() {
         return Ok(None);
     }
@@ -345,7 +335,7 @@ pub fn grant(
             manifest
                 .as_ref()
                 .and_then(|m| m.embedding())
-                .map(|e| format!("{}/{}", e.provider, e.model))
+                .map(|e| e.model.reference())
         })
         .or_else(|| {
             env::var("ZVEC_GREP_EMBEDDING")
@@ -585,12 +575,12 @@ mod tests {
     }
 
     #[test]
-    fn resumed_build_discloses_its_destination_while_queries_use_the_active_index() {
+    fn abandoned_build_does_not_override_active_authorization() {
         use crate::{
             api::context::{ContextOptions, options::RefreshPolicy},
             domain::{
                 FileSelection, IndexDescriptor, IndexState, Workspace,
-                model::{EmbeddingMetric, EmbeddingSchema, ModelConfig},
+                model::{EmbeddingModelInfo, Metric, ModelConfig},
             },
             workspace::{build::prepare_build, manifest::write_workspace_manifest},
         };
@@ -602,13 +592,19 @@ mod tests {
                 root: directory.path().to_path_buf(),
                 file_selection: FileSelection::default(),
                 index: IndexState::Enabled(IndexDescriptor {
-                    embedding: EmbeddingSchema {
-                        provider: "qwen".into(),
-                        model: "text-embedding-v4".into(),
+                    fts: crate::domain::FTS_CONFIG,
+                    embedding: EmbeddingModelInfo {
+                        model: crate::domain::model::ModelInfo {
+                            provider: "qwen".into(),
+                            name: "text-embedding-v4".into(),
+                            endpoint: None,
+                        },
                         dimension: 1024,
-                        metric: EmbeddingMetric::Cosine,
+                        metric: Metric::Cosine,
+                        max_batch_size: 32,
+                        max_input_tokens: None,
+                        max_image_bytes: None,
                     },
-                    revision: 1,
                 }),
                 created_epoch_ms: 1,
                 updated_epoch_ms: 1,
@@ -624,20 +620,14 @@ mod tests {
         write_workspace_manifest(&home, &active).expect("write active");
         let mut target = active.clone();
         target.embedding_runtime.endpoint = Some("https://staging.test/embeddings".into());
-        prepare_build(
-            target,
-            Some(&active),
-            None,
-            &crate::storage::ZvecStorageFactory::new(),
-        )
-        .expect("staged build");
+        prepare_build(target, Some(&active)).expect("staged build");
         let index = index_authorization(&IndexOptions {
             root: Some(directory.path().into()),
             ..IndexOptions::default()
         })
         .expect("index disclosure")
         .expect("remote index");
-        assert_eq!(index.endpoint_host, "staging.test");
+        assert_eq!(index.endpoint_host, "active.test");
         let query = query_authorization(&ContextOptions {
             root: Some(directory.path().into()),
             query: Some("query".into()),
@@ -648,23 +638,19 @@ mod tests {
         .expect("remote query");
         assert_eq!(query.target.endpoint_host, "active.test");
         assert!(query.query_text);
-        assert!(!query.workspace_content);
+        assert!(query.workspace_content);
 
-        // An unpublished first build is still the enclosing workspace when a
-        // user resumes from a child directory.
+        // An abandoned initial build must not silently select its remote model.
         fs::remove_file(home.join("manifest.json")).expect("unpublished workspace");
         let child = directory.path().join("src/nested");
         fs::create_dir_all(&child).expect("nested source directory");
-        let resumed = index_authorization(&IndexOptions {
-            root: Some(child),
-            ..IndexOptions::default()
-        })
-        .expect("first-build disclosure")
-        .expect("remote index");
-        assert_eq!(resumed.endpoint_host, "staging.test");
-        assert_eq!(
-            resumed.root,
-            fs::canonicalize(directory.path()).expect("workspace root")
+        assert!(
+            index_authorization(&IndexOptions {
+                root: Some(child),
+                ..IndexOptions::default()
+            })
+            .expect("default local model")
+            .is_none()
         );
     }
 

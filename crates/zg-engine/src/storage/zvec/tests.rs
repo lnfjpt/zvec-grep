@@ -65,11 +65,17 @@ fn path_enumeration_reads_the_complete_projection_without_decoding_payloads() {
     std::fs::create_dir(&storage_path).expect("storage directory");
     let store = NativeStore::open(
         &storage_path,
-        &EmbeddingSchema {
-            provider: "fixture".into(),
-            model: "fixture".into(),
+        &EmbeddingModelInfo {
+            model: crate::domain::model::ModelInfo {
+                provider: "fixture".into(),
+                name: "fixture".into(),
+                endpoint: None,
+            },
             dimension: 3,
-            metric: EmbeddingMetric::Cosine,
+            metric: Metric::Cosine,
+            max_batch_size: 32,
+            max_input_tokens: None,
+            max_image_bytes: None,
         },
         false,
     )
@@ -216,11 +222,17 @@ fn metadata_store(path: &Path) -> NativeStore {
     super::super::backend::initialize().expect("initialize zvec");
     NativeStore::open(
         path,
-        &EmbeddingSchema {
-            provider: "fixture".into(),
-            model: "fixture".into(),
+        &EmbeddingModelInfo {
+            model: crate::domain::model::ModelInfo {
+                provider: "fixture".into(),
+                name: "fixture".into(),
+                endpoint: None,
+            },
             dimension: 3,
-            metric: EmbeddingMetric::Cosine,
+            metric: Metric::Cosine,
+            max_batch_size: 32,
+            max_input_tokens: None,
+            max_image_bytes: None,
         },
         false,
     )
@@ -685,11 +697,17 @@ fn maximum_u32_directory_id_survives_reopen_and_filters_both_retrieval_collectio
         .apply_replace(&source, &entries)
         .expect("write maximum membership");
     store.flush().expect("checkpoint");
-    let schema = EmbeddingSchema {
-        provider: "fixture".into(),
-        model: "fixture".into(),
+    let schema = EmbeddingModelInfo {
+        model: crate::domain::model::ModelInfo {
+            provider: "fixture".into(),
+            name: "fixture".into(),
+            endpoint: None,
+        },
         dimension: 3,
-        metric: EmbeddingMetric::Cosine,
+        metric: Metric::Cosine,
+        max_batch_size: 32,
+        max_input_tokens: None,
+        max_image_bytes: None,
     };
     drop(store);
     let reader = NativeStore::open(temporary.path(), &schema, true).expect("reopen");

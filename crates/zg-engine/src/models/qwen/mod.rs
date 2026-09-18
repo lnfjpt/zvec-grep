@@ -646,7 +646,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::domain::{ImageContent, TableContent, model::EmbeddingMetric};
+    use crate::domain::{ImageContent, TableContent, model::Metric};
 
     struct MockHttp {
         response: Mutex<Option<QwenHttpResponse>>,
@@ -677,7 +677,7 @@ mod tests {
             provider: "qwen",
             model,
             dimension,
-            metric: EmbeddingMetric::Cosine,
+            metric: Metric::Cosine,
             default_endpoint: "https://default.test/embed",
             max_batch_size: 20,
             max_input_tokens: 512,

@@ -215,7 +215,7 @@ impl IndexOperationProvider for DirectIndexOperationProvider {
         let result = self.engine.index(options).await?;
         Ok(IndexOperationResult {
             root,
-            job_id: format!("generation-{}", result.generation),
+            job_id: uuid::Uuid::new_v4().to_string(),
             state: IndexOperationState::Succeeded,
             reused: false,
             error: None,
@@ -806,6 +806,8 @@ struct WorkspaceIndexOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding: Option<IndexedEmbeddingOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    fts: Option<IndexedFtsOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     index_version: Option<u32>,
     created_time: u64,
     updated_time: u64,
@@ -848,6 +850,12 @@ struct IndexedEmbeddingOutput {
     model: String,
     dimension: usize,
     metric: String,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct IndexedFtsOutput {
+    tokenizer: String,
+    filters: Vec<String>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -1575,6 +1583,10 @@ impl From<InfoResult> for IndexStatusOutput {
                 dimension: embedding.dimension,
                 metric: embedding.metric,
             }),
+            fts: info.fts.map(|fts| IndexedFtsOutput {
+                tokenizer: fts.tokenizer,
+                filters: fts.filters,
+            }),
             index_version: info.index_version,
             created_time: info.created_epoch_ms,
             updated_time: info.updated_epoch_ms,
@@ -1921,8 +1933,12 @@ mod tests {
                 discovery: super::IndexDiscoveryOptions::default(),
                 policy: super::WorkspaceIndexPolicy::Enabled,
                 embedding: None,
+                fts: Some(zg_engine::api::info::result::WorkspaceIndexFts {
+                    tokenizer: "jieba".into(),
+                    filters: vec!["lowercase".into()],
+                }),
                 index_version: Some(1),
-                generation: Some(1),
+
                 created_epoch_ms: 1,
                 updated_epoch_ms: 2,
             }),
@@ -1939,6 +1955,11 @@ mod tests {
         let files = &output["persistent"]["files"];
         let workspace = &output["persistent"]["workspace_index"];
         assert_eq!(workspace["name"], "search-engine");
+        assert_eq!(workspace["fts"]["tokenizer"], "jieba");
+        assert_eq!(
+            workspace["fts"]["filters"],
+            serde_json::json!(["lowercase"])
+        );
         assert!(workspace.get("id").is_none());
         assert_eq!(files["entities"], count);
         assert_eq!(files["indexed_size_bytes"], count + 3);

@@ -1,6 +1,6 @@
 # Workspace persistence
 
-`workspace` connects domain workspace state to the filesystem. It owns the name registry, manifest encoding, physical index locations, build publication and recovery, and workspace locks. The domain owns `Workspace`, `FileSelection`, `IndexState`, `IndexDescriptor`, and `EmbeddingSchema`; API result views are assembled at the application boundary.
+`workspace` connects domain workspace state to the filesystem. It owns the name registry, manifest encoding, physical index locations, build publication and recovery, and workspace locks. The domain owns `Workspace`, `FileSelection`, `IndexState`, `IndexDescriptor`, and `EmbeddingModelInfo`; API result views are assembled at the application boundary.
 
 ## Names and the registry
 
@@ -18,7 +18,7 @@ An explicit new name on an existing workspace renames its registry entry:
 zg index /path/to/workspace --name search-engine
 ```
 
-The registry is authoritative. Read-only `info` and `context` report its current name without writing metadata. The next index operation reconciles a stale manifest or pending build with the registry. Renaming itself retains file IDs and active storage and does not require a rebuild.
+The registry is authoritative. Read-only `info` and `context` report its current name without writing metadata. The next index operation reconciles a stale manifest with the registry. Renaming itself retains file IDs and active storage and does not require a rebuild.
 
 Move the root together with its `.zvec-grep` directory to retain workspace state. Reads resolve source paths against the new root. The next index operation updates the registered location after checking that the original root directory no longer exists. A live copy cannot claim the original's name; index the copy with its own `--name`.
 
@@ -34,18 +34,20 @@ Old `catalog` / `identity.json` data is ignored by the new format and removed on
 
 Manifest version 4 retains the existing flat JSON format. Loading an older compatible single-root manifest ignores its UUID `id`; subsequent writes preserve the name and omit the UUID. Names from old manifests must still satisfy registry uniqueness when indexing. The migration keeps embedding and source selection settings.
 
-The unreleased physical index format is version 5; the previous released format is version 4. Manifest version, physical index version, logical index revision, and generation-directory UUID describe different things. A manifest migration does not by itself rebuild storage; a mismatched physical index version requires the user to run `index --rebuild`. Ordinary indexing and query refresh report the incompatibility without automatically rebuilding. The storage schema has its own revision for development-time layout changes. Logical index revisions can update the same physical generation; they do not create immutable per-file snapshots.
+The unreleased physical index format is version 5; the previous released format is version 4. Manifest version, physical index version, and generation-directory UUID describe different things. A manifest migration does not by itself rebuild storage; a mismatched physical index version requires the user to run `index --rebuild`. Ordinary indexing and query refresh report the incompatibility without automatically rebuilding. Storage layout changes are governed by the same physical index version. Ordinary incremental indexing updates the active physical generation in place; it does not create immutable snapshots.
 
 ## Publication and recovery
 
-First builds and rebuilds write under `.zvec-grep/generations`, with a durable `build.json` describing the pending work. A compatible retry resumes the build. An atomic manifest replacement selects the completed generation; cleanup removes the previous storage afterward. Interrupted cleanup is recovered by a subsequent index operation. Failed rebuilds keep the active index available.
+First builds and rebuilds always start in empty storage under `.zvec-grep/generations`. A durable `build.json` records the temporary storage and previous index for cleanup. An atomic manifest replacement selects the completed index; cleanup removes the previous storage afterward. Failure or cancellation discards the new storage and preserves the active index. Every explicit rebuild starts over, including after an interruption. Ordinary indexing updates the active index and never resumes an abandoned rebuild. Crash recovery uses the manifest selection to discard unpublished storage or finish post-publication cleanup. Cleanup failure after publication does not turn a successful rebuild into a failed operation; the next writer retries it.
 
 The indexing application service acquires the workspace lock before mutating its registry entry and metadata. The registry's lock protects names across independent workspace roots. Storage owns collection recovery, pending file mutations, and the index-local file ID cache; these mechanisms remain separate from workspace naming.
 
 ## Persisted state and runtime observations
 
-`Workspace.index` is `Uninitialized`, `Disabled`, or `Enabled(IndexDescriptor)`. Enabled always carries the embedding schema and logical revision; physical format and generation-directory layout remain owned by `WorkspaceManifest`. A first build or rebuild keeps its target in `WorkspaceBuild` until publication. The selected descriptor does not imply that files are up to date or that an indexing job succeeded.
+`Workspace.index` is `Uninitialized`, `Disabled`, or `Enabled(IndexDescriptor)`. Enabled always carries the embedding model information and fixed FTS configuration; physical format and generation-directory layout remain owned by `WorkspaceManifest`. A first build or rebuild keeps its target in `WorkspaceBuild` until publication. The selected descriptor does not imply that files are up to date or that an indexing job succeeded.
 
 The daemon's `WorkspaceRuntime` holds an optional `IndexStatusSnapshot`: observed health, file statistics, and inspection time. No snapshot means unchecked or invalidated. Watcher changes, indexing submissions and completions (including failure/cancellation), and drop invalidate it. Epoch and job checks reject scans overlapping these changes. Runtime snapshots can read this memory without scanning; explicit CLI/MCP status still reads disk and refreshes the observation. Watchers may miss external changes, so an observation is not a lasting freshness guarantee. Restart starts without an observation.
 
 `IndexStats` contains counts. `IndexStatus` distinguishes unknown, uninitialized, disabled, missing, ready, stale, and failed. Queued/running/cancelled build states remain in the scheduler. CLI readiness requires a completed check with no failed, pending, added, modified, or deleted files.
+
+FTS currently uses the fixed `FTS_CONFIG` (`jieba` tokenizer and `lowercase` filter). The same constant configures native storage and populates `IndexDescriptor` when creating or reading a workspace. It is not user-configurable or separately persisted; changes belong to the physical index format. Index info exposes it through the engine API, daemon protocol, CLI status, and MCP status.

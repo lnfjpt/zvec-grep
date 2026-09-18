@@ -162,7 +162,7 @@ pub(crate) async fn index_workspace(
     })?;
     timings.record("index_optimize", finalize_started.elapsed(), 1);
 
-    let result = build_index_result(context, &passes, started.elapsed(), timings);
+    let result = build_index_result(&passes, started.elapsed(), timings);
     if result.files_failed > 0 {
         report(
             context,
@@ -1646,24 +1646,11 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
             "indexing requires an enabled workspace",
         ));
     }
-    if context.embedding_model.info().max_batch_size == 0 {
-        return Err(EngineError::internal(
-            "embedding model max_batch_size must be greater than zero",
-        ));
-    }
+    context.embedding_model.info().validate()?;
     if let IndexState::Enabled(index) = &context.workspace_index.index {
-        let schema = &index.embedding;
-        let model = context.embedding_model.info();
-        if schema.provider != model.model.provider
-            || schema.model != model.model.name
-            || schema.dimension != model.dimension
-            || schema.metric != model.metric
-        {
-            return Err(EngineError::invalid_argument(format!(
-                "workspace embedding schema does not match model {}",
-                model.model.reference()
-            )));
-        }
+        index
+            .embedding
+            .ensure_index_compatible(context.embedding_model.info())?;
     }
     let _ = resolve_embedding_policy(
         context.embedding_concurrency,
@@ -2012,7 +1999,6 @@ fn host_engine_error(code: &'static str, message: String, origin: HostErrorSite)
 }
 
 fn build_index_result(
-    context: &IndexingContext<'_>,
     passes: &[IndexPassResult],
     duration: Duration,
     timings: TimingCollector,
@@ -2020,12 +2006,6 @@ fn build_index_result(
     let first = &passes[0];
     let final_pass = passes.last().expect("an index pass is always present");
     IndexResult {
-        generation: context
-            .workspace_index
-            .index
-            .descriptor()
-            .map_or(0, |index| index.revision)
-            .saturating_add(1),
         files_scanned: final_pass.files_scanned,
         files_added: passes.iter().map(|pass| pass.diff.added).sum(),
         files_modified: passes.iter().map(|pass| pass.diff.modified).sum(),
@@ -2074,7 +2054,7 @@ mod tests {
         api::index::progress::IndexProgressPhase,
         domain::{
             Content, FileSelection, IndexDescriptor,
-            model::{EmbeddingMetric, EmbeddingSchema},
+            model::{EmbeddingModelInfo, Metric},
         },
         storage::spi::{StorageResult, StorageSearchFilter, StorageSearchHit},
     };
@@ -2341,7 +2321,7 @@ mod tests {
                         endpoint: None,
                     },
                     dimension: 2,
-                    metric: EmbeddingMetric::Cosine,
+                    metric: Metric::Cosine,
                     max_batch_size: 1,
                     max_input_tokens: Some(64),
                     max_image_bytes: None,
@@ -2393,13 +2373,19 @@ mod tests {
                 ..FileSelection::default()
             },
             index: IndexState::Enabled(IndexDescriptor {
-                embedding: EmbeddingSchema {
-                    provider: "local".to_owned(),
-                    model: "test".to_owned(),
+                fts: crate::domain::FTS_CONFIG,
+                embedding: EmbeddingModelInfo {
+                    model: crate::domain::model::ModelInfo {
+                        provider: "local".to_owned(),
+                        name: "test".to_owned(),
+                        endpoint: None,
+                    },
                     dimension: 2,
-                    metric: EmbeddingMetric::Cosine,
+                    metric: Metric::Cosine,
+                    max_batch_size: 32,
+                    max_input_tokens: None,
+                    max_image_bytes: None,
                 },
-                revision: 0,
             }),
             created_epoch_ms: 1,
             updated_epoch_ms: 1,

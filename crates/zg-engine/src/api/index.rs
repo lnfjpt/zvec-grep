@@ -22,6 +22,7 @@ pub mod options {
         pub name: Option<String>,
         /// Workspace whose index is being updated. `None` uses the working directory.
         pub root: Option<PathBuf>,
+        /// Build from empty storage and replace the active index only after success.
         pub rebuild: bool,
         /// Resets saved discovery options before applying this request's overrides.
         pub reset_paths: bool,
@@ -261,7 +262,6 @@ pub mod result {
 
     #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
     pub struct IndexResult {
-        pub generation: u64,
         pub files_scanned: usize,
         pub files_added: usize,
         pub files_modified: usize,

@@ -57,44 +57,29 @@ mod tests {
     use super::create_embedding_model;
 
     #[test]
-    fn factory_exposes_implemented_backends() {
-        let model = create_embedding_model(
-            "local/potion-code-16m-v2",
-            None,
-            crate::models::compute::ModelComputeRuntime::shared(),
-        )
-        .expect("Model2Vec backend should be implemented");
-        assert_eq!(model.info().model.reference(), "local/potion-code-16m-v2");
-
-        let qwen = create_embedding_model(
-            "qwen/text-embedding-v4",
-            Some(super::ModelConfig {
-                api_key: Some("test".to_owned()),
-                ..super::ModelConfig::default()
-            }),
-            crate::models::compute::ModelComputeRuntime::shared(),
-        )
-        .expect("Qwen backend should be implemented");
-        assert_eq!(qwen.info().model.reference(), "qwen/text-embedding-v4");
-
-        let llama = create_embedding_model(
-            "local/embeddinggemma-300m",
-            None,
-            crate::models::compute::ModelComputeRuntime::shared(),
-        )
-        .expect("llama.cpp backend should be implemented");
-        assert_eq!(llama.info().model.reference(), "local/embeddinggemma-300m");
-
-        let transformers = create_embedding_model(
-            "local/all-minilm-l6-v2",
-            None,
-            crate::models::compute::ModelComputeRuntime::shared(),
-        )
-        .expect("Transformers backend should be implemented");
-        assert_eq!(
-            transformers.info().model.reference(),
-            "local/all-minilm-l6-v2"
-        );
+    fn all_catalog_backends_produce_valid_model_info() {
+        for entry in crate::models::catalog::list_embedding_models() {
+            let options = matches!(entry, super::EmbeddingCatalogEntry::Qwen(_)).then(|| {
+                super::ModelConfig {
+                    api_key: Some("test".to_owned()),
+                    endpoint: Some("https://models.example.test/embeddings".to_owned()),
+                    ..super::ModelConfig::default()
+                }
+            });
+            let expected_endpoint = options
+                .as_ref()
+                .and_then(|options| options.endpoint.clone());
+            let model = create_embedding_model(
+                entry.reference(),
+                options,
+                crate::models::compute::ModelComputeRuntime::shared(),
+            )
+            .expect("catalog backend should construct without loading model assets");
+            model.info().validate().expect("valid catalog model info");
+            assert_eq!(model.info().model.reference(), entry.reference());
+            assert_eq!(model.info().dimension, entry.dimension());
+            assert_eq!(model.info().model.endpoint, expected_endpoint);
+        }
 
         let unknown = create_embedding_model(
             "missing",

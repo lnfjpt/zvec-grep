@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EngineError, EngineResult,
-    domain::{FileId, FileIndexStatus, FileRecord, model::EmbeddingMetric, validate_fragments},
+    domain::{FileId, FileIndexStatus, FileRecord, model::Metric, validate_fragments},
     utils::{atomic_write as write_record, sync_directory},
 };
 
@@ -25,9 +25,8 @@ use super::{
     },
     zvec::NativeStore,
 };
-use crate::domain::model::EmbeddingSchema;
+use crate::domain::model::EmbeddingModelInfo;
 
-const VERSION: u32 = 10;
 const CHECKPOINT_OPERATIONS: usize = 64;
 const CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 type StoreRegistry = Mutex<HashMap<PathBuf, Weak<SharedStore>>>;
@@ -45,7 +44,7 @@ impl ZvecStorageFactory {
 struct SharedStore {
     state: Mutex<StoreState>,
     path: PathBuf,
-    schema: EmbeddingSchema,
+    schema: EmbeddingModelInfo,
     read_only: bool,
     // The native handles must close before the operating-system lock is released.
     _lock: File,
@@ -69,57 +68,28 @@ struct ZvecStorage {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchemaRecord {
-    version: u32,
-    provider: String,
-    model: String,
-    dimension: usize,
-    metric: String,
+    embedding: EmbeddingModelInfo,
 }
 
 impl SchemaRecord {
-    fn new(schema: &EmbeddingSchema) -> Self {
+    fn new(embedding: &EmbeddingModelInfo) -> Self {
         Self {
-            version: VERSION,
-            provider: schema.provider.clone(),
-            model: schema.model.clone(),
-            dimension: schema.dimension,
-            metric: match schema.metric {
-                EmbeddingMetric::Cosine => "cosine",
-                EmbeddingMetric::DotProduct => "dot",
-                EmbeddingMetric::Euclidean => "euclidean",
-            }
-            .to_owned(),
+            embedding: embedding.clone(),
         }
     }
 
-    fn schema(self) -> EngineResult<EmbeddingSchema> {
-        if self.version != VERSION {
-            return Err(EngineError::storage_failure(format!(
-                "unsupported storage schema version {}; expected {VERSION}; rebuild the index",
-                self.version
-            )));
-        }
-        if !(1..=20_000).contains(&self.dimension) {
+    fn embedding(self) -> EngineResult<EmbeddingModelInfo> {
+        if !(1..=20_000).contains(&self.embedding.dimension) {
             return Err(EngineError::storage_failure(
                 "stored embedding dimension must be in 1..=20,000",
             ));
         }
-        let metric = match self.metric.as_str() {
-            "cosine" => EmbeddingMetric::Cosine,
-            "dot" => EmbeddingMetric::DotProduct,
-            "euclidean" => EmbeddingMetric::Euclidean,
-            _ => {
-                return Err(EngineError::storage_failure(
-                    "unknown stored embedding metric",
-                ));
-            }
-        };
-        Ok(EmbeddingSchema {
-            provider: self.provider,
-            model: self.model,
-            dimension: self.dimension,
-            metric,
-        })
+        self.embedding.validate().map_err(|error| {
+            EngineError::storage_failure(format!(
+                "invalid stored embedding model information: {error}"
+            ))
+        })?;
+        Ok(self.embedding)
     }
 }
 
@@ -128,6 +98,9 @@ impl WorkspaceIndexStorageFactory for ZvecStorageFactory {
         &self,
         options: WorkspaceIndexStorageOptions,
     ) -> StorageResult<Box<dyn WorkspaceIndexStorage>> {
+        if let WorkspaceIndexStorageOptions::ReadWrite { embedding, .. } = &options {
+            embedding.validate()?;
+        }
         initialize()?;
         let home = options.storage_path();
         if !home.is_absolute() {
@@ -526,7 +499,7 @@ fn recover_pending(native: &NativeStore, changes: PendingChanges) -> EngineResul
 fn validate_batch(
     file: &FileRecord,
     entries: &[IndexedFragment],
-    schema: &EmbeddingSchema,
+    schema: &EmbeddingModelInfo,
 ) -> EngineResult<()> {
     file.validate()?;
     validate_fragments(file.id, entries.iter().map(|entry| &entry.fragment))?;
@@ -537,7 +510,7 @@ fn validate_batch(
     Ok(())
 }
 
-fn validate_vector(vector: &[f32], schema: &EmbeddingSchema) -> EngineResult<()> {
+fn validate_vector(vector: &[f32], schema: &EmbeddingModelInfo) -> EngineResult<()> {
     if vector.len() != schema.dimension || vector.iter().any(|value| !value.is_finite()) {
         return Err(EngineError::invalid_argument(format!(
             "expected a finite {}-dimensional vector, got {} values",
@@ -545,7 +518,7 @@ fn validate_vector(vector: &[f32], schema: &EmbeddingSchema) -> EngineResult<()>
             vector.len()
         )));
     }
-    if schema.metric == EmbeddingMetric::Cosine && vector.iter().all(|value| *value == 0.0) {
+    if schema.metric == Metric::Cosine && vector.iter().all(|value| *value == 0.0) {
         return Err(EngineError::invalid_argument(
             "cosine vectors must have a non-zero norm",
         ));
@@ -568,32 +541,15 @@ pub(super) fn initialize() -> EngineResult<()> {
     }
 }
 
-// Check the version before decoding fields: legacy records contain dictionary
-// paths, and their native FTS collections must be rebuilt with SDK defaults.
-fn read_schema(path: &Path) -> EngineResult<SchemaRecord> {
-    let record: serde_json::Value = read_json(path)?;
-    if record.get("version").and_then(serde_json::Value::as_u64) != Some(u64::from(VERSION)) {
-        return Err(EngineError::storage_failure(format!(
-            "unsupported storage schema version {}; expected {VERSION}; rebuild the index",
-            record.get("version").unwrap_or(&serde_json::Value::Null)
-        )));
-    }
-    serde_json::from_value(record).map_err(|error| json_error(&error))
-}
-
 fn load_schema(
     path: &Path,
     options: &WorkspaceIndexStorageOptions,
-) -> EngineResult<EmbeddingSchema> {
+) -> EngineResult<EmbeddingModelInfo> {
     let descriptor = path.join("schema.json");
     if descriptor.exists() {
-        let schema = read_schema(&descriptor)?.schema()?;
-        if let WorkspaceIndexStorageOptions::ReadWrite { embedding, .. } = options
-            && &schema != embedding
-        {
-            return Err(EngineError::invalid_argument(
-                "stored embedding schema differs from the requested model; rebuild the index",
-            ));
+        let schema = read_json::<SchemaRecord>(&descriptor)?.embedding()?;
+        if let WorkspaceIndexStorageOptions::ReadWrite { embedding, .. } = options {
+            schema.ensure_index_compatible(embedding)?;
         }
         return Ok(schema);
     }
@@ -634,7 +590,7 @@ fn prepare_storage(
     home: &Path,
     path: &Path,
     options: &WorkspaceIndexStorageOptions,
-) -> EngineResult<(File, EmbeddingSchema)> {
+) -> EngineResult<(File, EmbeddingModelInfo)> {
     let read_only = options.is_read_only();
     let mut shared = read_only;
     loop {

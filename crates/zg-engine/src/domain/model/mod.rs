@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ModelInfo {
     pub provider: String,
     pub name: String,
@@ -57,11 +57,17 @@ pub enum ModelProgress {
     },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Metric {
+    Cosine,
+    DotProduct,
+    Euclidean,
+}
+
 mod embedding;
 mod reranking;
 
-pub(crate) use embedding::{
-    EmbeddingMetric, EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult, EmbeddingSchema,
-};
+pub(crate) use embedding::{EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult};
 #[allow(unused_imports)] // Reserved for the first reranking backend.
 pub(crate) use reranking::RerankScore;

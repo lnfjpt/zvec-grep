@@ -297,8 +297,12 @@ mod tests {
                 discovery: DiscoveryOptions::default(),
                 policy: WorkspaceIndexPolicy::Enabled,
                 embedding: None,
+                fts: Some(zg_engine::api::info::result::WorkspaceIndexFts {
+                    tokenizer: "jieba".into(),
+                    filters: vec!["lowercase".into()],
+                }),
                 index_version: Some(1),
-                generation: Some(1),
+
                 created_epoch_ms: 1,
                 updated_epoch_ms: 2,
             }),
@@ -313,6 +317,14 @@ mod tests {
         let encoded = serde_json::to_value(&reply).expect("info reply should serialize");
         assert_eq!(encoded["reply"]["workspace_index"]["name"], "search-engine");
         assert!(encoded["reply"]["workspace_index"].get("id").is_none());
+        assert_eq!(
+            encoded["reply"]["workspace_index"]["fts"]["tokenizer"],
+            "jieba"
+        );
+        assert_eq!(
+            encoded["reply"]["workspace_index"]["fts"]["filters"],
+            serde_json::json!(["lowercase"])
+        );
         let status = &encoded["reply"]["status"];
         assert_eq!(status["entities_indexed"], count);
         assert_eq!(status["indexed_size_bytes"], count + 3);

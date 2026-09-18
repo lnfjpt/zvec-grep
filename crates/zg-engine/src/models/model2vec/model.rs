@@ -633,7 +633,7 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::TempDir;
 
-    use crate::domain::{Content, model::EmbeddingMetric};
+    use crate::domain::{Content, model::Metric};
     use crate::{
         domain::model::{EmbeddingPurpose, ModelConfig, ModelProgress},
         models::{
@@ -1042,7 +1042,7 @@ mod tests {
             embedding_tensor: "embeddings",
             tokenizer_file: "tokenizer.json",
             dimension: 3,
-            metric: EmbeddingMetric::Cosine,
+            metric: Metric::Cosine,
             normalize: true,
             max_input_tokens: 512,
             max_batch_size: 32,

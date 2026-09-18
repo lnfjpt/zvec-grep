@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    domain::model::EmbeddingMetric,
+    domain::model::Metric,
     models::catalog::{
         EmbeddingCatalogEntry, LlamaCppConfig, Model2VecConfig, QwenConfig, TransformersConfig,
         list_embedding_models,
@@ -156,10 +156,10 @@ fn entry_value(entry: EmbeddingCatalogEntry) -> Value {
     }
 }
 
-const fn metric_name(metric: EmbeddingMetric) -> &'static str {
+const fn metric_name(metric: Metric) -> &'static str {
     match metric {
-        EmbeddingMetric::Cosine => "cosine",
-        EmbeddingMetric::DotProduct => "dot",
-        EmbeddingMetric::Euclidean => "euclidean",
+        Metric::Cosine => "cosine",
+        Metric::DotProduct => "dot",
+        Metric::Euclidean => "euclidean",
     }
 }

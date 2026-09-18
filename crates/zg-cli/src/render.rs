@@ -271,7 +271,6 @@ pub fn write_index_result(
 ) -> io::Result<()> {
     writeln!(writer, "Workspace index: ready")?;
     writeln!(writer, "Root: {}", root.display())?;
-    writeln!(writer, "Generation: {}", result.generation)?;
     writeln!(
         writer,
         "Files: scanned={} added={} modified={} deleted={} unchanged={} failed={}",
@@ -295,14 +294,22 @@ pub fn write_info_result(mut writer: impl Write, result: &InfoResult) -> io::Res
     writeln!(writer, "Workspace index: {state}")?;
     writeln!(writer, "Root: {}", result.root.display())?;
     writeln!(writer, "Index path: {}", result.index_path.display())?;
-    if let Some(index) = &result.workspace_index
-        && let Some(embedding) = &index.embedding
-    {
-        writeln!(
-            writer,
-            "Embedding: {}/{}",
-            embedding.provider, embedding.model
-        )?;
+    if let Some(index) = &result.workspace_index {
+        if let Some(embedding) = &index.embedding {
+            writeln!(
+                writer,
+                "Embedding: {}/{}",
+                embedding.provider, embedding.model
+            )?;
+        }
+        if let Some(fts) = &index.fts {
+            writeln!(
+                writer,
+                "FTS: tokenizer={} filters={}",
+                fts.tokenizer,
+                fts.filters.join(", ")
+            )?;
+        }
     }
     if let Some(status) = &result.status {
         writeln!(

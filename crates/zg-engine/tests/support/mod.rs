@@ -64,7 +64,7 @@ pub fn configure_remote_model(root: &Path, address: SocketAddr) -> std::io::Resu
     let manifest = json!({
         "manifestVersion": 1, "id": "fixture-workspace", "name": name, "path": home,
         "rootPaths": [{ "absolutePath": root, "recursive": true }],
-        "indexPolicy": "enabled", "embedding": { "provider": "qwen", "model": "text-embedding-v4", "dimension": 1024, "metric": "cosine" },
+        "indexPolicy": "enabled", "embedding": { "model": { "provider": "qwen", "name": "text-embedding-v4", "endpoint": format!("http://{address}/embeddings") }, "dimension": 1024, "metric": "cosine", "maxBatchSize": 10, "maxInputTokens": 8192, "maxImageBytes": null },
         "indexVersion": null, "createdTime": 1, "updatedTime": 1,
         "embeddingRuntime": { "apiKey": "local-test-key", "endpoint": format!("http://{address}/embeddings") }
     });

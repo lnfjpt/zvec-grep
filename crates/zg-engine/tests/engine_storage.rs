@@ -154,18 +154,20 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
 
     let engine = ZvecGrep::new();
     let initial = engine.index(index_options(root)).await?;
-    assert_eq!(initial.generation, 1);
     assert_eq!(initial.files_added, 3, "{initial:?}");
     assert_eq!(initial.files_failed, 0);
     let info = engine.info(info_options(root)).await?;
     assert!(info.indexed);
     assert!(info.index_path.exists());
-    assert_eq!(
-        info.workspace_index
-            .as_ref()
-            .and_then(|index| index.generation),
-        Some(1)
-    );
+    let fts = info
+        .workspace_index
+        .as_ref()
+        .expect("workspace info")
+        .fts
+        .as_ref()
+        .expect("FTS info");
+    assert_eq!(fts.tokenizer, "jieba");
+    assert_eq!(fts.filters, ["lowercase"]);
     assert_eq!(info.status.as_ref().expect("status").files_indexed, 3);
     assert_eq!(
         fts_paths(&engine, root, "orchard").await?,
@@ -194,7 +196,6 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
     let calls = server.requests.load(Ordering::Acquire);
     let unchanged = engine.index(index_options(root)).await?;
     assert_eq!(unchanged.files_unchanged, 3);
-    assert_eq!(unchanged.generation, 2);
     assert_eq!(server.requests.load(Ordering::Acquire), calls);
     engine.close();
     assert_eq!(
@@ -208,15 +209,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
     drop(engine);
 
     let engine = ZvecGrep::new();
-    assert_eq!(
-        engine
-            .info(info_options(root))
-            .await?
-            .workspace_index
-            .expect("index")
-            .generation,
-        Some(2)
-    );
+    assert!(engine.info(info_options(root)).await?.indexed);
     assert_eq!(
         fts_paths(&engine, root, "orchard").await?,
         [PathBuf::from("auth.rs")]
@@ -258,7 +251,6 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
         ),
         (1, 1, 1)
     );
-    assert_eq!(updated.generation, 3);
     assert!(fts_paths(&engine, root, "orchard").await?.is_empty());
     assert!(fts_paths(&engine, root, "invoices").await?.is_empty());
     assert_eq!(
@@ -277,10 +269,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
             ..index_options(root)
         })
         .await?;
-    assert_eq!(
-        (rebuilt.files_added, rebuilt.generation),
-        (3, updated.generation + 1)
-    );
+    assert_eq!(rebuilt.files_added, 3);
     let after_rebuild = engine.info(info_options(root)).await?;
     assert_eq!(
         after_rebuild
@@ -339,7 +328,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
 }
 
 #[tokio::test]
-async fn public_engine_resumes_failed_initial_build_without_publishing_it_early() -> TestResult {
+async fn public_engine_restarts_failed_initial_build_from_empty_storage() -> TestResult {
     let temporary = tempdir()?;
     let root = temporary.path();
     let home = root.join(".zvec-grep");
@@ -351,7 +340,7 @@ async fn public_engine_resumes_failed_initial_build_without_publishing_it_early(
     let error = engine
         .index(index_options(root))
         .await
-        .expect_err("invalid source keeps the build pending");
+        .expect_err("invalid source fails the build");
     assert!(
         error.message().contains("failed files: broken.txt"),
         "{error}"
@@ -362,30 +351,8 @@ async fn public_engine_resumes_failed_initial_build_without_publishing_it_early(
         info.status.is_none(),
         "an unpublished stage is not the active index"
     );
-    let pending: Value = serde_json::from_slice(&fs::read(home.join("build.json"))?)?;
-    let stage = pending["target"]["storageGeneration"]
-        .as_str()
-        .expect("stage generation");
-    let stage_path = fs::canonicalize(home.join("generations").join(stage).join("storage"))?;
-    let files = native_file_records(&stage_path)?;
-    let failed = files
-        .iter()
-        .find(|file| file["value"]["relative_path"]["value"] == "broken.txt")
-        .expect("failed source retained");
-    assert_eq!(failed["value"]["index_status"]["kind"], "failed");
-    assert!(
-        !failed["value"]["index_status"]["error"]
-            .as_str()
-            .expect("failure reason")
-            .is_empty()
-    );
-    assert_eq!(
-        files
-            .iter()
-            .filter(|file| file["value"]["index_status"]["kind"] == "indexed")
-            .count(),
-        1
-    );
+    assert!(!home.join("build.json").exists());
+    assert_eq!(fs::read_dir(home.join("generations"))?.count(), 0);
     let requests = server.requests.load(Ordering::Acquire);
     fs::write(
         root.join("broken.txt"),
@@ -406,26 +373,33 @@ async fn public_engine_resumes_failed_initial_build_without_publishing_it_early(
         "query refresh must not publish a stage"
     );
     assert_eq!(server.requests.load(Ordering::Acquire), requests);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&fs::read(home.join("build.json"))?)?,
-        pending
-    );
+    assert!(!home.join("build.json").exists());
     engine.close();
     drop(engine);
 
     let engine = ZvecGrep::new();
     let resumed = engine.index(index_options(root)).await?;
-    assert_eq!((resumed.files_unchanged, resumed.files_failed), (1, 0));
+    assert_eq!(
+        (
+            resumed.files_added,
+            resumed.files_unchanged,
+            resumed.files_failed
+        ),
+        (2, 0, 0)
+    );
     assert!(server.requests.load(Ordering::Acquire) > requests);
     assert!(!home.join("build.json").exists());
     let info = engine.info(info_options(root)).await?;
     assert!(info.indexed);
-    assert_eq!(
-        info.index_path, stage_path,
-        "resume publishes the existing stage"
-    );
     let status = info.status.expect("published status");
     assert_eq!((status.files_failed, status.files_indexed), (0, 2));
+    let records = native_file_records(&info.index_path)?;
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|record| record["value"]["index_status"]["kind"] == "indexed")
+    );
     let result = engine.context(query).await?;
     assert_eq!(result.items.len(), 1);
     assert_eq!(result.items[0].relative_path, Path::new("broken.txt"));
@@ -436,7 +410,7 @@ async fn public_engine_resumes_failed_initial_build_without_publishing_it_early(
 }
 
 #[tokio::test]
-async fn failed_native_rebuild_preserves_active_results_until_its_stage_is_resumed() -> TestResult {
+async fn failed_native_rebuild_keeps_active_index_and_retry_reembeds_every_file() -> TestResult {
     let temporary = tempdir()?;
     let root = temporary.path();
     let home = root.join(".zvec-grep");
@@ -447,7 +421,11 @@ async fn failed_native_rebuild_preserves_active_results_until_its_stage_is_resum
         "Orchard documentation remains available.\n",
     )?;
     let engine = ZvecGrep::new();
-    let initial = engine.index(index_options(root)).await?;
+    fs::write(
+        root.join("stable.txt"),
+        "Stable baseline that must be embedded again.\n",
+    )?;
+    engine.index(index_options(root)).await?;
     let original_path = engine.info(info_options(root)).await?.index_path;
     let original_manifest = fs::read(home.join("manifest.json"))?;
     fs::write(root.join("note.txt"), [255_u8, 254, 255])?;
@@ -457,21 +435,14 @@ async fn failed_native_rebuild_preserves_active_results_until_its_stage_is_resum
             ..index_options(root)
         })
         .await
-        .expect_err("invalid source keeps the rebuild pending");
+        .expect_err("invalid source fails the rebuild");
     assert!(
         error.message().contains("failed files: note.txt"),
         "{error}"
     );
     assert_eq!(fs::read(home.join("manifest.json"))?, original_manifest);
-    let pending: Value = serde_json::from_slice(&fs::read(home.join("build.json"))?)?;
-    let stage = pending["target"]["storageGeneration"]
-        .as_str()
-        .expect("stage generation");
-    let stage_path = fs::canonicalize(home.join("generations").join(stage).join("storage"))?;
-    assert_ne!(stage_path, original_path);
-    let failed_records = native_file_records(&stage_path)?;
-    assert_eq!(failed_records.len(), 1);
-    assert_eq!(failed_records[0]["value"]["index_status"]["kind"], "failed");
+    assert!(!home.join("build.json").exists());
+    assert_eq!(fs::read_dir(home.join("generations"))?.count(), 1);
     let requests = server.requests.load(Ordering::Acquire);
     let old_results = engine
         .context(ContextOptions {
@@ -480,7 +451,7 @@ async fn failed_native_rebuild_preserves_active_results_until_its_stage_is_resum
                 mode: ContextRouteMode::Fts,
                 query: "orchard".into(),
             }],
-            auto_update: true,
+            auto_update: false,
             allow_remote: true,
             ..ContextOptions::default()
         })
@@ -501,15 +472,26 @@ async fn failed_native_rebuild_preserves_active_results_until_its_stage_is_resum
     drop(engine);
 
     let engine = ZvecGrep::new();
-    let resumed = engine.index(index_options(root)).await?;
+    let requests_before_rebuild = server.requests.load(Ordering::Acquire);
+    let rebuilt = engine
+        .index(IndexOptions {
+            rebuild: true,
+            ..index_options(root)
+        })
+        .await?;
     assert_eq!(
-        (resumed.generation, resumed.files_failed),
-        (initial.generation + 1, 0)
+        (
+            rebuilt.files_added,
+            rebuilt.files_unchanged,
+            rebuilt.files_failed
+        ),
+        (2, 0, 0)
     );
+    assert!(server.requests.load(Ordering::Acquire) > requests_before_rebuild);
     assert!(!home.join("build.json").exists());
-    assert_eq!(
+    assert_ne!(
         engine.info(info_options(root)).await?.index_path,
-        stage_path
+        original_path
     );
     assert!(!original_path.exists());
     assert!(fts_paths(&engine, root, "orchard").await?.is_empty());
@@ -805,10 +787,11 @@ async fn version_four_requires_explicit_rebuild_to_version_five() -> TestResult 
     old["indexVersion"] = json!(4);
     let old_manifest = serde_json::to_vec(&old)?;
     fs::write(&manifest_path, &old_manifest)?;
-    let schema_path = before.index_path.join("schema.json");
-    let mut schema: Value = serde_json::from_slice(&fs::read(&schema_path)?)?;
-    schema["version"] = json!(0);
-    fs::write(&schema_path, serde_json::to_vec(&schema)?)?;
+    // The index version must be checked before attempting to decode old storage.
+    fs::write(
+        before.index_path.join("schema.json"),
+        b"obsolete storage format",
+    )?;
     let inputs = server.inputs.load(Ordering::Acquire);
     let error = engine
         .index(index_options(root))

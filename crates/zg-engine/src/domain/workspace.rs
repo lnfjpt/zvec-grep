@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{EngineError, EngineResult};
 
-use super::{SourcePath, model::EmbeddingSchema};
+use super::{SourcePath, model::EmbeddingModelInfo};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Workspace {
@@ -90,9 +90,20 @@ impl IndexState {
     }
 }
 
-/// Metadata of a committed index; revision is not an immutable data snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexDescriptor {
-    pub embedding: EmbeddingSchema,
-    pub revision: u64,
+    pub embedding: EmbeddingModelInfo,
+    pub fts: FtsConfig,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FtsConfig {
+    pub tokenizer: &'static str,
+    pub filters: &'static [&'static str],
+}
+
+/// Fixed FTS configuration for the current physical index format.
+pub(crate) const FTS_CONFIG: FtsConfig = FtsConfig {
+    tokenizer: "jieba",
+    filters: &["lowercase"],
+};

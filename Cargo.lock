@@ -3943,6 +3943,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "uuid",
  "zg-cli",
  "zg-engine",
 ]

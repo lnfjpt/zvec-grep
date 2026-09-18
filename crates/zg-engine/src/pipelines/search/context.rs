@@ -252,11 +252,6 @@ fn build_context_result(
         workspace_index: Some(ContextWorkspaceIndex {
             name: workspace.name.as_str().to_owned(),
             path: workspace_home.to_path_buf(),
-            generation: workspace
-                .index
-                .descriptor()
-                .map(|index| index.revision)
-                .filter(|revision| *revision != 0),
         }),
         items,
         group_results: groups
@@ -758,7 +753,7 @@ mod tests {
                 Content, Entity, EntityContent, EntityId, FileFormat, FileId, FileIndexStatus,
                 FileRecord, FileSelection, FileSnapshot, IndexDescriptor, IndexState, SourceRange,
                 TextRange, Workspace,
-                model::{EmbeddingMetric, EmbeddingSchema},
+                model::{EmbeddingModelInfo, Metric},
             },
             pipelines::search::pipeline::{SearchHit, SearchPlanResult},
             utils::sha256_hex,
@@ -820,14 +815,19 @@ mod tests {
             root: original_root.clone(),
             file_selection: FileSelection::default(),
             index: IndexState::Enabled(IndexDescriptor {
-                embedding: EmbeddingSchema {
-                    provider: "local".to_owned(),
-                    model: "fixture".to_owned(),
+                fts: crate::domain::FTS_CONFIG,
+                embedding: EmbeddingModelInfo {
+                    model: crate::domain::model::ModelInfo {
+                        provider: "local".to_owned(),
+                        name: "fixture".to_owned(),
+                        endpoint: None,
+                    },
                     dimension: 2,
-                    metric: EmbeddingMetric::Cosine,
+                    metric: Metric::Cosine,
+                    max_batch_size: 32,
+                    max_input_tokens: None,
+                    max_image_bytes: None,
                 },
-                // Legacy indexes can lack a known committed revision.
-                revision: 0,
             }),
             created_epoch_ms: 0,
             updated_epoch_ms: 0,
@@ -853,15 +853,6 @@ mod tests {
             assert_eq!(result.items[0].absolute_path, root.join("src/file.txt"));
             assert_eq!(result.items[0].relative_path, PathBuf::from("src/file.txt"));
             assert_eq!(result.items[0].status, ContextItemStatus::Fresh);
-            assert_eq!(
-                result
-                    .workspace_index
-                    .as_ref()
-                    .expect("workspace metadata")
-                    .generation,
-                None,
-                "unknown revisions must not be exposed as committed generation zero"
-            );
         }
         assert_eq!(
             super::file_freshness_status(&original_root, &file),

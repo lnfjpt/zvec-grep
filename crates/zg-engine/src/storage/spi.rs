@@ -14,7 +14,7 @@ use crate::{
 
 pub(crate) type StorageResult<T> = Result<T, EngineError>;
 
-use crate::domain::model::EmbeddingSchema;
+use crate::domain::model::EmbeddingModelInfo;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WorkspaceIndexStorageOptions {
@@ -23,7 +23,7 @@ pub(crate) enum WorkspaceIndexStorageOptions {
     },
     ReadWrite {
         storage_path: PathBuf,
-        embedding: EmbeddingSchema,
+        embedding: EmbeddingModelInfo,
     },
 }
 

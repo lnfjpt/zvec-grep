@@ -125,8 +125,8 @@ pub mod result {
         pub discovery: DiscoveryOptions,
         pub policy: WorkspaceIndexPolicy,
         pub embedding: Option<WorkspaceIndexEmbedding>,
+        pub fts: Option<WorkspaceIndexFts>,
         pub index_version: Option<u32>,
-        pub generation: Option<u64>,
         pub created_epoch_ms: u64,
         pub updated_epoch_ms: u64,
     }
@@ -137,6 +137,12 @@ pub mod result {
         pub model: String,
         pub dimension: usize,
         pub metric: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct WorkspaceIndexFts {
+        pub tokenizer: String,
+        pub filters: Vec<String>,
     }
 
     #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -182,27 +188,40 @@ impl result::WorkspaceIndexInfo {
                 .index
                 .descriptor()
                 .map(|index| (&index.embedding).into()),
-            index_version,
-            generation: workspace
+            fts: workspace
                 .index
                 .descriptor()
-                .and_then(|index| (index.revision != 0).then_some(index.revision)),
+                .map(|index| (&index.fts).into()),
+            index_version,
             created_epoch_ms: workspace.created_epoch_ms,
             updated_epoch_ms: workspace.updated_epoch_ms,
         }
     }
 }
 
-impl From<&crate::domain::EmbeddingSchema> for result::WorkspaceIndexEmbedding {
-    fn from(value: &crate::domain::EmbeddingSchema) -> Self {
+impl From<&crate::domain::FtsConfig> for result::WorkspaceIndexFts {
+    fn from(value: &crate::domain::FtsConfig) -> Self {
         Self {
-            provider: value.provider.clone(),
-            model: value.model.clone(),
+            tokenizer: value.tokenizer.to_owned(),
+            filters: value
+                .filters
+                .iter()
+                .map(|filter| (*filter).to_owned())
+                .collect(),
+        }
+    }
+}
+
+impl From<&crate::domain::EmbeddingModelInfo> for result::WorkspaceIndexEmbedding {
+    fn from(value: &crate::domain::EmbeddingModelInfo) -> Self {
+        Self {
+            provider: value.model.provider.clone(),
+            model: value.model.name.clone(),
             dimension: value.dimension,
             metric: match value.metric {
-                crate::domain::EmbeddingMetric::Cosine => "cosine",
-                crate::domain::EmbeddingMetric::DotProduct => "dot",
-                crate::domain::EmbeddingMetric::Euclidean => "euclidean",
+                crate::domain::Metric::Cosine => "cosine",
+                crate::domain::Metric::DotProduct => "dot",
+                crate::domain::Metric::Euclidean => "euclidean",
             }
             .to_owned(),
         }

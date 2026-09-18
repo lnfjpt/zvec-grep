@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "sync"] }
 tokio-util.workspace = true
+uuid.workspace = true
 zg-cli = { path = "../zg-cli" }
 zg-engine = { path = "../zg-engine" }
 

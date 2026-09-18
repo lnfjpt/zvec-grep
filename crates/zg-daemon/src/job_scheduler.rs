@@ -788,7 +788,6 @@ mod tests {
             self.started.notify_one();
             self.release.notified().await;
             Ok(IndexResult {
-                generation: 7,
                 ..IndexResult::default()
             })
         }
@@ -838,7 +837,7 @@ mod tests {
             .await
             .expect("job should exist");
         assert_eq!(completed.job.state, JobState::Succeeded);
-        assert_eq!(completed.result.map(|result| result.generation), Some(7));
+        assert!(completed.result.is_some());
     }
 
     #[tokio::test]

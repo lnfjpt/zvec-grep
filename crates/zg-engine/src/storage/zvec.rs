@@ -20,12 +20,12 @@ use super::{
         StorageSearchPath, StoredEntity, StoredSearchData,
     },
 };
-use crate::domain::model::EmbeddingSchema;
+use crate::domain::{FTS_CONFIG, model::EmbeddingModelInfo};
 use crate::{
     EngineError, EngineResult,
     domain::{
         CodeMetadata, Content, DirectoryId, EntityContent, EntityFragment, EntityId,
-        EntityMetadata, FileId, FileRecord, IndexField, SourcePath, model::EmbeddingMetric,
+        EntityMetadata, FileId, FileRecord, IndexField, SourcePath, model::Metric,
         validate_fragments,
     },
     utils::sha256_hex_parts,
@@ -64,7 +64,7 @@ impl EncodedMetadata {
 impl NativeStore {
     pub(super) fn open(
         path: &Path,
-        embedding: &EmbeddingSchema,
+        embedding: &EmbeddingModelInfo,
         read_only: bool,
     ) -> EngineResult<Self> {
         let dimension = u32::try_from(embedding.dimension)
@@ -79,9 +79,9 @@ impl NativeStore {
         let entities = open_collection(&path.join("entities"), &entities_schema()?, read_only)?;
         let fragments = open_collection(&path.join("fragments"), &fragments_schema()?, read_only)?;
         let metric = match embedding.metric {
-            EmbeddingMetric::Cosine => MetricType::Cosine,
-            EmbeddingMetric::DotProduct => MetricType::Ip,
-            EmbeddingMetric::Euclidean => MetricType::L2,
+            Metric::Cosine => MetricType::Cosine,
+            Metric::DotProduct => MetricType::Ip,
+            Metric::Euclidean => MetricType::L2,
         };
         let space = vector_collection_name(embedding);
         let vectors = open_collection(
@@ -493,14 +493,17 @@ impl NativeStore {
     }
 }
 
-pub(super) fn vector_collection_name(embedding: &EmbeddingSchema) -> String {
+pub(super) fn vector_collection_name(embedding: &EmbeddingModelInfo) -> String {
     format!(
         "vectors_{}",
         primary_key(
             "space",
             &format!(
                 "{}\0{}\0{}\0{:?}",
-                embedding.provider, embedding.model, embedding.dimension, embedding.metric
+                embedding.model.provider,
+                embedding.model.name,
+                embedding.dimension,
+                embedding.metric
             )
         )
     )
@@ -649,7 +652,7 @@ fn fragments_schema() -> EngineResult<CollectionSchema> {
     )?;
     native(
         text.set_index_params(&native(
-            IndexParams::fts(Some("jieba"), Some(&["lowercase"]), None),
+            IndexParams::fts(Some(FTS_CONFIG.tokenizer), Some(FTS_CONFIG.filters), None),
             "define full-text index",
         )?),
         "attach full-text index",

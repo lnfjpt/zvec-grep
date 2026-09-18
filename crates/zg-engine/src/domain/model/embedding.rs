@@ -1,58 +1,55 @@
-//! Embedding-specific metadata and values; no model execution resources.
-
-use super::ModelInfo;
+use super::{Metric, ModelInfo};
 use crate::{EngineError, EngineResult};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct EmbeddingModelInfo {
     pub model: ModelInfo,
     pub dimension: usize,
-    pub metric: EmbeddingMetric,
+    pub metric: Metric,
+    /// Maximum number of inputs accepted by one embedding request.
     pub max_batch_size: usize,
+    /// Positive token limit when applicable and known.
     pub max_input_tokens: Option<usize>,
+    /// Positive image size limit in bytes when applicable and known.
     pub max_image_bytes: Option<usize>,
 }
 
 impl EmbeddingModelInfo {
-    pub(crate) fn schema(&self) -> EmbeddingSchema {
-        EmbeddingSchema {
-            provider: self.model.provider.clone(),
-            model: self.model.name.clone(),
-            dimension: self.dimension,
-            metric: self.metric,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum EmbeddingMetric {
-    Cosine,
-    DotProduct,
-    Euclidean,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EmbeddingSchema {
-    pub provider: String,
-    pub model: String,
-    pub dimension: usize,
-    pub metric: EmbeddingMetric,
-}
-
-impl EmbeddingSchema {
     pub(crate) fn validate(&self) -> EngineResult<()> {
-        if self.provider.trim().is_empty() || self.model.trim().is_empty() || self.dimension == 0 {
-            return Err(EngineError::invalid_argument(
-                "workspace embedding schema requires a provider, model, and nonzero dimension",
-            ));
+        for (field, value) in [
+            ("provider", self.model.provider.as_str()),
+            ("name", self.model.name.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(EngineError::invalid_argument(format!(
+                    "embedding model {field} must be non-empty",
+                )));
+            }
+        }
+        for (field, value) in [
+            ("dimension", Some(self.dimension)),
+            ("max_batch_size", Some(self.max_batch_size)),
+            ("max_input_tokens", self.max_input_tokens),
+            ("max_image_bytes", self.max_image_bytes),
+        ] {
+            if value == Some(0) {
+                return Err(EngineError::invalid_argument(format!(
+                    "embedding model {field} must be greater than zero",
+                )));
+            }
         }
         Ok(())
     }
 
-    pub(crate) fn ensure_compatible(&self, other: &Self) -> EngineResult<()> {
-        if self != other {
+    /// Check the fields that determine whether an existing index can be reused.
+    pub(crate) fn ensure_index_compatible(&self, other: &Self) -> EngineResult<()> {
+        if self.model.provider != other.model.provider
+            || self.model.name != other.model.name
+            || self.dimension != other.dimension
+            || self.metric != other.metric
+        {
             return Err(EngineError::invalid_argument(
                 "existing index uses a different embedding model; rebuild the index",
             ));
@@ -68,8 +65,11 @@ pub enum EmbeddingPurpose {
     Query,
 }
 
+/// Result of a batch embedding request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EmbeddingResult {
+    /// One vector per input, in input order, each with the model's declared dimension.
     pub vectors: Vec<Vec<f32>>,
+    /// Zero-based indices of inputs that were truncated before producing their vectors.
     pub truncated: Vec<usize>,
 }

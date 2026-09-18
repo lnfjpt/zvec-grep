@@ -11,7 +11,7 @@ Work in progress. Usage examples will be added once the engine is stable.
 **Generated files.** Each workspace keeps its state under `.zvec-grep` in the source root:
 
 - `manifest.json` stores workspace configuration and identifies the active index.
-- `generations/` holds index data; `build.json` records an unfinished build.
+- `generations/` holds index data; `build.json` records storage ownership until publication and cleanup finish.
 - `authorization.json` stores saved consent for remote embedding services, when granted.
 
 The engine also uses per-user files: `~/.zvec-grep/workspaces.json` registers workspace names and locations, and `~/.zvec-grep/config.json` stores settings when saved. Saved remote consent uses a signing key at `~/.zvec-grep/authorization.key` by default. Lock and recovery files are managed automatically.
@@ -22,7 +22,7 @@ The engine also uses per-user files: `~/.zvec-grep/workspaces.json` registers wo
 
 **Workspace names.** Names are case-sensitive and unique within the per-user registry; new workspaces default to the root directory's name. Use `IndexOptions::name` to choose or change a name. Move the source root together with `.zvec-grep`; the next index operation updates its registered location once the original root no longer exists. A copy of an existing workspace needs a different name.
 
-**Rebuilds and recovery.** An incompatible index format requires an explicit rebuild with `IndexOptions::rebuild`. Repeating `index` resumes an interrupted build when its settings are compatible. Failed or cancelled rebuilds preserve the previous active index; the new index replaces it after successful completion.
+**Rebuilds and recovery.** An incompatible index format requires an explicit rebuild with `IndexOptions::rebuild`. Every rebuild starts from empty storage. Failed or cancelled builds are discarded and preserve the previous active index; the new index replaces it only after successful completion. Ordinary `index` updates the active index, or builds a new one if none exists. Crash recovery discards unpublished storage or finishes cleanup after publication; it never resumes a build.
 
 ## Modules
 
