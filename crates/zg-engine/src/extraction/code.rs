@@ -828,6 +828,9 @@ fn code_entity_metadata(entity: &CodeEntity<'_>) -> EntityMetadata {
         scope: (!entity.breadcrumb.is_empty()).then(|| entity.breadcrumb.join("::")),
         signature: entity.signature.clone(),
         documentation: entity.documentation.clone(),
+        visibility: None,
+        parameter: None,
+        language: None,
     })
 }
 
@@ -1077,6 +1080,9 @@ mod tests {
                 symbol_name: Some("add".to_owned()),
                 scope: None,
                 signature: Some("async function add(value: number): Promise<number>".to_owned()),
+                visibility: None,
+                parameter: None,
+                language: None,
                 documentation: Some("Adds one.".to_owned()),
             }))
         );
@@ -1091,6 +1097,9 @@ mod tests {
                 symbol_name: Some("create".to_owned()),
                 scope: Some("Box".to_owned()),
                 signature: Some("static create()".to_owned()),
+                visibility: None,
+                parameter: None,
+                language: None,
                 documentation: None,
             }))
         );
@@ -1133,6 +1142,9 @@ mod tests {
                 symbol_name: Some("Widget".to_owned()),
                 scope: None,
                 signature: Some("typedef struct Widget {} Widget".to_owned()),
+                visibility: None,
+                parameter: None,
+                language: None,
                 documentation: None,
             }))
         );
@@ -1160,6 +1172,9 @@ mod tests {
                 symbol_name: Some("Value".to_owned()),
                 scope: Some("Widget".to_owned()),
                 signature: Some("func (w *Widget) Value() int".to_owned()),
+                visibility: None,
+                parameter: None,
+                language: None,
                 documentation: None,
             }))
         );
@@ -1188,6 +1203,9 @@ mod tests {
                 symbol_name: Some("fetch".to_owned()),
                 scope: Some("Service".to_owned()),
                 signature: Some("@staticmethod\nasync def fetch(value: str) -> str:".to_owned()),
+                visibility: None,
+                parameter: None,
+                language: None,
                 documentation: None,
             }))
         );
