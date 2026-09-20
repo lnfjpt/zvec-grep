@@ -21,7 +21,7 @@ pub mod result {
 
     use serde::{Deserialize, Serialize};
 
-    use crate::api::index::options::{FileFilter, ScanOptions};
+    use crate::domain::ScanRules;
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub struct InfoResult {
@@ -122,8 +122,7 @@ pub mod result {
         pub path: PathBuf,
         /// The single base directory for every source file in this workspace.
         pub root: PathBuf,
-        pub filter: FileFilter,
-        pub scan: ScanOptions,
+        pub scan: ScanRules,
         pub policy: WorkspaceIndexPolicy,
         pub embedding: Option<WorkspaceIndexEmbedding>,
         pub fts: Option<WorkspaceIndexFts>,
@@ -177,15 +176,13 @@ impl result::WorkspaceIndexInfo {
     pub(crate) fn from_workspace(
         workspace: &crate::domain::Workspace,
         home: &std::path::Path,
-        scan: &crate::file_selection::ScanOptions,
         index_version: Option<u32>,
     ) -> Self {
         Self {
             name: workspace.name.clone(),
             path: home.to_path_buf(),
             root: workspace.root.clone(),
-            filter: workspace.filter.clone(),
-            scan: scan.clone(),
+            scan: workspace.scan.clone(),
             policy: (&workspace.index).into(),
             embedding: workspace
                 .index

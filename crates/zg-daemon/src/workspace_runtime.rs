@@ -22,7 +22,7 @@ use zg_engine::{
         context::{ContextOptions, ContextResult, options::RefreshPolicy},
         index::{
             IndexOptions, IndexResult,
-            options::{FileFilterUpdate, ScanOptionsUpdate, WorkspaceChange as IndexChange},
+            options::{ScanRulesUpdate, WorkspaceChange as IndexChange},
         },
         info::{InfoOptions, InfoResult, result::IndexStatusSnapshot},
     },
@@ -272,9 +272,7 @@ impl WorkspaceRuntimeManager {
         let canonical_root = canonical_root(options.root.as_deref())?;
         options.root = Some(canonical_root.clone());
         let runtime = self.runtime(canonical_root.clone(), &options);
-        let reconfigure = options.reset_paths
-            || options.filter != FileFilterUpdate::default()
-            || options.scan != ScanOptionsUpdate::default();
+        let reconfigure = options.reset_paths || options.scan != ScanRulesUpdate::default();
         let template = index_template(&options);
         runtime.invalidate_status();
         let target_revision = runtime.dirty_revision.load(Ordering::Acquire);
@@ -1026,8 +1024,7 @@ fn index_template(options: &IndexOptions) -> IndexOptions {
     template.rebuild = false;
     template.reset_paths = false;
     template.changes.clear();
-    template.filter = FileFilterUpdate::default();
-    template.scan = ScanOptionsUpdate::default();
+    template.scan = ScanRulesUpdate::default();
     template.embedding = None;
     template
 }
@@ -1706,7 +1703,7 @@ mod tests {
     }
     #[tokio::test]
     async fn manual_updates_replace_the_watcher_once_without_replaying_configuration() {
-        use zg_engine::api::index::options::{FileFilterUpdate, ScanOptionsUpdate};
+        use zg_engine::api::index::options::ScanRulesUpdate;
         let workspace = tempdir().expect("workspace");
         let root = workspace.path().canonicalize().expect("root");
         let executor = Arc::new(RecordingExecutor::default());
@@ -1738,14 +1735,11 @@ mod tests {
                     rebuild: true,
                     reset_paths: true,
                     allow_remote: true,
-                    filter: FileFilterUpdate {
+                    scan: ScanRulesUpdate {
                         globs: Some(vec!["*.rs".into()]),
-                        ..FileFilterUpdate::default()
-                    },
-                    scan: ScanOptionsUpdate {
                         hidden: Some(false),
                         max_depth: Some(None),
-                        ..ScanOptionsUpdate::default()
+                        ..ScanRulesUpdate::default()
                     },
                     ..IndexOptions::default()
                 },
@@ -1772,8 +1766,7 @@ mod tests {
         {
             let calls = executor.calls.lock().expect("calls");
             let watched = &calls[2];
-            assert_eq!(watched.filter, FileFilterUpdate::default());
-            assert_eq!(watched.scan, ScanOptionsUpdate::default());
+            assert_eq!(watched.scan, ScanRulesUpdate::default());
             assert!(!watched.rebuild);
             assert!(!watched.reset_paths);
             assert!(!watched.allow_remote);
@@ -1792,7 +1785,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_policy_retries_after_a_busy_successor_without_losing_the_old_watcher() {
-        use zg_engine::api::index::options::ScanOptionsUpdate;
+        use zg_engine::api::index::options::ScanRulesUpdate;
         let workspace = tempdir().expect("workspace");
         let root = workspace.path().canonicalize().expect("root");
         let (started, mut calls) = mpsc::unbounded_channel();
@@ -1826,9 +1819,9 @@ mod tests {
                 IndexOptions {
                     root: Some(root.clone()),
                     embedding_concurrency: Some(5),
-                    scan: ScanOptionsUpdate {
+                    scan: ScanRulesUpdate {
                         hidden: Some(true),
-                        ..ScanOptionsUpdate::default()
+                        ..ScanRulesUpdate::default()
                     },
                     ..IndexOptions::default()
                 },
@@ -1885,7 +1878,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_manual_update_preserves_the_live_watcher_and_execution_template() {
-        use zg_engine::api::index::options::ScanOptionsUpdate;
+        use zg_engine::api::index::options::ScanRulesUpdate;
         let workspace = tempdir().expect("workspace");
         let root = workspace.path().canonicalize().expect("root");
         let executor = Arc::new(RecordingExecutor::default());
@@ -1917,9 +1910,9 @@ mod tests {
                 IndexOptions {
                     root: Some(root.clone()),
                     embedding_concurrency: Some(99),
-                    scan: ScanOptionsUpdate {
+                    scan: ScanRulesUpdate {
                         hidden: Some(true),
-                        ..ScanOptionsUpdate::default()
+                        ..ScanRulesUpdate::default()
                     },
                     ..IndexOptions::default()
                 },

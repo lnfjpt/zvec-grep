@@ -10,7 +10,6 @@ use zg_host_native::NativeScanner;
 use crate::{
     EngineError,
     api::{
-        context::{ContextOptions, ContextResult},
         index::{IndexOptions, IndexResult, options::EmbeddingModelSpec},
         info::{
             InfoOptions, InfoResult,
@@ -25,7 +24,6 @@ use crate::{
         ModelError, ModelRuntimeLease, ModelRuntimeManager, ModelRuntimeRequest,
         ResolveEmbeddingReferenceOptions, resolve_embedding_reference,
     },
-    pipelines::search::context::{NormalizedContextRequest, context_from_index},
     storage::spi::{WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions},
     workspace::{
         CURRENT_INDEX_VERSION,
@@ -83,6 +81,10 @@ impl WorkspaceIndexService {
         }
     }
 
+    pub(in crate::pipelines) fn storage_factory(&self) -> &dyn WorkspaceIndexStorageFactory {
+        self.storage_factory.as_ref()
+    }
+
     fn registry(&self) -> Result<WorkspaceRegistry, EngineError> {
         self.registry
             .clone()
@@ -90,7 +92,10 @@ impl WorkspaceIndexService {
     }
 
     /// A registry rename is authoritative; replay it into metadata after a crash.
-    fn reconcile_name(&self, manifest: &mut WorkspaceManifest) -> Result<(), EngineError> {
+    pub(in crate::pipelines) fn reconcile_name(
+        &self,
+        manifest: &mut WorkspaceManifest,
+    ) -> Result<(), EngineError> {
         let registry = self.registry()?;
         if let Some(name) = registry.name_for_root(&manifest.workspace.root)? {
             manifest.workspace.name = name;
@@ -193,12 +198,11 @@ impl WorkspaceIndexService {
                     .and_then(|manifest| manifest.index_version),
             )?;
         }
-        // Validate before model acquisition; invalid filters must not trigger downloads or inference.
-        let filter = resolve_filter(existing.as_ref(), &options);
-        crate::file_selection::FileMatcher::new(&location.root, &filter)?;
+        // Validate before model acquisition; invalid globs must not trigger downloads or inference.
+        let scan = resolve_scan(existing.as_ref(), &options);
+        crate::file_selection::GlobMatcher::new(&location.root, &scan.globs)?;
         if options.reset_paths
-            || options.filter != crate::api::index::options::FileFilterUpdate::default()
-            || options.scan != crate::api::index::options::ScanOptionsUpdate::default()
+            || options.scan != crate::api::index::options::ScanRulesUpdate::default()
         {
             // A changed selection can admit files outside a watcher's narrow change scope.
             options.changes.clear();
@@ -248,7 +252,6 @@ impl WorkspaceIndexService {
             })?;
         let result = index_workspace(&IndexingContext {
             workspace_index: &manifest.workspace,
-            scan: &manifest.scan,
             storage: storage.as_ref(),
             scanner: &self.scanner,
             embedding_model: &model,
@@ -285,103 +288,7 @@ impl WorkspaceIndexService {
         Ok(indexed)
     }
 
-    pub(crate) async fn context(
-        &self,
-        models: &ModelRuntimeManager,
-        options: &ContextOptions,
-        request: &NormalizedContextRequest,
-    ) -> Result<ContextResult, EngineError> {
-        let requested_root = resolve_root(options.root.as_deref())?;
-        let Some(location) = find_nearest_workspace(&requested_root)? else {
-            return Err(workspace_index_unavailable(
-                &requested_root,
-                "no workspace manifest was found",
-            ));
-        };
-        let factory = &self.storage_factory;
-        let initial_manifest = read_workspace_manifest(&location.home)?;
-        if !initial_manifest
-            .as_ref()
-            .map(|manifest| factory.exists(&manifest.storage_home()))
-            .transpose()?
-            .unwrap_or(false)
-        {
-            return Err(workspace_index_unavailable(
-                &location.root,
-                "index storage is missing",
-            ));
-        }
-        if options.refresh.map_or(options.auto_update, |policy| {
-            policy == crate::api::context::options::RefreshPolicy::Wait
-        }) && self
-            .workspace_needs_refresh(&location, factory.as_ref())
-            .await?
-        {
-            self.index(models, refresh_options(options, location.root.clone()))
-                .await?;
-        }
-        let _lock = acquire_home_lock(&location.home, LockMode::Read, "context")?;
-        let mut manifest = read_workspace_manifest(&location.home)?.ok_or_else(|| {
-            workspace_index_unavailable(&location.root, "workspace manifest disappeared")
-        })?;
-        self.reconcile_name(&mut manifest)?;
-        if manifest.workspace.index == IndexState::Disabled {
-            return Err(EngineError::unsupported(format!(
-                "workspace indexing is disabled at {}",
-                location.root.display()
-            )));
-        }
-        if !is_indexed(&manifest) {
-            return Err(workspace_index_unavailable(
-                &location.root,
-                "workspace index has not been built",
-            ));
-        }
-        assert_index_version(manifest.index_version)?;
-        let model = request
-            .routes
-            .iter()
-            .any(|route| route.mode == crate::api::context::options::ContextRouteMode::Vector)
-            .then(|| {
-                acquire_search_model(
-                    models,
-                    &manifest,
-                    options.embedding_concurrency,
-                    options,
-                    &location.root,
-                )
-            })
-            .transpose()?;
-        if let Some(model) = &model {
-            assert_embedding_compatible(Some(&manifest), model)?;
-        }
-        let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
-            storage_path: manifest.storage_home(),
-        })?;
-        let result = context_from_index(
-            &location.root,
-            &manifest.workspace,
-            &manifest.path,
-            storage.as_ref(),
-            model
-                .as_ref()
-                .map(|model| crate::pipelines::search::RequestEmbeddingRuntime {
-                    model,
-                    signal: options.signal.clone(),
-                })
-                .as_ref()
-                .map(|model| model as &dyn crate::pipelines::search::SearchEmbeddingRuntime),
-            options,
-            request,
-        )
-        .await;
-        let close = storage.close();
-        let result = result?;
-        close?;
-        Ok(result)
-    }
-
-    async fn workspace_needs_refresh(
+    pub(in crate::pipelines) async fn workspace_needs_refresh(
         &self,
         location: &WorkspaceIndexLocation,
         factory: &dyn WorkspaceIndexStorageFactory,
@@ -397,14 +304,9 @@ impl WorkspaceIndexService {
         let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: manifest.storage_home(),
         })?;
-        let status = get_workspace_index_status(
-            &manifest.workspace,
-            &manifest.scan,
-            storage.as_ref(),
-            &self.scanner,
-            None,
-        )
-        .await;
+        let status =
+            get_workspace_index_status(&manifest.workspace, storage.as_ref(), &self.scanner, None)
+                .await;
         let close = storage.close();
         let status = status?;
         close?;
@@ -443,7 +345,6 @@ impl WorkspaceIndexService {
             })?;
             let status = get_workspace_index_status(
                 &manifest.workspace,
-                &manifest.scan,
                 storage.as_ref(),
                 &self.scanner,
                 None,
@@ -547,7 +448,7 @@ fn index_manifest(
             .or_else(|| active.map(|value| value.workspace.name.clone()))
             .unwrap_or_else(|| workspace_name(&location.root)),
         root: location.root.clone(),
-        filter: resolve_filter(active, options),
+        scan: resolve_scan(active, options),
         index: IndexState::Enabled(IndexDescriptor {
             fts: crate::domain::FTS_CONFIG,
             embedding: model.info().clone(),
@@ -562,7 +463,6 @@ fn index_manifest(
         Some(CURRENT_INDEX_VERSION),
         runtime,
     )?;
-    manifest.scan = resolve_scan(active, options);
     manifest.storage_generation = active.and_then(|value| value.storage_generation.clone());
     Ok(manifest)
 }
@@ -579,34 +479,6 @@ impl fmt::Debug for WorkspaceIndexService {
             .debug_struct("WorkspaceIndexService")
             .field("scanner", &self.scanner)
             .finish_non_exhaustive()
-    }
-}
-
-fn refresh_options(options: &ContextOptions, root: PathBuf) -> IndexOptions {
-    IndexOptions {
-        root: Some(root),
-        // Refresh reconciles the active index against the whole source tree.
-        changes: vec![crate::api::index::options::WorkspaceChange::Rescan],
-        on_progress: options.on_progress.clone(),
-        signal: options.signal.clone(),
-        allow_remote: options.allow_remote,
-        api_key: options.api_key.clone(),
-        endpoint: options.endpoint.clone(),
-        embedding_concurrency: options.embedding_concurrency,
-        device: options.device,
-        model_cache: options.model_cache.clone(),
-        embedding: options.authorization_model.as_ref().map(|reference| {
-            crate::api::index::options::EmbeddingModelSpec {
-                reference: reference.clone(),
-                revision: None,
-                cache_dir: options.model_cache.clone(),
-                endpoint: options.endpoint.clone(),
-                device: options
-                    .device
-                    .unwrap_or(crate::api::index::options::Device::Auto),
-            }
-        }),
-        ..IndexOptions::default()
     }
 }
 
@@ -705,87 +577,6 @@ fn acquire_model(
         .map_err(ModelError::into_engine_error)
 }
 
-fn acquire_search_model(
-    models: &ModelRuntimeManager,
-    manifest: &WorkspaceManifest,
-    embedding_concurrency: Option<usize>,
-    options: &ContextOptions,
-    root: &Path,
-) -> Result<ModelRuntimeLease, EngineError> {
-    let schema = manifest.embedding().ok_or_else(|| {
-        workspace_index_unavailable(&manifest.path, "embedding model information is missing")
-    })?;
-    let reference = schema.model.reference();
-    if options
-        .authorization_model
-        .as_ref()
-        .is_some_and(|expected| expected != &reference)
-    {
-        return Err(EngineError::permission_denied(
-            "Workspace embedding model changed after authorization; retry the query",
-        ));
-    }
-    let config = crate::config::read()?;
-    let local = schema.model.provider == "local";
-    if !local && options.device.is_some() {
-        return Err(EngineError::invalid_argument(
-            "--device is only supported for local embedding models",
-        ));
-    }
-    let endpoint = if local {
-        None
-    } else {
-        let endpoint = crate::authorization::remote_endpoint(
-            &reference,
-            options
-                .endpoint
-                .as_deref()
-                .or(manifest.embedding_runtime.endpoint.as_deref()),
-        )?;
-        crate::authorization::require(root, &reference, &endpoint, options.allow_remote)?;
-        Some(endpoint)
-    };
-    models
-        .acquire(ModelRuntimeRequest::new(
-            reference.clone(),
-            ModelConfig {
-                api_key: (!local)
-                    .then(|| {
-                        options
-                            .api_key
-                            .clone()
-                            .or_else(|| manifest.embedding_runtime.api_key.clone())
-                            .or_else(|| {
-                                crate::config::string(
-                                    &config,
-                                    &["providers", &schema.model.provider, "apiKey"],
-                                )
-                            })
-                            .or_else(environment_api_key)
-                    })
-                    .flatten(),
-                endpoint,
-                device: if local {
-                    crate::config::runtime_device(
-                        &config,
-                        &reference,
-                        options.device,
-                        manifest.embedding_runtime.device,
-                    )?
-                } else {
-                    None
-                },
-                cache_dir: crate::config::model_cache(
-                    &config,
-                    options.model_cache.clone(),
-                    manifest.embedding_runtime.cache_dir.clone(),
-                ),
-            },
-            embedding_concurrency,
-        ))
-        .map_err(ModelError::into_engine_error)
-}
-
 pub(crate) fn embedding_reference(
     existing: Option<&WorkspaceManifest>,
     requested: Option<&EmbeddingModelSpec>,
@@ -803,7 +594,7 @@ pub(crate) fn embedding_reference(
     .ok_or_else(|| EngineError::internal("default embedding model is not configured"))
 }
 
-fn environment_api_key() -> Option<String> {
+pub(in crate::pipelines) fn environment_api_key() -> Option<String> {
     ["ZVEC_GREP_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY"]
         .into_iter()
         .find_map(|name| {
@@ -814,7 +605,7 @@ fn environment_api_key() -> Option<String> {
         })
 }
 
-fn assert_embedding_compatible(
+pub(in crate::pipelines) fn assert_embedding_compatible(
     existing: Option<&WorkspaceManifest>,
     model: &ModelRuntimeLease,
 ) -> Result<(), EngineError> {
@@ -827,30 +618,15 @@ fn assert_embedding_compatible(
     schema.ensure_index_compatible(model.info())
 }
 
-pub(crate) fn resolve_filter(
-    existing: Option<&WorkspaceManifest>,
-    options: &IndexOptions,
-) -> crate::domain::FileFilter {
-    let mut filter = if options.reset_paths {
-        crate::domain::FileFilter::default()
-    } else {
-        existing.map_or_else(crate::domain::FileFilter::default, |manifest| {
-            manifest.workspace.filter.clone()
-        })
-    };
-    options.filter.apply(&mut filter);
-    filter
-}
-
 fn resolve_scan(
     existing: Option<&WorkspaceManifest>,
     options: &IndexOptions,
-) -> crate::file_selection::ScanOptions {
+) -> crate::domain::ScanRules {
     let mut scan = if options.reset_paths {
-        crate::file_selection::ScanOptions::default()
+        crate::domain::ScanRules::default()
     } else {
-        existing.map_or_else(crate::file_selection::ScanOptions::default, |manifest| {
-            manifest.scan.clone()
+        existing.map_or_else(crate::domain::ScanRules::default, |manifest| {
+            manifest.workspace.scan.clone()
         })
     };
     options.scan.apply(&mut scan);
@@ -905,7 +681,7 @@ fn embedding_runtime(
     }
 }
 
-fn assert_index_version(version: Option<u32>) -> Result<(), EngineError> {
+pub(in crate::pipelines) fn assert_index_version(version: Option<u32>) -> Result<(), EngineError> {
     if let Some(version) = version
         && version != CURRENT_INDEX_VERSION
     {
@@ -916,7 +692,7 @@ fn assert_index_version(version: Option<u32>) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn is_indexed(manifest: &WorkspaceManifest) -> bool {
+pub(in crate::pipelines) fn is_indexed(manifest: &WorkspaceManifest) -> bool {
     manifest.workspace.index_enabled() && manifest.index_version.is_some()
 }
 
@@ -981,11 +757,6 @@ fn workspace_suggestion(manifest: &WorkspaceManifest, indexed: bool) -> Option<S
     }
 }
 
-#[track_caller]
-fn workspace_index_unavailable(root: &Path, reason: &str) -> EngineError {
-    EngineError::not_found(format!("workspace index at {}: {reason}", root.display()))
-}
-
 fn epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -995,12 +766,7 @@ fn epoch_millis() -> u64 {
 }
 
 fn workspace_info(manifest: &WorkspaceManifest) -> WorkspaceIndexInfo {
-    WorkspaceIndexInfo::from_workspace(
-        &manifest.workspace,
-        &manifest.path,
-        &manifest.scan,
-        manifest.index_version,
-    )
+    WorkspaceIndexInfo::from_workspace(&manifest.workspace, &manifest.path, manifest.index_version)
 }
 
 /// Find the old registration of a physically moved workspace. The recorded root
@@ -1047,11 +813,11 @@ mod tests {
         api::{
             index::{
                 IndexOptions,
-                options::{EmbeddingModelSpec, FileFilterUpdate},
+                options::{EmbeddingModelSpec, ScanRulesUpdate},
             },
             info::InfoOptions,
         },
-        domain::{FileFilter, FileRecord, IndexState, Workspace, model::Device},
+        domain::{FileRecord, IndexState, Workspace, model::Device},
         storage::spi::{
             IndexedFragment, StorageResult, StorageSearchFilter, StorageSearchHit,
             WorkspaceIndexStorage, WorkspaceIndexStorageFactory, WorkspaceIndexStorageOptions,
@@ -1171,25 +937,13 @@ mod tests {
         }
     }
 
-    fn write_legacy_manifest(
+    fn write_previous_index_version(
         home: &std::path::Path,
         manifest: &crate::workspace::manifest::WorkspaceManifest,
     ) {
-        let mut legacy = serde_json::to_value(manifest).expect("legacy manifest value");
-        legacy["manifestVersion"] = 1.into();
-        legacy["indexVersion"] = 3.into();
-        let root = legacy
-            .as_object_mut()
-            .expect("manifest object")
-            .remove("root")
-            .expect("workspace root");
-        let discovery = serde_json::json!({"absolutePath":root,"recursive":true});
-        legacy["rootPaths"] = serde_json::json!([discovery]);
-        std::fs::write(
-            home.join("manifest.json"),
-            serde_json::to_vec(&legacy).expect("legacy manifest json"),
-        )
-        .expect("legacy manifest write");
+        let mut previous = manifest.clone();
+        previous.index_version = Some(4);
+        super::write_workspace_manifest(home, &previous).expect("previous index metadata");
     }
 
     #[test]
@@ -1211,9 +965,9 @@ mod tests {
             Workspace {
                 name: "workspace".into(),
                 root: directory.path().to_path_buf(),
-                filter: FileFilter {
+                scan: crate::domain::ScanRules {
                     globs: vec!["*.rs".into()],
-                    ..FileFilter::default()
+                    ..crate::domain::ScanRules::default()
                 },
                 index: IndexState::Uninitialized,
                 created_epoch_ms: 0,
@@ -1224,26 +978,18 @@ mod tests {
             crate::domain::model::ModelConfig::default(),
         )
         .expect("manifest");
-        manifest.scan.hidden = true;
-        manifest.scan.max_depth = Some(3);
+        manifest.workspace.scan.hidden = true;
+        manifest.workspace.scan.max_depth = Some(3);
         let mut options = IndexOptions::default();
         assert_eq!(
-            super::resolve_filter(Some(&manifest), &options),
-            manifest.workspace.filter
-        );
-        assert_eq!(
             super::resolve_scan(Some(&manifest), &options),
-            manifest.scan
+            manifest.workspace.scan
         );
-        options.filter.globs = Some(Vec::new());
+        options.scan.globs = Some(Vec::new());
         options.scan.hidden = Some(false);
         options.scan.max_depth = Some(None);
-        assert!(
-            super::resolve_filter(Some(&manifest), &options)
-                .globs
-                .is_empty()
-        );
         let scan = super::resolve_scan(Some(&manifest), &options);
+        assert!(scan.globs.is_empty());
         assert!(!scan.hidden);
         assert_eq!(scan.max_depth, None);
         options = IndexOptions {
@@ -1251,12 +997,8 @@ mod tests {
             ..IndexOptions::default()
         };
         assert_eq!(
-            super::resolve_filter(Some(&manifest), &options),
-            FileFilter::default()
-        );
-        assert_eq!(
             super::resolve_scan(Some(&manifest), &options),
-            crate::file_selection::ScanOptions::default()
+            crate::domain::ScanRules::default()
         );
     }
 
@@ -1296,9 +1038,9 @@ mod tests {
                 &models,
                 IndexOptions {
                     root: Some(original.clone()),
-                    filter: FileFilterUpdate {
+                    scan: ScanRulesUpdate {
                         globs: Some(vec!["*.rs".into()]),
-                        ..FileFilterUpdate::default()
+                        ..ScanRulesUpdate::default()
                     },
                     embedding: Some(EmbeddingModelSpec {
                         reference: "local/potion-code-16m-v2".into(),
@@ -1331,7 +1073,7 @@ mod tests {
         );
         assert_eq!(workspace.path, workspace.root.join(".zvec-grep"));
         assert_eq!(
-            workspace.filter.globs,
+            workspace.scan.globs,
             vec![crate::domain::GlobRule::from("*.rs")]
         );
         assert_eq!(info.status.expect("status").files_scanned, 0);
@@ -1349,7 +1091,7 @@ mod tests {
             .expect("manifest read")
             .expect("manifest");
         assert_eq!(after.workspace.name, before.workspace.name);
-        assert_eq!(after.workspace.filter, before.workspace.filter);
+        assert_eq!(after.workspace.scan, before.workspace.scan);
         assert_eq!(after.workspace.root, moved);
         assert_eq!(
             service
@@ -1465,7 +1207,7 @@ mod tests {
         );
         assert!(active.storage_home().join("storage").exists());
         assert!(!super::has_build(&home));
-        let refresh = super::refresh_options(
+        let refresh = crate::pipelines::indexed_search::service::refresh_options(
             &crate::api::context::ContextOptions::default(),
             directory.path().to_path_buf(),
         );
@@ -1513,7 +1255,7 @@ mod tests {
             .expect("read")
             .expect("active");
         let mut target = active.clone();
-        target.workspace.filter.globs.push("*.rs".into());
+        target.workspace.scan.globs.push("*.rs".into());
         target.embedding_runtime.endpoint = Some("https://abandoned.test/embeddings".into());
         let abandoned = super::prepare_build(target, Some(&active)).expect("crashed build");
         std::fs::write(
@@ -1529,7 +1271,7 @@ mod tests {
             .expect("read")
             .expect("active");
         assert_eq!(updated.storage_generation, active.storage_generation);
-        assert_eq!(updated.workspace.filter, active.workspace.filter);
+        assert_eq!(updated.workspace.scan, active.workspace.scan);
         assert_eq!(updated.embedding_runtime, active.embedding_runtime);
         assert!(!abandoned.target.storage_home().exists());
         assert!(!super::has_build(&home));
@@ -2259,7 +2001,7 @@ mod tests {
         let service = WorkspaceIndexService::with_storage_factory(factory.clone());
         let models = ModelRuntimeManager::new();
         let mut options = empty_index_options(directory.path());
-        options.filter.globs = Some(vec!["sources/**".into()]);
+        options.scan.globs = Some(vec!["sources/**".into()]);
         options.embedding.as_mut().expect("local model").cache_dir =
             Some(directory.path().join("model-cache"));
         let result = service
@@ -2287,7 +2029,7 @@ mod tests {
             manifest.embedding_runtime.cache_dir,
             Some(directory.path().join("model-cache"))
         );
-        let lease = super::acquire_search_model(
+        let lease = crate::pipelines::indexed_search::service::acquire_search_model(
             &models,
             &manifest,
             None,
@@ -2302,8 +2044,8 @@ mod tests {
         );
         drop(lease);
 
-        // Legacy metadata remains readable long enough to request an explicit rebuild.
-        write_legacy_manifest(&info.home, &manifest);
+        // An incompatible physical index requires an explicit rebuild.
+        write_previous_index_version(&info.home, &manifest);
         let error = service
             .index(
                 &models,
@@ -2313,7 +2055,7 @@ mod tests {
                 },
             )
             .await
-            .expect_err("legacy index needs rebuild");
+            .expect_err("previous index needs rebuild");
         assert!(error.message().contains("rebuild the index"));
 
         service
@@ -2332,7 +2074,7 @@ mod tests {
             .expect("manifest");
         assert_eq!(rebuilt.index_version, Some(5));
         assert_eq!(rebuilt.workspace.root, manifest.workspace.root);
-        assert_eq!(rebuilt.workspace.filter, manifest.workspace.filter);
+        assert_eq!(rebuilt.workspace.scan, manifest.workspace.scan);
         assert_eq!(rebuilt.embedding_runtime, manifest.embedding_runtime);
         assert_eq!(rebuilt.workspace.name, manifest.workspace.name);
         assert_eq!(

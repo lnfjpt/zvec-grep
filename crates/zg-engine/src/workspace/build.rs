@@ -256,7 +256,7 @@ mod tests {
 
     use crate::{
         domain::{
-            FileFilter, IndexDescriptor, IndexState, Workspace,
+            IndexDescriptor, IndexState, Workspace,
             model::{EmbeddingModelInfo, Metric, ModelConfig},
         },
         storage::spi::{StorageResult, WorkspaceIndexStorage, WorkspaceIndexStorageOptions},
@@ -300,7 +300,7 @@ mod tests {
             Workspace {
                 name: "workspace".to_owned(),
                 root: root.to_path_buf(),
-                filter: FileFilter::default(),
+                scan: crate::domain::ScanRules::default(),
                 index: IndexState::Enabled(IndexDescriptor {
                     fts: crate::domain::FTS_CONFIG,
                     embedding: EmbeddingModelInfo {

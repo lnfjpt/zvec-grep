@@ -12,7 +12,6 @@ pub mod options {
 
     use super::progress::IndexProgressReporter;
     #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-    // Reject old root lists instead of silently widening their scan scope.
     #[serde(deny_unknown_fields)]
     #[allow(clippy::struct_excessive_bools)]
     pub struct IndexOptions {
@@ -24,15 +23,13 @@ pub mod options {
         pub root: Option<PathBuf>,
         /// Build from empty storage and replace the active index only after success.
         pub rebuild: bool,
-        /// Resets saved filters and scanning options before applying this request's updates.
+        /// Resets saved scan rules before applying this request's updates.
         pub reset_paths: bool,
         /// Normalized watcher changes for a narrow incremental index operation.
         /// An empty list means normal discovery rather than "no work".
         pub changes: Vec<WorkspaceChange>,
         #[serde(default)]
-        pub filter: FileFilterUpdate,
-        #[serde(default)]
-        pub scan: ScanOptionsUpdate,
+        pub scan: ScanRulesUpdate,
         pub embedding: Option<EmbeddingModelSpec>,
         /// Maximum embedding batch tasks for this index operation.
         /// The model default is used when omitted.
@@ -62,50 +59,14 @@ pub mod options {
         pub signal: Option<CancellationToken>,
     }
 
-    pub use crate::domain::{FileCategory, FileFilter, FileFormat, GlobRule};
-    pub use crate::file_selection::ScanOptions;
-
-    /// Changes to saved filters. Omitted fields retain their existing values.
-    #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-    #[serde(default, deny_unknown_fields)]
-    pub struct FileFilterUpdate {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub globs: Option<Vec<GlobRule>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub formats: Option<Vec<FileFormat>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub excluded_formats: Option<Vec<FileFormat>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub categories: Option<Vec<FileCategory>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub excluded_categories: Option<Vec<FileCategory>>,
-    }
-
-    impl FileFilterUpdate {
-        /// Applies only the fields supplied by this request.
-        pub fn apply(&self, target: &mut FileFilter) {
-            if let Some(value) = &self.globs {
-                target.globs.clone_from(value);
-            }
-            if let Some(value) = &self.formats {
-                target.formats.clone_from(value);
-            }
-            if let Some(value) = &self.excluded_formats {
-                target.excluded_formats.clone_from(value);
-            }
-            if let Some(value) = &self.categories {
-                target.categories.clone_from(value);
-            }
-            if let Some(value) = &self.excluded_categories {
-                target.excluded_categories.clone_from(value);
-            }
-        }
-    }
+    pub use crate::domain::{GlobRule, ScanRules};
 
     /// Changes to filesystem scanning. `null` clears an optional limit.
     #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(default, deny_unknown_fields)]
-    pub struct ScanOptionsUpdate {
+    pub struct ScanRulesUpdate {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub globs: Option<Vec<GlobRule>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub hidden: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,12 +87,15 @@ pub mod options {
         )]
         pub max_file_size_bytes: Option<Option<u64>>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub follow: Option<bool>,
+        pub follow_symlinks: Option<bool>,
     }
 
-    impl ScanOptionsUpdate {
+    impl ScanRulesUpdate {
         /// Applies only the fields supplied by this request.
-        pub fn apply(&self, target: &mut ScanOptions) {
+        pub fn apply(&self, target: &mut ScanRules) {
+            if let Some(value) = &self.globs {
+                target.globs.clone_from(value);
+            }
             if let Some(value) = self.hidden {
                 target.hidden = value;
             }
@@ -150,8 +114,8 @@ pub mod options {
             if let Some(value) = self.max_file_size_bytes {
                 target.max_file_size_bytes = value;
             }
-            if let Some(value) = self.follow {
-                target.follow = value;
+            if let Some(value) = self.follow_symlinks {
+                target.follow_symlinks = value;
             }
         }
     }
@@ -199,44 +163,55 @@ pub mod options {
 
         #[test]
         fn updates_preserve_omission_and_apply_false_empty_and_null() {
-            let mut scan = ScanOptions {
+            let mut scan = ScanRules {
+                globs: vec!["*.rs".into()],
                 hidden: true,
                 nested_git: true,
                 max_depth: Some(3),
                 ..Default::default()
             };
-            let update: ScanOptionsUpdate =
+            let update: ScanRulesUpdate =
                 serde_json::from_str(r#"{"hidden":false,"nested_git":false,"max_depth":null}"#)
                     .expect("valid test fixture");
             assert_eq!(update.max_depth, Some(None));
-            assert_eq!(update.follow, None);
+            assert_eq!(update.follow_symlinks, None);
             update.apply(&mut scan);
             assert!(!scan.hidden);
             assert!(!scan.nested_git);
             assert_eq!(scan.max_depth, None);
-            ScanOptionsUpdate::default().apply(&mut scan);
+            ScanRulesUpdate::default().apply(&mut scan);
             assert!(!scan.nested_git, "omission preserves the configured value");
+            assert_eq!(scan.globs, vec![GlobRule::from("*.rs")]);
             assert_eq!(
                 serde_json::to_value(&update).expect("valid test fixture")["max_depth"],
                 serde_json::Value::Null
             );
             assert!(
-                serde_json::to_value(ScanOptionsUpdate::default())
+                serde_json::to_value(ScanRulesUpdate::default())
                     .expect("valid test fixture")
                     .get("max_depth")
                     .is_none()
             );
-            let mut filter = FileFilter {
-                globs: vec![GlobRule {
-                    pattern: "*.rs".into(),
-                    case_insensitive: false,
-                }],
-                ..Default::default()
-            };
-            let update: FileFilterUpdate =
+            let update: ScanRulesUpdate =
                 serde_json::from_str(r#"{"globs":[]}"#).expect("valid test fixture");
-            update.apply(&mut filter);
-            assert!(filter.globs.is_empty());
+            update.apply(&mut scan);
+            assert!(scan.globs.is_empty());
+        }
+
+        #[test]
+        fn query_constraints_are_not_accepted_as_scan_updates() {
+            for field in [
+                "formats",
+                "excluded_formats",
+                "categories",
+                "excluded_categories",
+                "modified_after_epoch_ms",
+                "modified_before_epoch_ms",
+            ] {
+                let mut value = serde_json::json!({});
+                value[field] = serde_json::json!([]);
+                assert!(serde_json::from_value::<ScanRulesUpdate>(value).is_err());
+            }
         }
     }
 }

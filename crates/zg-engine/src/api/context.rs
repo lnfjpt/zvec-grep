@@ -5,14 +5,44 @@ pub use result::ContextResult;
 
 /// Options accepted by [`crate::ZvecGrep::context`].
 pub mod options {
-    pub use crate::domain::{FileCategory, FileFilter, FileFormat, GlobRule, SymbolType};
-    pub use crate::pipelines::search::types::{
-        SearchRoute as ContextRoute, SearchRouteMode as ContextRouteMode,
-    };
+    pub use crate::domain::{FileCategory, FileFormat, GlobRule, SymbolType};
 
     use std::path::PathBuf;
 
     use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct ContextRoute {
+        pub mode: ContextRouteMode,
+        pub query: String,
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ContextRouteMode {
+        Fts,
+        Vector,
+    }
+
+    /// Temporary restrictions on indexed files and entities for one query.
+    #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(default, deny_unknown_fields)]
+    pub struct QueryFilter {
+        /// Ordered path rules relative to the workspace root.
+        pub globs: Vec<GlobRule>,
+        /// Formats matched by the catalog's explicit, case-sensitive filename rules.
+        pub formats: Vec<FileFormat>,
+        /// Excluded file-name formats; any match takes precedence over included formats.
+        pub excluded_formats: Vec<FileFormat>,
+        /// Categories selected through the catalog's filename rules.
+        pub categories: Vec<FileCategory>,
+        /// Excluded file-name categories; any match takes precedence over included categories.
+        pub excluded_categories: Vec<FileCategory>,
+        /// Inclusive bounds on the modification time recorded in the index.
+        pub modified_after_epoch_ms: Option<u64>,
+        pub modified_before_epoch_ms: Option<u64>,
+        pub symbol_types: Vec<SymbolType>,
+    }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(deny_unknown_fields)]
@@ -34,10 +64,9 @@ pub mod options {
         pub refresh: Option<RefreshPolicy>,
         pub trace: bool,
         pub prefer_symbol: bool,
-        pub symbol_types: Vec<SymbolType>,
         /// Temporary filter over indexed files; does not alter workspace selection.
         #[serde(default)]
-        pub filter: FileFilter,
+        pub filter: QueryFilter,
         /// Filesystem glob options for the independent rg backend only.
         pub globs: Vec<String>,
         pub insensitive_globs: Vec<String>,
@@ -49,8 +78,6 @@ pub mod options {
         pub max_depth: Option<usize>,
         pub max_file_size_bytes: Option<u64>,
         pub follow: bool,
-        pub modified_after_epoch_ms: Option<u64>,
-        pub modified_before_epoch_ms: Option<u64>,
         pub embedding_concurrency: Option<usize>,
         /// Allows remote embedding for this operation without persisting a grant.
         #[serde(default)]
@@ -77,7 +104,7 @@ pub mod options {
     impl ContextOptions {
         pub(crate) fn validate_file_selection(&self) -> crate::EngineResult<()> {
             if self.rg {
-                if self.filter != FileFilter::default() {
+                if self.filter != QueryFilter::default() {
                     return Err(crate::EngineError::invalid_argument(
                         "indexed file filters cannot be combined with rg; use rg glob and type options",
                     ));
@@ -119,8 +146,7 @@ pub mod options {
                 refresh: None,
                 trace: false,
                 prefer_symbol: false,
-                symbol_types: Vec::new(),
-                filter: FileFilter::default(),
+                filter: QueryFilter::default(),
                 globs: Vec::new(),
                 insensitive_globs: Vec::new(),
                 file_types: Vec::new(),
@@ -131,8 +157,6 @@ pub mod options {
                 max_depth: None,
                 max_file_size_bytes: None,
                 follow: false,
-                modified_after_epoch_ms: None,
-                modified_before_epoch_ms: None,
                 embedding_concurrency: None,
                 allow_remote: false,
                 api_key: None,
@@ -160,6 +184,9 @@ pub mod options {
     pub struct RgOptions {
         pub extra_args: Vec<String>,
         pub pattern_files: Vec<PathBuf>,
+        /// Inclusive bounds on the file modification time read during direct search.
+        pub modified_after_epoch_ms: Option<u64>,
+        pub modified_before_epoch_ms: Option<u64>,
         pub fixed_strings: bool,
         pub ignore_case: bool,
         pub word_regexp: bool,
@@ -208,7 +235,7 @@ pub mod options {
             assert!(indexed.validate_file_selection().is_err());
             let rg = ContextOptions {
                 rg: true,
-                filter: FileFilter {
+                filter: QueryFilter {
                     globs: vec!["*.rs".into()],
                     ..Default::default()
                 },
@@ -220,6 +247,35 @@ pub mod options {
                 ..Default::default()
             };
             assert!(indexed.validate_file_selection().is_ok());
+
+            let rg_time_filter = RgOptions {
+                modified_after_epoch_ms: Some(0),
+                ..Default::default()
+            };
+            let indexed = ContextOptions {
+                rg_options: rg_time_filter.clone(),
+                ..Default::default()
+            };
+            assert!(indexed.validate_file_selection().is_err());
+            let rg = ContextOptions {
+                rg: true,
+                rg_options: rg_time_filter,
+                ..Default::default()
+            };
+            assert!(rg.validate_file_selection().is_ok());
+        }
+
+        #[test]
+        fn query_filter_accepts_partial_fields_and_rejects_nested_or_scan_fields() {
+            let filter: QueryFilter =
+                serde_json::from_str(r#"{"formats":["rust"],"modified_after_epoch_ms":0}"#)
+                    .expect("partial query filter");
+            assert_eq!(filter.formats, vec![FileFormat::Rust]);
+            assert_eq!(filter.modified_after_epoch_ms, Some(0));
+            assert!(filter.globs.is_empty());
+            for value in [r#"{"files":{}}"#, r#"{"hidden":true}"#] {
+                assert!(serde_json::from_str::<QueryFilter>(value).is_err());
+            }
         }
     }
 }
@@ -227,17 +283,77 @@ pub mod options {
 /// Values returned by [`crate::ZvecGrep::context`].
 pub mod result {
     pub use crate::domain::{CodeMetadata, EntityMetadata, MarkdownMetadata};
-    pub use crate::lexical::structure::{
-        StructureEnrichmentDiagnostics, StructureEnrichmentSource,
-    };
-    pub use crate::pipelines::search::types::{
-        MatchedBy, SearchFinalTrace, SearchFusionTrace, SearchHitTrace, SearchRecallTrace,
-        TimingEntry,
-    };
 
     use std::path::PathBuf;
 
     use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MatchedBy {
+        Fts,
+        Vector,
+        #[serde(rename = "fts+vector")]
+        FtsAndVector,
+        Lexical,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    pub struct SearchHitTrace {
+        pub recall: Vec<SearchRecallTrace>,
+        pub fusion: SearchFusionTrace,
+        pub final_selection: SearchFinalTrace,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    pub struct SearchRecallTrace {
+        pub path: super::options::ContextRouteMode,
+        pub route_id: String,
+        pub query: String,
+        pub found: bool,
+        pub rank: Option<usize>,
+        pub score: Option<f64>,
+        pub forced: bool,
+        pub reason: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    pub struct SearchFusionTrace {
+        pub rank: usize,
+        pub score: f64,
+        pub forced: bool,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct SearchFinalTrace {
+        pub returned_by_limit: bool,
+        pub cutoff_rank: usize,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct TimingEntry {
+        pub name: String,
+        pub duration_micros: u64,
+        pub count: Option<u64>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct StructureEnrichmentDiagnostics {
+        pub source: StructureEnrichmentSource,
+        pub file_limit: usize,
+        pub matched_files: usize,
+        pub parsed_files: usize,
+        pub enriched_files: usize,
+        pub enriched_items: usize,
+        pub skipped_files: usize,
+        pub truncated: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum StructureEnrichmentSource {
+        StructuralExtraction,
+    }
 
     #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
     pub struct ContextResult {

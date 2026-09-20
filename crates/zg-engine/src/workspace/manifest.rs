@@ -3,8 +3,7 @@ use crate::domain::model::ModelConfig;
 use crate::domain::model::{Device, Metric};
 use crate::{
     EngineError,
-    domain::{FileFilter, IndexDescriptor, IndexState, Workspace, model::EmbeddingModelInfo},
-    file_selection::ScanOptions,
+    domain::{IndexDescriptor, IndexState, ScanRules, Workspace, model::EmbeddingModelInfo},
     utils::{atomic_write, sync_directory},
 };
 use serde::{Deserialize, Serialize};
@@ -22,7 +21,6 @@ pub(crate) const CURRENT_MANIFEST_VERSION: u32 = 4;
 pub(crate) struct WorkspaceManifest {
     pub manifest_version: u32,
     pub workspace: Workspace,
-    pub scan: ScanOptions,
     /// Root recorded on disk before resolving a moved workspace.
     pub recorded_root: PathBuf,
     pub path: PathBuf,
@@ -31,8 +29,6 @@ pub(crate) struct WorkspaceManifest {
     pub embedding_runtime: ModelConfig,
 }
 
-// Retain the existing flat disk representation, while retiring its UUID identity.
-// Unknown legacy `id` fields are ignored; the next write stores only the name.
 // Serialized policy is a disk concern; domain enabled state always has a descriptor.
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,17 +39,18 @@ enum IndexPolicy {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ManifestData {
     manifest_version: u32,
+    // Older manifests carried a workspace UUID; names now provide identity.
+    #[serde(default, rename = "id", skip_serializing)]
+    _legacy_id: Option<serde::de::IgnoredAny>,
     name: String,
     path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     root: Option<PathBuf>,
     #[serde(default)]
-    filter: FileFilter,
-    #[serde(default)]
-    scan: ScanOptions,
+    scan: ScanRules,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root_paths: Option<Vec<LegacyRootPath>>,
     index_policy: IndexPolicy,
@@ -112,12 +109,11 @@ impl TryFrom<ManifestData> for WorkspaceManifest {
             workspace: Workspace {
                 name: input.name,
                 root,
-                filter: input.filter,
+                scan,
                 index,
                 created_epoch_ms: input.created_time,
                 updated_epoch_ms: input.updated_time,
             },
-            scan,
             path: input.path,
             index_version: input.index_version,
             storage_generation: input.storage_generation,
@@ -133,11 +129,11 @@ impl From<WorkspaceManifest> for ManifestData {
         let workspace = manifest.workspace;
         Self {
             manifest_version: manifest.manifest_version,
+            _legacy_id: None,
             name: workspace.name,
             path: manifest.path,
             root: Some(workspace.root),
-            filter: workspace.filter,
-            scan: manifest.scan,
+            scan: workspace.scan,
             root_paths: None,
             index_policy: match &workspace.index {
                 IndexState::Uninitialized => IndexPolicy::Uninitialized,
@@ -169,7 +165,6 @@ impl WorkspaceManifest {
             path: home,
             recorded_root: workspace.root.clone(),
             workspace,
-            scan: ScanOptions::default(),
             index_version,
             storage_generation: None,
             embedding_runtime,
@@ -311,9 +306,9 @@ mod tests {
             Workspace {
                 name: "fixture".to_owned(),
                 root: home.parent().expect("workspace root").to_path_buf(),
-                filter: FileFilter {
+                scan: crate::domain::ScanRules {
                     globs: vec!["*.rs".into()],
-                    ..FileFilter::default()
+                    ..crate::domain::ScanRules::default()
                 },
                 index: IndexState::Enabled(IndexDescriptor {
                     fts: crate::domain::FTS_CONFIG,
@@ -405,7 +400,7 @@ mod tests {
         assert!(json.get("id").is_none());
         assert!(json.get("rootPaths").is_none());
         assert_eq!(json["root"], directory.path().to_string_lossy().as_ref());
-        assert_eq!(json["filter"]["globs"][0]["pattern"], "*.rs");
+        assert_eq!(json["scan"]["globs"][0]["pattern"], "*.rs");
         assert_eq!(json["embeddingRuntime"]["device"], "cpu");
         assert!(json.get("generation").is_none());
         assert_eq!(
@@ -416,13 +411,14 @@ mod tests {
             read_workspace_manifest(&home).expect("read manifest"),
             Some(manifest)
         );
-        let mut legacy = json;
-        legacy["embeddingRuntime"]
+        let mut without_cache = json;
+        without_cache["embeddingRuntime"]
             .as_object_mut()
             .expect("runtime object")
             .remove("cacheDir");
-        let legacy: WorkspaceManifest = serde_json::from_value(legacy).expect("legacy manifest");
-        assert_eq!(legacy.embedding_runtime.cache_dir, None);
+        let without_cache: WorkspaceManifest =
+            serde_json::from_value(without_cache).expect("optional runtime cache");
+        assert_eq!(without_cache.embedding_runtime.cache_dir, None);
     }
 
     #[test]
@@ -439,6 +435,7 @@ mod tests {
             .expect("root");
         let discovery = serde_json::json!({"absolutePath":root,"recursive":true});
         json["rootPaths"] = serde_json::json!([discovery.clone()]);
+        json["id"] = serde_json::json!(uuid::Uuid::new_v4());
         fs::create_dir(&home).expect("workspace home");
         fs::write(
             workspace_manifest_path(&home),
@@ -449,6 +446,18 @@ mod tests {
             .expect("legacy read")
             .expect("manifest");
         assert_eq!(legacy, manifest);
+        assert!(
+            serde_json::to_value(&legacy)
+                .expect("current JSON")
+                .get("id")
+                .is_none()
+        );
+
+        for version in 1..=CURRENT_MANIFEST_VERSION {
+            let mut supported = json.clone();
+            supported["manifestVersion"] = version.into();
+            assert!(serde_json::from_value::<WorkspaceManifest>(supported).is_ok());
+        }
 
         let mut subtree = json.clone();
         subtree["rootPaths"][0]["absolutePath"] = serde_json::json!(directory.path().join("src"));
@@ -460,7 +469,7 @@ mod tests {
         shallow["rootPaths"][0]["recursive"] = false.into();
         let shallow: WorkspaceManifest =
             serde_json::from_value(shallow).expect("nonrecursive legacy workspace");
-        assert_eq!(shallow.scan.max_depth, Some(1));
+        assert_eq!(shallow.workspace.scan.max_depth, Some(1));
 
         json["rootPaths"] = serde_json::json!([discovery.clone(), discovery]);
         fs::write(
@@ -470,6 +479,19 @@ mod tests {
         .expect("multiple legacy roots");
         let error = read_workspace_manifest(&home).expect_err("multiple roots are unsupported");
         assert!(error.message().contains("exactly one workspace root"));
+    }
+
+    #[test]
+    fn removed_selection_fields_are_rejected_instead_of_widening_scan_scope() {
+        let directory = tempdir().expect("workspace");
+        let manifest = fixture_manifest(&directory.path().join(".zvec-grep"));
+        let value = serde_json::to_value(&manifest).expect("manifest JSON");
+        let mut split_filter = value.clone();
+        split_filter["filter"] = serde_json::json!({"globs": ["*.rs"]});
+        assert!(serde_json::from_value::<WorkspaceManifest>(split_filter).is_err());
+        let mut query_constraint = value;
+        query_constraint["scan"]["formats"] = serde_json::json!(["rust"]);
+        assert!(serde_json::from_value::<WorkspaceManifest>(query_constraint).is_err());
     }
 
     #[test]

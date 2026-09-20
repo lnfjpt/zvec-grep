@@ -9,23 +9,27 @@ use crate::{EngineError, EngineResult};
 
 mod catalog;
 mod sniff;
+#[cfg(test)]
+mod tests;
 
 pub use catalog::FileFormat;
 
 const HEADER_BYTES: usize = 1024;
 
+/// Keep numeric IDs stable; do not renumber or reuse existing IDs.
+#[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileCategory {
-    Unknown,
-    Archive,
-    Data,
-    Document,
-    Image,
-    Audio,
-    Video,
-    Code,
-    Binary,
+    Unknown = 0,
+    Archive = 1,
+    Data = 2,
+    Document = 3,
+    Image = 4,
+    Audio = 5,
+    Video = 6,
+    Code = 7,
+    Binary = 8,
 }
 
 impl FileCategory {
@@ -76,7 +80,7 @@ impl<'de> serde::Deserialize<'de> for FileFormat {
 }
 
 impl FileFormat {
-    /// Infers formats from the file name and, if needed, its contents.
+    /// Matches catalog suffixes and basenames exactly, then probes contents if needed.
     pub(crate) fn from_path(path: &Path) -> EngineResult<Vec<Self>> {
         let file_name = path.file_name().ok_or_else(|| {
             EngineError::invalid_argument(format!(
@@ -150,18 +154,16 @@ impl FileFormat {
 
 fn match_longest_extension(file_name: &OsStr) -> &'static [FileFormat] {
     let file_name_bytes = file_name.as_encoded_bytes();
-    let mut extension_buffer = [0; catalog::MAX_EXTENSION_LEN];
     file_name_bytes
         .iter()
         .enumerate()
         .filter(|(index, byte)| *index > 0 && **byte == b'.')
         .find_map(|(dot_index, _)| {
             let extension_bytes = &file_name_bytes[dot_index + 1..];
-            let lowercase_extension = extension_buffer.get_mut(..extension_bytes.len())?;
-            for (target, byte) in lowercase_extension.iter_mut().zip(extension_bytes) {
-                *target = byte.to_ascii_lowercase();
+            if extension_bytes.len() > catalog::MAX_EXTENSION_LEN {
+                return None;
             }
-            let extension = std::str::from_utf8(lowercase_extension).ok()?;
+            let extension = std::str::from_utf8(extension_bytes).ok()?;
             let candidates = catalog::lookup_extension(extension);
             (!candidates.is_empty()).then_some(candidates)
         })
@@ -169,7 +171,7 @@ fn match_longest_extension(file_name: &OsStr) -> &'static [FileFormat] {
 }
 
 fn normalize_formats(formats: &mut Vec<FileFormat>) {
-    formats.sort_unstable_by_key(|format| *format as u16);
+    formats.sort_unstable();
     formats.dedup();
     if formats
         .iter()
@@ -178,6 +180,3 @@ fn normalize_formats(formats: &mut Vec<FileFormat>) {
         formats.retain(|format| !matches!(format, FileFormat::Text | FileFormat::Unknown));
     }
 }
-
-#[cfg(test)]
-mod tests;

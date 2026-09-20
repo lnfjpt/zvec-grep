@@ -9,9 +9,12 @@ use super::*;
 use FileFormat::*;
 
 fn name_formats(file_name: &str) -> Vec<FileFormat> {
-    let mut formats = catalog::lookup_name(file_name).to_vec();
-    formats.extend_from_slice(match_longest_extension(OsStr::new(file_name)));
+    let mut formats = match_longest_extension(OsStr::new(file_name)).to_vec();
+    formats.extend_from_slice(catalog::lookup_name(file_name));
     normalize_formats(&mut formats);
+    if formats.is_empty() {
+        formats.push(Unknown);
+    }
     formats
 }
 
@@ -54,46 +57,49 @@ fn formats_have_query_names_and_categories() {
 
 #[test]
 fn catalog_definitions_round_trip() {
-    let mut identifiers = HashSet::new();
     let mut names = HashSet::new();
-    for &format in catalog::FORMATS {
-        let identifier = format as u16;
-        assert!(identifiers.insert(identifier), "duplicate ID: {identifier}");
-        assert_eq!(FileFormat::from_id(identifier), Some(format));
-
+    for &format in FileFormat::ALL {
         let name = format.as_str();
         assert!(!name.is_empty());
         assert_eq!(name, name.trim());
         assert_eq!(name, name.to_ascii_lowercase());
         assert!(names.insert(name), "duplicate name: {name}");
+        assert_eq!(FileFormat::parse(name), Some(format));
+        let json = serde_json::to_value(format).expect("format JSON");
+        assert_eq!(json, name);
+        assert_eq!(
+            serde_json::from_value::<FileFormat>(json).expect("format round trip"),
+            format
+        );
     }
-    assert_eq!(Unknown as u16, 0);
-    assert_eq!(FileFormat::from_id(0), Some(Unknown));
-    assert_eq!(FileFormat::from_id(u16::MAX), None);
 
     let mut extensions = HashMap::new();
-    for &(extension, format) in catalog::EXTENSIONS {
-        let candidates = extensions.entry(extension).or_insert_with(Vec::new);
-        assert!(
-            !candidates.contains(&format),
-            "duplicate registration: {extension}, {format:?}"
-        );
-        candidates.push(format);
+    for &format in FileFormat::ALL {
+        for &extension in format.extensions() {
+            let candidates = extensions.entry(extension).or_insert_with(Vec::new);
+            assert!(
+                !candidates.contains(&format),
+                "duplicate registration: {extension}, {format:?}"
+            );
+            candidates.push(format);
+        }
     }
     for (extension, mut candidates) in extensions {
-        candidates.sort_unstable_by_key(|format| *format as u16);
-        let name = format!("sample.{}", extension.to_ascii_uppercase());
+        candidates.sort_unstable();
+        let name = format!("sample.{extension}");
         assert_eq!(name_formats(&name), candidates, "{name}");
     }
 
     let mut file_names = HashMap::new();
-    for &(name, format) in catalog::FILE_NAMES {
-        let candidates = file_names.entry(name).or_insert_with(Vec::new);
-        assert!(
-            !candidates.contains(&format),
-            "duplicate registration: {name}, {format:?}"
-        );
-        candidates.push(format);
+    for &format in FileFormat::ALL {
+        for &name in format.file_names() {
+            let candidates = file_names.entry(name).or_insert_with(Vec::new);
+            assert!(
+                !candidates.contains(&format),
+                "duplicate registration: {name}, {format:?}"
+            );
+            candidates.push(format);
+        }
     }
     for (name, candidates) in file_names {
         assert_eq!(catalog::lookup_name(name), candidates, "{name}");
@@ -123,6 +129,7 @@ fn file_names_resolve_registered_formats() {
         (".env", &[Dotenv]),
         (".env.local", &[Dotenv]),
         (".bashrc", &[Bash]),
+        (".bash_aliases", &[Bash]),
         ("tsconfig.json", &[Json, TypeScript]),
         ("tsconfig.build.json", &[Json, TypeScript]),
         ("jsconfig.json", &[JavaScript, Json]),
@@ -143,7 +150,7 @@ fn file_names_resolve_registered_formats() {
         "dockerfile.dev",
         ".ENV.local",
     ] {
-        assert!(name_formats(name).is_empty(), "{name}");
+        assert_eq!(name_formats(name), [Unknown], "{name}");
     }
 
     let mut formats = vec![TypeScript, Json, Unknown, Json, Text];
@@ -158,9 +165,16 @@ fn extensions_match_longest_registered_suffix() {
         (&["doc", "DOCX", "docm", "dotx"], Word),
         (&["xls", "XLSX", "xlsb"], Excel),
         (&["ppt", "pptx", "potm"], PowerPoint),
-        (&["json", "JSONC", "json5"], Json),
+        (&["json", "jsonc", "json5"], Json),
         (&["js", "jsx", "mjs", "cjs"], JavaScript),
-        (&["md", "markdown", "mdx"], Markdown),
+        (
+            &["md", "MD", "markdown", "mdwn", "mkd", "mkdn", "mdx"],
+            Markdown,
+        ),
+        (&["txt", "TXT"], Text),
+        (&["zip", "ZIP", "pyz", "pyzw"], Zip),
+        (&["rar", "RAR"], Rar),
+        (&["7z", "7Z"], SevenZip),
         (&["odg", "otg", "fodg"], Odg),
         (&["ogg", "oga", "ogv"], Ogg),
         (&["woff", "woff2"], Woff),
@@ -172,18 +186,20 @@ fn extensions_match_longest_registered_suffix() {
         }
     }
     let cases: &[(&str, &[FileFormat])] = &[
-        ("scan.TiF", &[Tiff]),
+        ("scan.TIF", &[Tiff]),
         ("report.最终.PDF", &[Pdf]),
-        (".config.JSON", &[Json]),
-        ("backup.2026.TAR.GZ", &[Tar]),
+        (".config.json", &[Json]),
+        ("backup.2026.tar.gz", &[Tar]),
         ("events.json.gz", &[Gzip]),
         ("data.notar.gz", &[Gzip]),
         (".tar.gz", &[Gzip]),
         ("module.d.ts", &[TypeScript]),
-        ("module.D.MTS", &[TypeScript]),
-        ("header.H", &[C, Cpp]),
+        ("module.d.cts", &[TypeScript]),
+        ("module.d.mts", &[TypeScript]),
+        ("module.D.MTS", &[Mpeg]),
+        ("header.H", &[Cpp]),
         ("file.ts", &[Mpeg, TypeScript]),
-        ("file.MTS", &[Mpeg, TypeScript]),
+        ("file.MTS", &[Mpeg]),
         ("file.m", &[Matlab, ObjectiveC]),
         ("file.dot", &[Graphviz, Word]),
         ("file.pot", &[Gettext, PowerPoint]),
@@ -208,8 +224,76 @@ fn extensions_match_longest_registered_suffix() {
         "data.dat",
         "settings.conf",
         "settings.cfg",
+        "scan.TiF",
+        "photo.Jpg",
+        "photo.Png",
+        "main.RS",
+        "main.Rs",
+        ".config.JSON",
+        "backup.2026.TAR.GZ",
     ] {
-        assert!(name_formats(name).is_empty(), "{name}");
+        assert_eq!(name_formats(name), [Unknown], "{name}");
+    }
+}
+
+#[test]
+fn canonical_names_and_extension_aliases_have_separate_case_rules() {
+    let cases = [
+        ("Rust", Some(Rust)),
+        ("RUST", Some(Rust)),
+        ("rs", Some(Rust)),
+        (" .rs ", Some(Rust)),
+        ("RS", None),
+        (".RS", None),
+        (".rust", None),
+        ("C", Some(C)),
+        (".c", Some(C)),
+        (".C", Some(Cpp)),
+        (".h", None),
+        (".H", Some(Cpp)),
+        ("JPEG", Some(Jpeg)),
+        ("JPG", Some(Jpeg)),
+        (".JPG", Some(Jpeg)),
+        ("Jpg", None),
+        (".Jpeg", None),
+        (".R", Some(R)),
+        (".S", Some(Assembly)),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(FileFormat::parse(input), expected, "{input}");
+    }
+}
+
+#[test]
+fn uppercase_language_suffixes_are_explicit_catalog_entries() {
+    for (name, expected) in [
+        ("main.rs", Rust),
+        ("main.c", C),
+        ("main.C", Cpp),
+        ("main.H", Cpp),
+        ("main.s", Assembly),
+        ("main.S", Assembly),
+        ("analysis.r", R),
+        ("analysis.R", R),
+        ("analysis.Rmd", R),
+        ("analysis.Rnw", R),
+        ("template.inl", Cpp),
+        ("library.gemspec", Ruby),
+        ("config.ru", Ruby),
+        (".irbrc", Ruby),
+        ("Makefile.am", Makefile),
+        ("GNUmakefile.in", Makefile),
+    ] {
+        assert_eq!(name_formats(name), [expected], "{name}");
+    }
+    for name in [
+        "main.RS",
+        "main.CPP",
+        "main.ASM",
+        "analysis.RMD",
+        "CONFIG.RU",
+    ] {
+        assert_eq!(name_formats(name), [Unknown], "{name}");
     }
 }
 
@@ -219,7 +303,7 @@ fn known_paths_skip_content_detection() {
     let cases: &[(&str, &[FileFormat])] = &[
         ("missing.JPG", &[Jpeg]),
         ("header.h", &[C, Cpp]),
-        ("header.H", &[C, Cpp]),
+        ("header.H", &[Cpp]),
         ("module.d.ts", &[TypeScript]),
         ("Dockerfile", &[Dockerfile]),
         ("package-lock.json", &[Json]),
@@ -267,6 +351,8 @@ fn unknown_paths_use_content_detection() {
         ),
         ("README", b"Plain text without an extension.\n", Text),
         ("unexpected.custom", b"plain text", Text),
+        ("main.RS", b"fn main() {}\n", Text),
+        ("image.RS", b"\x89PNG\r\n\x1a\n", Png),
         ("utf16", b"\xff\xfeh\0i\0\n\0", Text),
         ("encoded", b"-----BEGIN CERTIFICATE-----\nMIIB", Pem),
         ("binary", b"\0\x01\x02\xff", Unknown),
@@ -396,7 +482,7 @@ fn probing_respects_sample_boundaries() {
 #[test]
 fn invalid_paths_report_errors() {
     let directory = tempdir().expect("temporary directory");
-    for name in ["missing", "missing.m", "missing.ts"] {
+    for name in ["missing", "missing.m", "missing.ts", "missing.RS"] {
         let path = directory.path().join(name);
         let error = FileFormat::from_path(&path).expect_err("content detection requires a file");
         assert_eq!(error.code(), EngineError::NOT_FOUND, "{name}");

@@ -12,8 +12,8 @@ use ignore::{
 };
 use zg_host_native::{HostError, PathPolicy, RootSpec};
 
-use super::{FileMatcher, ScanOptions};
-use crate::{EngineError, EngineResult, domain::FileFilter};
+use super::GlobMatcher;
+use crate::{EngineError, EngineResult, domain::ScanRules};
 
 const MAX_IGNORE_BYTES: u64 = 1_048_576;
 const MAX_IGNORE_RULES: usize = 16_384;
@@ -26,8 +26,8 @@ const IGNORE_NAMES: [&str; 3] = [".gitignore", ".ignore", ".rgignore"];
 #[derive(Debug)]
 pub(crate) struct ScanPolicy {
     root: PathBuf,
-    options: ScanOptions,
-    matcher: FileMatcher,
+    options: ScanRules,
+    matcher: GlobMatcher,
     defaults: Gitignore,
     control_paths: Mutex<Vec<PathBuf>>,
     cache: Mutex<IgnoreCache>,
@@ -41,12 +41,8 @@ struct IgnoreCache {
 }
 
 impl ScanPolicy {
-    pub(crate) fn new(
-        root: &Path,
-        filter: &FileFilter,
-        options: &ScanOptions,
-    ) -> EngineResult<Self> {
-        let matcher = FileMatcher::new(root, filter)?;
+    pub(crate) fn new(root: &Path, options: &ScanRules) -> EngineResult<Self> {
+        let matcher = GlobMatcher::new(root, &options.globs)?;
         let mut options = options.clone();
         options.ignore_files = options
             .ignore_files
@@ -76,14 +72,10 @@ impl ScanPolicy {
         })
     }
 
-    pub(crate) fn root_spec(
-        root: &Path,
-        filter: &FileFilter,
-        options: &ScanOptions,
-    ) -> EngineResult<RootSpec> {
-        let policy = Arc::new(Self::new(root, filter, options)?);
+    pub(crate) fn root_spec(root: &Path, options: &ScanRules) -> EngineResult<RootSpec> {
+        let policy = Arc::new(Self::new(root, options)?);
         let mut spec = RootSpec::new(root.to_path_buf(), policy);
-        spec.follow = options.follow;
+        spec.follow = options.follow_symlinks;
         spec.max_depth = options.max_depth;
         spec.max_file_size_bytes = options.max_file_size_bytes;
         Ok(spec)
@@ -325,7 +317,7 @@ impl PathPolicy for ScanPolicy {
         if !self.selected(absolute_path, true)? {
             return Ok(false);
         }
-        // Discover ignore-file symlinks in leaf directories independently of follow.
+        // Discover ignore-file symlinks even when scanning does not follow links.
         if !self.options.no_ignore {
             for name in IGNORE_NAMES {
                 self.rules(&absolute_path.join(name), false)?;
@@ -425,7 +417,7 @@ fn control_alias(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn control_paths(root: &Path, options: &ScanOptions) -> Vec<PathBuf> {
+fn control_paths(root: &Path, options: &ScanRules) -> Vec<PathBuf> {
     let mut paths = options.ignore_files.clone();
     if !options.no_ignore {
         paths.extend(IGNORE_NAMES.map(|name| root.join(name)));

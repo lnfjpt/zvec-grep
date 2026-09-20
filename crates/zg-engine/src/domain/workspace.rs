@@ -1,14 +1,16 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{EngineError, EngineResult};
 
-use super::{FileFilter, SourcePath, model::EmbeddingModelInfo};
+use super::{GlobRule, SourcePath, model::EmbeddingModelInfo};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Workspace {
     pub name: String,
     pub root: PathBuf,
-    pub filter: FileFilter,
+    pub scan: ScanRules,
     pub index: IndexState,
     pub created_epoch_ms: u64,
     pub updated_epoch_ms: u64,
@@ -55,6 +57,24 @@ impl Workspace {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FtsConfig {
+    pub tokenizer: &'static str,
+    pub filters: &'static [&'static str],
+}
+
+/// Fixed FTS configuration for the current physical index format.
+pub(crate) const FTS_CONFIG: FtsConfig = FtsConfig {
+    tokenizer: "jieba",
+    filters: &["lowercase"],
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IndexDescriptor {
+    pub embedding: EmbeddingModelInfo,
+    pub fts: FtsConfig,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IndexState {
     Uninitialized,
@@ -71,20 +91,35 @@ impl IndexState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndexDescriptor {
-    pub embedding: EmbeddingModelInfo,
-    pub fts: FtsConfig,
+/// Persistent rules for discovering and admitting workspace files to the index.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ScanRules {
+    /// Ordered path rules relative to the workspace root.
+    pub globs: Vec<GlobRule>,
+    pub hidden: bool,
+    pub follow_symlinks: bool,
+    pub max_depth: Option<usize>,
+    pub max_file_size_bytes: Option<u64>,
+
+    pub no_ignore: bool,
+    pub ignore_files: Vec<PathBuf>,
+    /// Traverse child Git repositories, including submodules and worktrees.
+    pub nested_git: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FtsConfig {
-    pub tokenizer: &'static str,
-    pub filters: &'static [&'static str],
+impl Default for ScanRules {
+    fn default() -> Self {
+        Self {
+            globs: Vec::new(),
+            hidden: false,
+            follow_symlinks: false,
+            max_depth: None,
+            max_file_size_bytes: None,
+            no_ignore: false,
+            ignore_files: Vec::new(),
+            nested_git: true,
+        }
+    }
 }
-
-/// Fixed FTS configuration for the current physical index format.
-pub(crate) const FTS_CONFIG: FtsConfig = FtsConfig {
-    tokenizer: "jieba",
-    filters: &["lowercase"],
-};

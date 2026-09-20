@@ -22,7 +22,7 @@ use zg_engine::{
     api::{
         context::{
             ContextOptions,
-            options::{ContextRoute, ContextRouteMode, FileFilter},
+            options::{ContextRoute, ContextRouteMode, QueryFilter},
         },
         index::{
             IndexOptions,
@@ -460,13 +460,13 @@ async fn search_paths(
                 query: "orchard".to_owned(),
             }],
             limit: Some(TOTAL_FILES),
-            filter: FileFilter {
+            filter: QueryFilter {
                 // These are concrete fixture file names; anchor them to the root.
                 globs: selected_paths
                     .into_iter()
                     .map(|path| format!("/{}", path.replace(std::path::MAIN_SEPARATOR, "/")).into())
                     .collect(),
-                ..FileFilter::default()
+                ..QueryFilter::default()
             },
             auto_update: false,
             allow_remote: true,

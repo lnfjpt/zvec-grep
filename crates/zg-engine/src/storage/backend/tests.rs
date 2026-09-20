@@ -4,8 +4,7 @@ use super::*;
 use crate::domain::SourcePath;
 use crate::domain::{
     CodeMetadata, Content, Entity, EntityContent, EntityFragment, EntityId, EntityMetadata,
-    FileFormat, FileRecord, FileSnapshot, SourceRange, SymbolType, TableCell, TableCellRole,
-    TableContent,
+    FileRecord, FileSnapshot, SourceRange, SymbolType, TableCell, TableCellRole, TableContent,
 };
 
 fn file_at(storage: &dyn WorkspaceIndexStorage, path: &str) -> (FileRecord, IndexedFragment) {
@@ -78,6 +77,12 @@ fn directory_and_filename_filters_match_both_retrieval_collections() {
         (
             StoragePathFilter::FileNameSuffix(".rs".into()),
             vec![0, 1, 2, 4, 6, 7, 8],
+        ),
+        (
+            StoragePathFilter::Not(Box::new(StoragePathFilter::Not(Box::new(
+                StoragePathFilter::FileNameSuffix(".md".into()),
+            )))),
+            vec![5],
         ),
         (StoragePathFilter::FileNamePrefix("under_".into()), vec![6]),
         (
@@ -273,7 +278,6 @@ fn query_attributes_follow_replacement_failure_deletion_and_reopen() {
     let temporary = tempfile::tempdir().expect("workspace");
     let storage = open(temporary.path(), false);
     let (mut file, entry) = file_at(storage.as_ref(), "source.txt");
-    file.formats = vec![FileFormat::C, FileFormat::Cpp];
     file.snapshot.modified_epoch_ms = Some(0);
     storage.replace_file(&file, &[entry]).expect("write");
     assert_eq!(
@@ -281,7 +285,6 @@ fn query_attributes_follow_replacement_failure_deletion_and_reopen() {
         [StoredFileAttributes::from(&file)]
     );
 
-    file.formats = vec![FileFormat::Html];
     file.snapshot.modified_epoch_ms = None;
     storage
         .mark_file_failed(&file, "extractor failed")
@@ -504,7 +507,6 @@ fn fixture(
     let file = FileRecord {
         id,
         relative_path,
-        formats: vec![FileFormat::Text],
         snapshot: FileSnapshot {
             size_bytes: text.len() as u64,
             modified_epoch_ms: Some(1),
@@ -1347,7 +1349,11 @@ fn invalid_prepared_files_leave_the_writer_usable_and_readers_reject_preparation
         vec![1.0, 0.0, 0.0],
     );
     let mut invalid = file.clone();
-    invalid.formats.clear();
+    invalid.index_status = FileIndexStatus::Indexed {
+        indexed_epoch_ms: 1,
+        entity_count: 1,
+    };
+    invalid.snapshot.content_hash = None;
     assert!(
         storage
             .prepare_file_replacements(&[&file, &invalid])

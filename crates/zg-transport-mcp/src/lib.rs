@@ -32,14 +32,17 @@ use zg_engine::{
     api::{
         context::{
             ContextOptions, ContextResult,
-            options::{ContextRoute, ContextRouteMode, RefreshPolicy, SymbolType},
+            options::{
+                ContextRoute, ContextRouteMode, FileCategory, FileFormat, QueryFilter,
+                RefreshPolicy, SymbolType,
+            },
             result::{ContentRange, ContextItem, ContextItemStatus, MatchedBy},
         },
         index::{
             IndexOptions,
             options::{
-                Device, EmbeddingModelSpec, FileCategory, FileFilter, FileFilterUpdate, FileFormat,
-                GlobRule, ScanOptions, ScanOptionsUpdate, deserialize_optional_update,
+                Device, EmbeddingModelSpec, GlobRule, ScanRules, ScanRulesUpdate,
+                deserialize_optional_update,
             },
         },
         info::{
@@ -592,11 +595,13 @@ pub struct SearchInput {
     /// Ordered path glob rules; later matching rules take precedence.
     #[schemars(length(max = 128))]
     pub globs: Option<Vec<GlobInput>>,
-    /// Included engine file formats, such as rust or markdown.
+    /// Formats inferred from indexed file names, such as rust or markdown; source contents are not inspected.
     pub formats: Option<PathListInput>,
+    /// Exclude matching file-name formats, taking precedence over formats.
     pub excluded_formats: Option<PathListInput>,
-    /// Included engine file categories, such as code or document.
+    /// Categories inferred from indexed file names, such as code or document.
     pub categories: Option<PathListInput>,
+    /// Exclude matching file-name categories, taking precedence over categories.
     pub excluded_categories: Option<PathListInput>,
     /// Embedding requests processed concurrently during updates.
     #[schemars(range(min = 1))]
@@ -650,10 +655,6 @@ pub struct IndexInput {
     pub reset_paths: Option<bool>,
     #[schemars(length(max = 128))]
     pub globs: Option<Vec<GlobInput>>,
-    pub formats: Option<PathListInput>,
-    pub excluded_formats: Option<PathListInput>,
-    pub categories: Option<PathListInput>,
-    pub excluded_categories: Option<PathListInput>,
     pub hidden: Option<bool>,
     pub no_ignore: Option<bool>,
     /// Whether indexing scans nested Git repositories and submodules.
@@ -664,7 +665,7 @@ pub struct IndexInput {
     #[schemars(range(min = 1))]
     #[serde(default, deserialize_with = "deserialize_optional_update")]
     pub max_file_size_bytes: Option<Option<u64>>,
-    pub follow: Option<bool>,
+    pub follow_symlinks: Option<bool>,
     /// Embedding batch tasks processed concurrently during this update.
     #[schemars(range(min = 1))]
     pub embedding_concurrency: Option<usize>,
@@ -844,14 +845,6 @@ struct RootSpecOutput {
     recursive: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     globs: Vec<GlobInput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    formats: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    excluded_formats: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    categories: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    excluded_categories: Vec<String>,
     #[serde(skip_serializing_if = "is_false")]
     hidden: bool,
     #[serde(skip_serializing_if = "is_false")]
@@ -864,7 +857,7 @@ struct RootSpecOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_file_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "is_false")]
-    follow: bool,
+    follow_symlinks: bool,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -1128,8 +1121,7 @@ impl SearchInput {
             }),
             trace: self.trace.unwrap_or(false),
             prefer_symbol: self.prefer_symbol.unwrap_or(false),
-            symbol_types: self.symbol_types.into_iter().map(Into::into).collect(),
-            filter: FileFilter {
+            filter: QueryFilter {
                 globs: normalize_globs(self.globs)?.unwrap_or_default(),
                 formats: normalize_formats(self.formats, "formats")?.unwrap_or_default(),
                 excluded_formats: normalize_formats(self.excluded_formats, "excludedFormats")?
@@ -1141,17 +1133,22 @@ impl SearchInput {
                     "excludedCategories",
                 )?
                 .unwrap_or_default(),
+                modified_after_epoch_ms: parse_optional_time(self.modified_after, "modifiedAfter")?,
+                modified_before_epoch_ms: parse_optional_time(
+                    self.modified_before,
+                    "modifiedBefore",
+                )?,
+                symbol_types: self.symbol_types.into_iter().map(Into::into).collect(),
             },
-            modified_after_epoch_ms: parse_optional_time(self.modified_after, "modifiedAfter")?,
-            modified_before_epoch_ms: parse_optional_time(self.modified_before, "modifiedBefore")?,
             api_key: self.api_key,
             device: self.device.map(Into::into),
             embedding_concurrency: self.embedding_concurrency,
             ..ContextOptions::default()
         };
         if request
+            .filter
             .modified_after_epoch_ms
-            .zip(request.modified_before_epoch_ms)
+            .zip(request.filter.modified_before_epoch_ms)
             .is_some_and(|(after, before)| after > before)
         {
             return Err("modifiedAfter must not be later than modifiedBefore".to_owned());
@@ -1206,17 +1203,8 @@ impl IndexInput {
             return Err("device requires an explicit embedding model".to_owned());
         }
 
-        let filter = FileFilterUpdate {
+        let scan = ScanRulesUpdate {
             globs: normalize_globs(self.globs)?,
-            formats: normalize_formats(self.formats, "formats")?,
-            excluded_formats: normalize_formats(self.excluded_formats, "excludedFormats")?,
-            categories: normalize_categories(self.categories, "categories")?,
-            excluded_categories: normalize_categories(
-                self.excluded_categories,
-                "excludedCategories",
-            )?,
-        };
-        let scan = ScanOptionsUpdate {
             hidden: self.hidden,
             no_ignore: self.no_ignore,
             nested_git: self.nested_git,
@@ -1229,7 +1217,7 @@ impl IndexInput {
                 .transpose()?,
             max_depth: self.max_depth,
             max_file_size_bytes: self.max_file_size_bytes,
-            follow: self.follow,
+            follow_symlinks: self.follow_symlinks,
         };
         if let Some(paths) = &scan.ignore_files {
             validate_scoped_paths(&root, paths, "ignore file")?;
@@ -1253,7 +1241,6 @@ impl IndexInput {
                 name: self.name,
                 rebuild: self.rebuild.unwrap_or(false),
                 reset_paths: self.reset_paths.unwrap_or(false),
-                filter,
                 scan,
                 embedding,
                 api_key: self.api_key,
@@ -1274,17 +1261,13 @@ impl IndexInput {
             || self.rebuild.is_some()
             || self.reset_paths.is_some()
             || self.globs.is_some()
-            || self.formats.is_some()
-            || self.excluded_formats.is_some()
-            || self.categories.is_some()
-            || self.excluded_categories.is_some()
             || self.hidden.is_some()
             || self.no_ignore.is_some()
             || self.nested_git.is_some()
             || self.ignore_files.is_some()
             || self.max_depth.is_some()
             || self.max_file_size_bytes.is_some()
-            || self.follow.is_some()
+            || self.follow_symlinks.is_some()
             || self.embedding_concurrency.is_some()
             || self.debug.is_some()
             || self.wait.is_some()
@@ -1655,7 +1638,7 @@ impl From<InfoResult> for IndexStatusOutput {
         let workspace_index = reply.workspace_index.map(|info| WorkspaceIndexOutput {
             name: info.name,
             path: info.path.display().to_string(),
-            root_paths: vec![RootSpecOutput::new(&info.root, info.filter, info.scan)],
+            root_paths: vec![RootSpecOutput::new(&info.root, info.scan)],
             embedding: info.embedding.map(|embedding| IndexedEmbeddingOutput {
                 provider: embedding.provider,
                 model: embedding.model,
@@ -1766,31 +1749,11 @@ const fn index_job_state(state: IndexOperationState) -> IndexJobState {
 }
 
 impl RootSpecOutput {
-    fn new(root: &Path, filter: FileFilter, scan: ScanOptions) -> Self {
+    fn new(root: &Path, scan: ScanRules) -> Self {
         Self {
             absolute_path: root.display().to_string(),
             recursive: true,
-            globs: filter.globs.into_iter().map(Into::into).collect(),
-            formats: filter
-                .formats
-                .iter()
-                .map(|value| value.as_str().to_owned())
-                .collect(),
-            excluded_formats: filter
-                .excluded_formats
-                .iter()
-                .map(|value| value.as_str().to_owned())
-                .collect(),
-            categories: filter
-                .categories
-                .iter()
-                .map(|value| value.as_str().to_owned())
-                .collect(),
-            excluded_categories: filter
-                .excluded_categories
-                .iter()
-                .map(|value| value.as_str().to_owned())
-                .collect(),
+            globs: scan.globs.into_iter().map(Into::into).collect(),
             hidden: scan.hidden,
             no_ignore: scan.no_ignore,
             nested_git: scan.nested_git,
@@ -1801,7 +1764,7 @@ impl RootSpecOutput {
                 .collect(),
             max_depth: scan.max_depth,
             max_file_size_bytes: scan.max_file_size_bytes,
-            follow: scan.follow,
+            follow_symlinks: scan.follow_symlinks,
         }
     }
 }
@@ -2024,8 +1987,7 @@ mod tests {
                 name: "search-engine".to_owned(),
                 path: root.join(".zvec-grep"),
                 root,
-                filter: super::FileFilter::default(),
-                scan: super::ScanOptions::default(),
+                scan: super::ScanRules::default(),
                 policy: super::WorkspaceIndexPolicy::Enabled,
                 embedding: None,
                 fts: Some(zg_engine::api::info::result::WorkspaceIndexFts {
@@ -2121,7 +2083,7 @@ mod tests {
         let mut search = input();
         search.symbol_types = serde_json::from_value(types.clone()).expect("symbol types");
         let request = search.into_request().expect("all seven types should map");
-        assert_eq!(serde_json::json!(request.symbol_types), types);
+        assert_eq!(serde_json::json!(request.filter.symbol_types), types);
 
         let schema =
             serde_json::to_value(schemars::schema_for!(SearchInput)).expect("search schema");
@@ -2190,8 +2152,8 @@ mod tests {
     #[test]
     fn index_updates_preserve_omitted_empty_false_and_null_values() {
         let parsed: IndexInput = serde_json::from_value(serde_json::json!({
-            "root": test_root(), "globs": [], "formats": [], "categories": [],
-            "hidden": false, "follow": false, "nestedGit": false, "ignoreFiles": [],
+            "root": test_root(), "globs": [],
+            "hidden": false, "followSymlinks": false, "nestedGit": false, "ignoreFiles": [],
             "maxDepth": null, "maxFileSizeBytes": null
         }))
         .expect("valid test fixture");
@@ -2200,17 +2162,34 @@ mod tests {
         else {
             panic!("index");
         };
-        assert_eq!(options.filter.globs, Some(Vec::new()));
-        assert_eq!(options.filter.formats, Some(Vec::new()));
-        assert_eq!(options.filter.categories, Some(Vec::new()));
-        assert_eq!(options.filter.excluded_formats, None);
+        assert_eq!(options.scan.globs, Some(Vec::new()));
         assert_eq!(options.scan.hidden, Some(false));
-        assert_eq!(options.scan.follow, Some(false));
+        assert_eq!(options.scan.follow_symlinks, Some(false));
         assert_eq!(options.scan.nested_git, Some(false));
         assert_eq!(options.scan.no_ignore, None);
         assert_eq!(options.scan.ignore_files, Some(Vec::new()));
         assert_eq!(options.scan.max_depth, Some(None));
         assert_eq!(options.scan.max_file_size_bytes, Some(None));
+    }
+
+    #[test]
+    fn index_contract_rejects_query_only_format_and_category_filters() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(IndexInput)).expect("index input schema");
+        let output_schema = serde_json::to_value(schemars::schema_for!(super::RootSpecOutput))
+            .expect("scan status schema");
+        for (input_field, output_field) in [
+            ("formats", "formats"),
+            ("excludedFormats", "excluded_formats"),
+            ("categories", "categories"),
+            ("excludedCategories", "excluded_categories"),
+        ] {
+            let mut value = serde_json::json!({ "root": test_root() });
+            value[input_field] = serde_json::json!([]);
+            assert!(serde_json::from_value::<IndexInput>(value).is_err());
+            assert!(schema["properties"].get(input_field).is_none());
+            assert!(output_schema["properties"].get(output_field).is_none());
+        }
     }
 
     #[test]
@@ -2234,10 +2213,9 @@ mod tests {
             );
             let output = super::RootSpecOutput::new(
                 &test_root(),
-                super::FileFilter::default(),
-                super::ScanOptions {
+                super::ScanRules {
                     nested_git: value,
-                    ..super::ScanOptions::default()
+                    ..super::ScanRules::default()
                 },
             );
             assert_eq!(
@@ -2259,7 +2237,8 @@ mod tests {
         let parsed: SearchInput = serde_json::from_value(serde_json::json!({
             "root": test_root(), "query": "needle",
             "globs": [{"pattern": "*.RS", "caseInsensitive": true}, {"pattern": "!test.rs"}, {"pattern": " notes/** "}],
-            "formats": ["rust"], "categories": ["code"]
+            "formats": ["rust"], "categories": ["code"],
+            "modifiedAfter": 0, "modifiedBefore": 20, "symbolTypes": ["function"]
         }))
         .expect("valid test fixture");
         let request = parsed.into_request().expect("valid test fixture");
@@ -2269,6 +2248,13 @@ mod tests {
         assert_eq!(request.filter.globs[2].pattern, " notes/** ");
         assert_eq!(request.filter.formats[0].as_str(), "rust");
         assert_eq!(request.filter.categories[0].as_str(), "code");
+        assert_eq!(request.filter.modified_after_epoch_ms, Some(0));
+        assert_eq!(request.filter.modified_before_epoch_ms, Some(20));
+        assert_eq!(
+            request.filter.symbol_types,
+            vec![super::SymbolType::Function]
+        );
+        assert_eq!(request.rg_options.modified_after_epoch_ms, None);
         assert!(request.globs.is_empty() && request.file_types.is_empty());
         assert!(
             serde_json::from_value::<SearchInput>(serde_json::json!({
@@ -2295,7 +2281,7 @@ mod tests {
         assert!(debug);
         assert_eq!(request.root, Some(test_root()));
         assert_eq!(
-            request.filter.globs.as_ref().expect("valid test fixture")[0].pattern,
+            request.scan.globs.as_ref().expect("valid test fixture")[0].pattern,
             "*.rs"
         );
         assert_eq!(request.name.as_deref(), Some("search-engine"));
@@ -2418,17 +2404,13 @@ mod tests {
                 pattern: "*.rs".to_owned(),
                 case_insensitive: false,
             }]),
-            formats: None,
-            excluded_formats: None,
-            categories: None,
-            excluded_categories: None,
             hidden: None,
             no_ignore: None,
             nested_git: None,
             ignore_files: None,
             max_depth: None,
             max_file_size_bytes: None,
-            follow: None,
+            follow_symlinks: None,
             embedding_concurrency: Some(2),
             debug: Some(true),
             wait: Some(true),

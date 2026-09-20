@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn indexed_source_bytes_and_entity_counts_round_trip_without_truncation_fields() {
-        use zg_engine::api::index::options::{FileFilter, ScanOptions};
+        use zg_engine::api::index::options::ScanRules;
         use zg_engine::api::info::{
             InfoResult,
             result::{IndexStats, InfoSource, WorkspaceIndexInfo, WorkspaceIndexPolicy},
@@ -294,8 +294,7 @@ mod tests {
                 name: "search-engine".to_owned(),
                 path: "/workspace/.zvec-grep".into(),
                 root: "/workspace".into(),
-                filter: FileFilter::default(),
-                scan: ScanOptions::default(),
+                scan: ScanRules::default(),
                 policy: WorkspaceIndexPolicy::Enabled,
                 embedding: None,
                 fts: Some(zg_engine::api::info::result::WorkspaceIndexFts {

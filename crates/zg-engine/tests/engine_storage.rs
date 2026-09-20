@@ -18,7 +18,7 @@ use zg_engine::{
     api::{
         context::{
             ContextOptions,
-            options::{ContextRoute, ContextRouteMode, SymbolType},
+            options::{ContextRoute, ContextRouteMode, QueryFilter, SymbolType},
             result::{ContextItemStatus, EntityMetadata},
         },
         index::{IndexOptions, options::WorkspaceChange},
@@ -75,7 +75,10 @@ pub mod catalog {
                         mode,
                         query: "orchard".into(),
                     }],
-                    symbol_types: vec![symbol_type],
+                    filter: QueryFilter {
+                        symbol_types: vec![symbol_type],
+                        ..QueryFilter::default()
+                    },
                     limit: Some(30),
                     auto_update: false,
                     allow_remote: true,
@@ -587,7 +590,8 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
             .expect("recovered file payload"),
     )?;
     assert_eq!(recovered["version"], original["version"]);
-    for field in ["id", "relative_path", "formats", "snapshot"] {
+    assert!(recovered["value"].get("formats").is_none());
+    for field in ["id", "relative_path", "snapshot"] {
         assert_eq!(
             recovered["value"][field], original["value"][field],
             "recovery preserves {field}"
@@ -836,14 +840,7 @@ async fn version_four_requires_explicit_rebuild_to_version_five() -> TestResult 
     assert_ne!(after.index_path, before.index_path);
     assert!(!before.index_path.exists());
     let current: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-    for field in [
-        "name",
-        "root",
-        "filter",
-        "scan",
-        "embeddingRuntime",
-        "createdTime",
-    ] {
+    for field in ["name", "root", "scan", "embeddingRuntime", "createdTime"] {
         assert_eq!(current[field], old[field], "{field}");
     }
     assert_eq!(engine.index(index_options(root)).await?.files_unchanged, 2);

@@ -1,14 +1,13 @@
 use super::*;
 use crate::domain::{
-    CodeMetadata, Entity, FileFormat, FileIndexStatus, FileSnapshot, FragmentId, IndexField,
-    MarkdownMetadata, SourceRange, SymbolType, TextRange, WindowFragment,
+    CodeMetadata, Entity, FileIndexStatus, FileSnapshot, FragmentId, IndexField, MarkdownMetadata,
+    SourceRange, SymbolType, TextRange, WindowFragment,
 };
 
 fn file(id: u32, path: impl Into<PathBuf>) -> FileRecord {
     FileRecord {
         id: FileId::new(id),
         relative_path: crate::domain::SourcePath::new(path).expect("source path"),
-        formats: vec![FileFormat::Unknown],
         snapshot: FileSnapshot {
             size_bytes: 0,
             modified_epoch_ms: None,
@@ -21,6 +20,7 @@ fn file(id: u32, path: impl Into<PathBuf>) -> FileRecord {
 #[test]
 fn source_file_projection_preserves_paths_and_directory_membership_for_all_statuses() {
     super::super::backend::initialize().expect("initialize zvec");
+    assert!(!files_schema().expect("file schema").has_field("formats"));
     let directories = [DirectoryId::new(0), DirectoryId::new(1)];
     let mut source = file(12, Path::new("src").join("nested").join("name.rs"));
     source.snapshot.content_hash = Some("fixture-hash".into());
@@ -37,6 +37,7 @@ fn source_file_projection_preserves_paths_and_directory_membership_for_all_statu
         source.index_status = status;
         let doc = encode_file_doc(&source, &directories).expect("encode source");
         assert_eq!(doc.get_pk(), Some("f12"));
+        assert!(!doc.has_field("formats"));
         assert_eq!(
             string_field(&doc, "relative_path").expect("query path"),
             "src/nested/name.rs"
@@ -58,7 +59,7 @@ fn source_file_projection_preserves_paths_and_directory_membership_for_all_statu
 }
 
 #[test]
-fn query_projections_read_all_paths_formats_and_optional_times_without_decoding_payloads() {
+fn query_projections_read_all_paths_and_optional_times_without_decoding_payloads() {
     super::super::backend::initialize().expect("initialize zvec");
     let temporary = tempfile::tempdir().expect("temporary storage");
     let storage_path = temporary.path().join("storage");
@@ -88,11 +89,6 @@ fn query_projections_read_all_paths_formats_and_optional_times_without_decoding_
             u32::try_from(index).expect("ID"),
             format!("file-{index}.rs"),
         );
-        source.formats = if index % 2 == 0 {
-            vec![FileFormat::C, FileFormat::Cpp]
-        } else {
-            vec![FileFormat::Html]
-        };
         source.snapshot.modified_epoch_ms = match index % 3 {
             0 => None,
             1 => Some(0),
@@ -259,7 +255,6 @@ fn metadata_store(path: &Path) -> NativeStore {
 
 fn metadata_fragments(entity_id: &str, window_id: &str) -> (FileRecord, Vec<IndexedFragment>) {
     let mut source = file(0, "harvest.rs");
-    source.formats = vec![FileFormat::Rust];
     source.snapshot.size_bytes = 100;
     source.snapshot.content_hash = Some("fixture-hash".into());
     source.index_status = FileIndexStatus::Indexed {
@@ -763,4 +758,122 @@ fn maximum_u32_directory_id_survives_reopen_and_filters_both_retrieval_collectio
             .expect("u32 ancestors"),
         Some(vec![u32::MAX])
     );
+}
+
+#[test]
+fn filename_negation_emits_native_sql_with_literal_escaping() {
+    let temporary = tempfile::tempdir().expect("storage");
+    let store = metadata_store(temporary.path());
+    for (filter, expected) in [
+        (
+            StoragePathFilter::FileNamePrefix("main".into()),
+            "file_name NOT LIKE 'main%'",
+        ),
+        (
+            StoragePathFilter::FileNameSuffix(".rs".into()),
+            "file_name NOT LIKE '%%.rs'",
+        ),
+        (
+            StoragePathFilter::FileNamePrefix("under_".into()),
+            r"file_name NOT LIKE 'under\_%%'",
+        ),
+        (
+            StoragePathFilter::FileNameSuffix("%.rs".into()),
+            r"file_name NOT LIKE '%%\%.rs'",
+        ),
+        (
+            StoragePathFilter::FileNamePrefix(r"back\".into()),
+            r"file_name NOT LIKE 'back\\%%'",
+        ),
+        (
+            StoragePathFilter::FileNamePrefix("quote'".into()),
+            r"file_name NOT LIKE 'quote\'%'",
+        ),
+        (
+            StoragePathFilter::FileNameExact("main.rs".into()),
+            "file_name != 'main.rs'",
+        ),
+    ] {
+        assert_eq!(
+            path_filter(&store, &StoragePathFilter::Not(Box::new(filter)), false).expect("SQL"),
+            expected
+        );
+    }
+    let filter = StoragePathFilter::Not(Box::new(StoragePathFilter::Or(vec![
+        StoragePathFilter::FileNamePrefix("main".into()),
+        StoragePathFilter::Not(Box::new(StoragePathFilter::FileNameSuffix(".rs".into()))),
+    ])));
+    assert_eq!(
+        path_filter(&store, &filter, false).expect("boolean SQL"),
+        "(file_name NOT LIKE 'main%' AND file_name LIKE '%%.rs')"
+    );
+}
+
+#[test]
+fn filename_negation_preserves_native_results_or_errors_for_both_retrieval_routes() {
+    let temporary = tempfile::tempdir().expect("storage");
+    let store = metadata_store(temporary.path());
+    let (source, entries) = metadata_fragments("owner", "window");
+    store
+        .apply_replace(&source, &entries)
+        .expect("indexed source");
+    let mut fts = Fts::new().expect("FTS request");
+    fts.set_match_string("orchard").expect("query text");
+    for (path, sql) in [
+        (
+            StoragePathFilter::FileNamePrefix("absent".into()),
+            "file_name NOT LIKE 'absent%'",
+        ),
+        (
+            StoragePathFilter::FileNameSuffix(".rs".into()),
+            "file_name NOT LIKE '%%.rs'",
+        ),
+    ] {
+        let filter = StorageSearchFilter {
+            path: Some(StoragePathFilter::Not(Box::new(path))),
+            ..StorageSearchFilter::default()
+        };
+        let queries = [
+            (
+                SearchQuery::fts("text", &fts, 10).expect("native FTS query"),
+                &store.fragments,
+                StorageSearchPath::Fts,
+                "search full-text index",
+            ),
+            (
+                SearchQuery::new("embedding", &[1.0, 0.0, 0.0], 10).expect("native vector query"),
+                &store.vectors,
+                StorageSearchPath::Vector,
+                "search vector index",
+            ),
+        ];
+        for (mut query, collection, route, operation) in queries {
+            query.set_filter(sql).expect("native SQL");
+            query
+                .set_output_fields(&["document_id", "entity_id", "file_id"])
+                .expect("projection");
+            query.set_include_vector(false).expect("omit vectors");
+            let expected = collection.query(&query);
+            let actual = match route {
+                StorageSearchPath::Fts => store.search_fts("orchard", 10, Some(&filter)),
+                StorageSearchPath::Vector => {
+                    store.search_vector(&[1.0, 0.0, 0.0], 10, Some(&filter))
+                }
+            };
+            match expected {
+                Ok(docs) => {
+                    let expected = docs
+                        .iter()
+                        .map(|doc| decode_search_hit(doc, route).expect("native hit"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual.expect("native query succeeded"), expected);
+                }
+                Err(error) => {
+                    let actual = actual.expect_err("native query failed");
+                    assert_eq!(actual.code(), EngineError::STORAGE_FAILURE);
+                    assert_eq!(actual.message(), format!("zvec {operation}: {error}"));
+                }
+            }
+        }
+    }
 }

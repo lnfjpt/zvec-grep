@@ -30,7 +30,6 @@ const CONTEXT_GROUP_RRF_K: f64 = 60.0;
 #[derive(Clone, Debug)]
 pub(crate) struct NormalizedContextRequest {
     pub display_query: String,
-    pub rg_patterns: Vec<String>,
     pub routes: Vec<ContextRoute>,
     pub groups: Vec<NormalizedContextGroup>,
 }
@@ -51,9 +50,6 @@ pub(crate) fn normalize_context_request(
         .iter()
         .chain(&options.queries)
         .filter_map(|query| {
-            if options.rg {
-                return Some(query.clone());
-            }
             let query = query.trim();
             (!query.is_empty()).then(|| query.to_owned())
         })
@@ -75,10 +71,7 @@ pub(crate) fn normalize_context_request(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if primary_queries.is_empty()
-        && routes.is_empty()
-        && (!options.rg || options.rg_options.pattern_files.is_empty())
-    {
+    if primary_queries.is_empty() && routes.is_empty() {
         return Err(EngineError::invalid_argument(
             "context requires a non-empty query or route",
         ));
@@ -118,32 +111,18 @@ pub(crate) fn normalize_context_request(
         .iter()
         .flat_map(|group| group.routes.iter().cloned())
         .collect::<Vec<_>>();
-    let rg_patterns = primary_queries
-        .iter()
-        .cloned()
-        .chain(routes.iter().map(|route| route.query.clone()))
-        .collect::<Vec<_>>();
-    let display_query = if !primary_queries.is_empty() {
-        primary_queries.join(" | ")
-    } else if !routes.is_empty() {
+    let display_query = if primary_queries.is_empty() {
         routes
             .iter()
             .map(|route| route.query.as_str())
             .collect::<Vec<_>>()
             .join(" | ")
     } else {
-        options
-            .rg_options
-            .pattern_files
-            .iter()
-            .map(|path| format!("@{}", path.display()))
-            .collect::<Vec<_>>()
-            .join(" | ")
+        primary_queries.join(" | ")
     };
 
     Ok(NormalizedContextRequest {
         display_query,
-        rg_patterns,
         routes: all_routes,
         groups,
     })
@@ -187,10 +166,7 @@ pub(crate) async fn context_from_index(
                     limit: Some(limit),
                     trace: options.trace,
                     prefer_symbol: options.prefer_symbol,
-                    symbol_types: options.symbol_types.clone(),
                     filter: options.filter.clone(),
-                    modified_after_epoch_ms: options.modified_after_epoch_ms,
-                    modified_before_epoch_ms: options.modified_before_epoch_ms,
                 },
                 storage,
                 embedding_model,
@@ -671,11 +647,10 @@ mod tests {
     fn explicit_content_roles_preserve_source_and_window_provenance() {
         use crate::{
             domain::{
-                Content, Entity, EntityContent, EntityFragment, EntityId, FileFormat, FileId,
-                FileIndexStatus, FileRecord, FileSnapshot, FragmentId, SourceRange, TextRange,
-                WindowFragment,
+                Content, Entity, EntityContent, EntityFragment, EntityId, FileId, FileIndexStatus,
+                FileRecord, FileSnapshot, FragmentId, SourceRange, TextRange, WindowFragment,
             },
-            pipelines::search::pipeline::{SearchEvidence, SearchHit},
+            pipelines::indexed_search::pipeline::{SearchEvidence, SearchHit},
         };
 
         let file_id = FileId::new(1);
@@ -695,7 +670,6 @@ mod tests {
             file: FileRecord {
                 id: file_id,
                 relative_path: crate::domain::SourcePath::new("file.txt").expect("source path"),
-                formats: vec![FileFormat::Text],
                 snapshot: FileSnapshot {
                     size_bytes: 100,
                     modified_epoch_ms: None,
@@ -745,12 +719,11 @@ mod tests {
     fn resolves_context_paths_and_freshness_after_workspace_relocation() {
         use crate::{
             domain::{
-                Content, Entity, EntityContent, EntityId, FileFilter, FileFormat, FileId,
-                FileIndexStatus, FileRecord, FileSnapshot, IndexDescriptor, IndexState,
-                SourceRange, TextRange, Workspace,
+                Content, Entity, EntityContent, EntityId, FileId, FileIndexStatus, FileRecord,
+                FileSnapshot, IndexDescriptor, IndexState, SourceRange, TextRange, Workspace,
                 model::{EmbeddingModelInfo, Metric},
             },
-            pipelines::search::pipeline::{SearchHit, SearchPlanResult},
+            pipelines::indexed_search::pipeline::{SearchHit, SearchPlanResult},
             utils::sha256_hex,
         };
 
@@ -763,7 +736,6 @@ mod tests {
         let source = FileRecord {
             id: FileId::new(1),
             relative_path: crate::domain::SourcePath::new("src/file.txt").expect("source path"),
-            formats: vec![FileFormat::Text],
             snapshot: FileSnapshot {
                 size_bytes: content.len() as u64,
                 modified_epoch_ms: None,
@@ -808,7 +780,7 @@ mod tests {
         let mut workspace = Workspace {
             name: "workspace".to_owned(),
             root: original_root.clone(),
-            filter: FileFilter::default(),
+            scan: crate::domain::ScanRules::default(),
             index: IndexState::Enabled(IndexDescriptor {
                 fts: crate::domain::FTS_CONFIG,
                 embedding: EmbeddingModelInfo {
@@ -885,7 +857,6 @@ mod tests {
         .expect("normalized context request");
 
         assert_eq!(request.display_query, "alpha | beta");
-        assert_eq!(request.rg_patterns, ["alpha", "beta", "gamma"]);
         assert_eq!(request.groups.len(), 3);
         assert_eq!(request.groups[0].id, "Q1");
         assert_eq!(request.groups[0].role, ContextQueryGroupRole::Primary);

@@ -507,13 +507,9 @@ Embedding options:
   --embedding-concurrency <n>       Embedding task concurrency
   --allow-remote                    Allow Remote Embedding for this command only
 
-File selection:
+Scan rules:
   -g, --glob <glob>                 Include paths; prefix with ! to exclude; repeatable
   --iglob <glob>                    Case-insensitive path glob; repeatable
-  -t, --type <format>               Include an engine format, e.g. rust or markdown
-  -T, --type-not <format>           Exclude an engine format; repeatable
-  --category <category>             Include an engine category, e.g. code or document
-  --category-not <category>         Exclude a file category; repeatable
   --hidden[=true|false]              Include hidden paths except .git and .zvec-grep
   --no-ignore[=true|false]           Do not apply default or .gitignore rules
   --nested-git[=true|false]          Scan nested Git repositories and submodules
@@ -521,7 +517,7 @@ File selection:
   --max-depth <n>                   Maximum directory depth
   --max-filesize <size>             Maximum bytes or K/M/G/T size
   -L, --follow[=true|false]          Follow symbolic links safely
-  --reset-paths                     Clear inherited file-selection settings
+  --reset-paths                     Clear inherited scanning settings
 
 Interactive remote indexing asks to allow once, allow for this workspace, or
 cancel. Non-interactive indexing requires --allow-remote or a workspace grant.

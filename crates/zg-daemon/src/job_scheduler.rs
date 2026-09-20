@@ -16,10 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zg_engine::{
     EngineError, ErrorReport,
-    api::index::{
-        IndexOptions, IndexResult,
-        options::{FileFilterUpdate, ScanOptionsUpdate},
-    },
+    api::index::{IndexOptions, IndexResult, options::ScanRulesUpdate},
     api::info::InfoOptions,
 };
 
@@ -546,9 +543,7 @@ fn finish_job(inner: &Arc<SchedulerInner>, job: &Arc<ScheduledJob>) {
 }
 
 fn has_selection_update(options: &IndexOptions) -> bool {
-    options.reset_paths
-        || options.filter != FileFilterUpdate::default()
-        || options.scan != ScanOptionsUpdate::default()
+    options.reset_paths || options.scan != ScanRulesUpdate::default()
 }
 
 fn merge_options(current: &mut Option<IndexOptions>, mut incoming: IndexOptions) {
@@ -562,28 +557,17 @@ fn merge_options(current: &mut Option<IndexOptions>, mut incoming: IndexOptions)
     // A later reset discards earlier pending selection changes. Otherwise every
     // explicitly supplied field wins, including false, empty lists and null limits.
     if incoming.reset_paths {
-        current.filter = FileFilterUpdate::default();
-        current.scan = ScanOptionsUpdate::default();
+        current.scan = ScanRulesUpdate::default();
     }
     current.reset_paths |= incoming.reset_paths;
     current.rebuild |= incoming.rebuild;
-    merge_update(&mut current.filter.globs, incoming.filter.globs.take());
-    merge_update(&mut current.filter.formats, incoming.filter.formats.take());
-    merge_update(
-        &mut current.filter.excluded_formats,
-        incoming.filter.excluded_formats.take(),
-    );
-    merge_update(
-        &mut current.filter.categories,
-        incoming.filter.categories.take(),
-    );
-    merge_update(
-        &mut current.filter.excluded_categories,
-        incoming.filter.excluded_categories.take(),
-    );
+    merge_update(&mut current.scan.globs, incoming.scan.globs.take());
     merge_update(&mut current.scan.hidden, incoming.scan.hidden.take());
     merge_update(&mut current.scan.no_ignore, incoming.scan.no_ignore.take());
-    merge_update(&mut current.scan.follow, incoming.scan.follow.take());
+    merge_update(
+        &mut current.scan.follow_symlinks,
+        incoming.scan.follow_symlinks.take(),
+    );
     merge_update(
         &mut current.scan.nested_git,
         incoming.scan.nested_git.take(),
@@ -840,7 +824,7 @@ mod tests {
         EngineError,
         api::index::{
             IndexOptions, IndexResult,
-            options::{FileCategory, FileFilterUpdate, ScanOptionsUpdate, WorkspaceChange},
+            options::{ScanRulesUpdate, WorkspaceChange},
         },
     };
 
@@ -1090,14 +1074,10 @@ mod tests {
                 .submit(
                     root.clone(),
                     IndexOptions {
-                        filter: FileFilterUpdate {
+                        scan: ScanRulesUpdate {
                             globs: Some(vec!["*.rs".into()]),
-                            categories: Some(vec![FileCategory::Code]),
-                            ..Default::default()
-                        },
-                        scan: ScanOptionsUpdate {
                             hidden: Some(true),
-                            follow: Some(true),
+                            follow_symlinks: Some(true),
                             max_depth: Some(Some(3)),
                             ..Default::default()
                         },
@@ -1112,11 +1092,8 @@ mod tests {
                 .submit(
                     root.clone(),
                     IndexOptions {
-                        filter: FileFilterUpdate {
+                        scan: ScanRulesUpdate {
                             globs: Some(Vec::new()),
-                            ..Default::default()
-                        },
-                        scan: ScanOptionsUpdate {
                             hidden: Some(false),
                             max_depth: Some(None),
                             ..Default::default()
@@ -1159,12 +1136,9 @@ mod tests {
     }
 
     fn assert_merged_selection(applied: &IndexOptions) {
-        use zg_engine::api::index::options::FileCategory;
-
-        assert_eq!(applied.filter.globs, Some(Vec::new()));
-        assert_eq!(applied.filter.categories, Some(vec![FileCategory::Code]));
+        assert_eq!(applied.scan.globs, Some(Vec::new()));
         assert_eq!(applied.scan.hidden, Some(false));
-        assert_eq!(applied.scan.follow, Some(true));
+        assert_eq!(applied.scan.follow_symlinks, Some(true));
         assert_eq!(applied.scan.max_depth, Some(None));
         assert!(
             applied.changes.is_empty(),
@@ -1175,18 +1149,18 @@ mod tests {
     #[test]
     fn nested_git_updates_keep_false_and_omission_until_reset() {
         let mut pending = Some(IndexOptions {
-            scan: ScanOptionsUpdate {
+            scan: ScanRulesUpdate {
                 nested_git: Some(true),
-                ..ScanOptionsUpdate::default()
+                ..ScanRulesUpdate::default()
             },
             ..IndexOptions::default()
         });
         super::merge_options(
             &mut pending,
             IndexOptions {
-                scan: ScanOptionsUpdate {
+                scan: ScanRulesUpdate {
                     nested_git: Some(false),
-                    ..ScanOptionsUpdate::default()
+                    ..ScanRulesUpdate::default()
                 },
                 ..IndexOptions::default()
             },
@@ -1272,9 +1246,9 @@ mod tests {
         super::merge_options(
             &mut pending,
             IndexOptions {
-                filter: FileFilterUpdate {
+                scan: ScanRulesUpdate {
                     globs: Some(Vec::new()),
-                    ..FileFilterUpdate::default()
+                    ..ScanRulesUpdate::default()
                 },
                 embedding_concurrency: Some(8),
                 ..IndexOptions::default()
@@ -1294,19 +1268,16 @@ mod tests {
         assert_eq!(merged.device, Some(Device::Cpu));
         assert_eq!(merged.model_cache, Some("/models".into()));
         assert_eq!(merged.embedding_concurrency, Some(8));
-        assert_eq!(merged.filter.globs, Some(Vec::new()));
+        assert_eq!(merged.scan.globs, Some(Vec::new()));
     }
 
     #[test]
     fn a_later_reset_discards_pending_selection_updates_but_remains_pending_for_later_patches() {
-        use zg_engine::api::index::options::{FileFilterUpdate, ScanOptionsUpdate};
+        use zg_engine::api::index::options::ScanRulesUpdate;
 
         let mut pending = Some(IndexOptions {
-            filter: FileFilterUpdate {
+            scan: ScanRulesUpdate {
                 globs: Some(vec!["old/**".into()]),
-                ..Default::default()
-            },
-            scan: ScanOptionsUpdate {
                 hidden: Some(true),
                 max_depth: Some(Some(3)),
                 ..Default::default()
@@ -1317,8 +1288,8 @@ mod tests {
             &mut pending,
             IndexOptions {
                 reset_paths: true,
-                scan: ScanOptionsUpdate {
-                    follow: Some(false),
+                scan: ScanRulesUpdate {
+                    follow_symlinks: Some(false),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -1326,17 +1297,14 @@ mod tests {
         );
         let reset = pending.as_ref().expect("pending reset");
         assert!(reset.reset_paths);
-        assert_eq!(reset.filter, FileFilterUpdate::default());
+        assert_eq!(reset.scan.globs, None);
         assert_eq!(reset.scan.hidden, None);
         assert_eq!(reset.scan.max_depth, None);
         super::merge_options(
             &mut pending,
             IndexOptions {
-                filter: FileFilterUpdate {
+                scan: ScanRulesUpdate {
                     globs: Some(Vec::new()),
-                    ..Default::default()
-                },
-                scan: ScanOptionsUpdate {
                     max_depth: Some(None),
                     ..Default::default()
                 },
@@ -1345,8 +1313,8 @@ mod tests {
         );
         let update = pending.expect("pending update");
         assert!(update.reset_paths);
-        assert_eq!(update.filter.globs, Some(Vec::new()));
-        assert_eq!(update.scan.follow, Some(false));
+        assert_eq!(update.scan.globs, Some(Vec::new()));
+        assert_eq!(update.scan.follow_symlinks, Some(false));
         assert_eq!(update.scan.max_depth, Some(None));
     }
 

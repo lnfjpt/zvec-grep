@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{EngineError, EngineResult};
 
-use super::{format::FileFormat, path::SourcePath};
+use super::path::SourcePath;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct FileId(u32);
@@ -76,7 +76,6 @@ pub(crate) struct FileSnapshot {
 pub(crate) struct FileRecord {
     pub id: FileId,
     pub relative_path: SourcePath,
-    pub formats: Vec<FileFormat>,
     pub snapshot: FileSnapshot,
     pub index_status: FileIndexStatus,
 }
@@ -87,19 +86,6 @@ impl FileRecord {
         if self.index_status.is_indexed() && self.snapshot.content_hash.is_none() {
             return Err(EngineError::invalid_argument(format!(
                 "indexed files must have a content hash: {}",
-                self.relative_path.display()
-            )));
-        }
-        if self.formats.is_empty()
-            || (self.formats.len() > 1 && self.formats.contains(&FileFormat::Unknown))
-            || self
-                .formats
-                .iter()
-                .enumerate()
-                .any(|(index, format)| self.formats[..index].contains(format))
-        {
-            return Err(EngineError::invalid_argument(format!(
-                "source formats must be non-empty and unique; unknown must stand alone: {}",
                 self.relative_path.display()
             )));
         }

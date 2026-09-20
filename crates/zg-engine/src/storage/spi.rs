@@ -9,9 +9,7 @@ use async_trait::async_trait;
 
 use crate::{
     EngineError,
-    domain::{
-        Entity, EntityFragment, EntityId, FileFormat, FileId, FileRecord, SourcePath, SymbolType,
-    },
+    domain::{Entity, EntityFragment, EntityId, FileId, FileRecord, SourcePath, SymbolType},
 };
 
 pub(crate) type StorageResult<T> = Result<T, EngineError>;
@@ -54,7 +52,6 @@ pub(crate) struct StoredEntity {
 pub(crate) struct StoredFileAttributes {
     pub id: FileId,
     pub relative_path: PathBuf,
-    pub formats: Vec<FileFormat>,
     pub modified_epoch_ms: Option<u64>,
 }
 
@@ -63,7 +60,6 @@ impl From<&FileRecord> for StoredFileAttributes {
         Self {
             id: file.id,
             relative_path: file.relative_path.to_path_buf(),
-            formats: file.formats.clone(),
             modified_epoch_ms: file.snapshot.modified_epoch_ms,
         }
     }
@@ -148,7 +144,7 @@ pub(crate) trait WorkspaceIndexStorage: Send + Sync {
             .collect())
     }
 
-    /// Read stored formats and modification times without loading complete file records.
+    /// Read paths and modification times without loading complete file records.
     fn list_file_attributes(&self) -> StorageResult<Vec<StoredFileAttributes>> {
         Ok(self
             .list_files()?

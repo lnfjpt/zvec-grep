@@ -12,18 +12,19 @@ use support::{
     EmbeddingServer, configure_remote_model, index_options, info_options, native_file_records,
 };
 use zg_engine::{
-    ZvecGrep,
+    EngineError, ZvecGrep,
     api::{
         context::{
             ContextOptions,
-            options::{ContextRoute, ContextRouteMode},
+            options::{
+                ContextRoute, ContextRouteMode, FileCategory, FileFormat, QueryFilter, RgOptions,
+                SymbolType,
+            },
+            result::EntityMetadata,
         },
         index::{
             IndexOptions,
-            options::{
-                FileCategory, FileFilter, FileFilterUpdate, FileFormat, GlobRule, ScanOptions,
-                ScanOptionsUpdate,
-            },
+            options::{GlobRule, ScanRules, ScanRulesUpdate},
         },
     },
 };
@@ -60,7 +61,7 @@ async fn search_paths(
     engine: &ZvecGrep,
     root: &Path,
     mode: ContextRouteMode,
-    filter: FileFilter,
+    filter: QueryFilter,
 ) -> TestResult<BTreeSet<PathBuf>> {
     let result = engine
         .context(ContextOptions {
@@ -86,7 +87,7 @@ async fn search_paths(
 async fn assert_index_and_queries(
     engine: &ZvecGrep,
     root: &Path,
-    filter: &FileFilter,
+    filter: &QueryFilter,
     expected: &BTreeSet<PathBuf>,
 ) -> TestResult {
     let info = engine.info(info_options(root)).await?;
@@ -97,7 +98,7 @@ async fn assert_index_and_queries(
     );
     for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
         assert_eq!(
-            &search_paths(engine, root, mode, FileFilter::default()).await?,
+            &search_paths(engine, root, mode, QueryFilter::default()).await?,
             expected,
             "unfiltered {mode:?}"
         );
@@ -113,8 +114,9 @@ async fn assert_index_and_queries(
             .await?
             .workspace_index
             .expect("workspace")
-            .filter,
-        *filter,
+            .scan
+            .globs,
+        filter.globs,
         "query filters do not alter workspace configuration"
     );
     Ok(())
@@ -140,7 +142,7 @@ async fn ordered_globs_have_the_same_membership_during_indexing_and_both_query_r
             ("readme.md", "# orchard\n"),
         ],
     )?;
-    let filter = FileFilter {
+    let filter = QueryFilter {
         globs: vec![
             GlobRule {
                 pattern: "*.RS".into(),
@@ -151,14 +153,14 @@ async fn ordered_globs_have_the_same_membership_during_indexing_and_both_query_r
             "!blocked".into(),
             "blocked/keep.rs".into(),
         ],
-        ..FileFilter::default()
+        ..QueryFilter::default()
     };
     let engine = ZvecGrep::new();
     let indexed = engine
         .index(IndexOptions {
-            filter: FileFilterUpdate {
+            scan: ScanRulesUpdate {
                 globs: Some(filter.globs.clone()),
-                ..FileFilterUpdate::default()
+                ..ScanRulesUpdate::default()
             },
             ..index_options(root)
         })
@@ -198,20 +200,20 @@ async fn nested_git_roots_are_scanned_and_explicit_globs_override_ignore_rules()
     assert_index_and_queries(
         &engine,
         root,
-        &FileFilter::default(),
+        &QueryFilter::default(),
         &paths(&["plain.txt", "nested/child.txt"]),
     )
     .await?;
-    let filter = FileFilter {
+    let filter = QueryFilter {
         // A directory ignored by .gitignore must itself be explicitly included.
         globs: vec!["*.txt".into(), "ignored".into(), "ignored/**".into()],
-        ..FileFilter::default()
+        ..QueryFilter::default()
     };
     let indexed = engine
         .index(IndexOptions {
-            filter: FileFilterUpdate {
+            scan: ScanRulesUpdate {
                 globs: Some(filter.globs.clone()),
-                ..FileFilterUpdate::default()
+                ..ScanRulesUpdate::default()
             },
             ..index_options(root)
         })
@@ -260,7 +262,7 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
             ("submodule/.git", "gitdir: ../.git/modules/submodule\n"),
         ],
     )?;
-    let boundary_filter = FileFilter {
+    let boundary_filter = QueryFilter {
         globs: vec![
             "*.txt".into(),
             "nested".into(),
@@ -268,7 +270,7 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
             "submodule".into(),
             "submodule/**".into(),
         ],
-        ..FileFilter::default()
+        ..QueryFilter::default()
     };
     let outer = paths(&["plain.txt", "ordinary/keep.txt"]);
     let including_nested = paths(&[
@@ -280,14 +282,11 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
     let engine = ZvecGrep::new();
     let indexed = engine
         .index(IndexOptions {
-            filter: FileFilterUpdate {
+            scan: ScanRulesUpdate {
                 globs: Some(boundary_filter.globs.clone()),
-                ..FileFilterUpdate::default()
-            },
-            scan: ScanOptionsUpdate {
                 nested_git: Some(false),
                 no_ignore: Some(true),
-                ..ScanOptionsUpdate::default()
+                ..ScanRulesUpdate::default()
             },
             ..index_options(root)
         })
@@ -298,21 +297,18 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
 
     let indexed = engine
         .index(IndexOptions {
-            filter: FileFilterUpdate {
+            scan: ScanRulesUpdate {
                 globs: Some(Vec::new()),
-                ..FileFilterUpdate::default()
-            },
-            scan: ScanOptionsUpdate {
                 nested_git: Some(true),
                 no_ignore: Some(false),
-                ..ScanOptionsUpdate::default()
+                ..ScanRulesUpdate::default()
             },
             ..index_options(root)
         })
         .await?;
     assert_eq!((indexed.files_added, indexed.files_failed), (2, 0));
     // Entering a repository does not disable its ignore files or expose .git internals.
-    assert_index_and_queries(&engine, root, &FileFilter::default(), &including_nested).await?;
+    assert_index_and_queries(&engine, root, &QueryFilter::default(), &including_nested).await?;
     assert_eq!(engine.index(index_options(root)).await?.files_unchanged, 4);
     assert!(
         engine
@@ -342,19 +338,19 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
         })
         .await?;
     assert_eq!((rebuilt.files_added, rebuilt.files_failed), (4, 0));
-    assert_index_and_queries(&engine, root, &FileFilter::default(), &including_nested).await?;
+    assert_index_and_queries(&engine, root, &QueryFilter::default(), &including_nested).await?;
 
     let indexed = engine
         .index(IndexOptions {
-            scan: ScanOptionsUpdate {
+            scan: ScanRulesUpdate {
                 nested_git: Some(false),
-                ..ScanOptionsUpdate::default()
+                ..ScanRulesUpdate::default()
             },
             ..index_options(root)
         })
         .await?;
     assert_eq!((indexed.files_deleted, indexed.files_failed), (2, 0));
-    assert_index_and_queries(&engine, root, &FileFilter::default(), &outer).await?;
+    assert_index_and_queries(&engine, root, &QueryFilter::default(), &outer).await?;
     assert_eq!(engine.index(index_options(root)).await?.files_unchanged, 2);
     engine.close();
 
@@ -376,14 +372,18 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
         })
         .await?;
     assert_eq!((rebuilt.files_added, rebuilt.files_failed), (2, 0));
-    assert_index_and_queries(&engine, root, &FileFilter::default(), &outer).await?;
+    assert_index_and_queries(&engine, root, &QueryFilter::default(), &outer).await?;
     engine.drop_index(info_options(root)).await?;
     engine.close();
     Ok(())
 }
 
 #[tokio::test]
-async fn detected_formats_and_overlapping_categories_control_indexing_and_queries() -> TestResult {
+#[expect(
+    clippy::too_many_lines,
+    reason = "Verify filename filtering remains independent of extraction and source availability"
+)]
+async fn filename_formats_and_categories_filter_queries_without_limiting_indexing() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path();
     let server = EmbeddingServer::start()?;
@@ -404,84 +404,249 @@ async fn detected_formats_and_overlapping_categories_control_indexing_and_querie
             ("source.rs", "/// orchard\npub fn source() {}\n"),
         ],
     )?;
-    let filter = FileFilter {
-        formats: vec![
-            FileFormat::Python,
-            FileFormat::Rust,
-            FileFormat::Html,
-            FileFormat::Json,
-        ],
+    let filter = QueryFilter {
+        formats: vec![FileFormat::Python, FileFormat::Rust, FileFormat::Json],
         categories: vec![FileCategory::Code, FileCategory::Data],
-        excluded_categories: vec![FileCategory::Document],
-        ..FileFilter::default()
+        ..QueryFilter::default()
     };
     let engine = ZvecGrep::new();
-    let indexed = engine
-        .index(IndexOptions {
-            filter: FileFilterUpdate {
-                formats: Some(filter.formats.clone()),
-                categories: Some(filter.categories.clone()),
-                excluded_categories: Some(filter.excluded_categories.clone()),
-                ..FileFilterUpdate::default()
-            },
-            ..index_options(root)
-        })
-        .await?;
-    assert_eq!((indexed.files_added, indexed.files_failed), (3, 0));
+    let indexed = engine.index(index_options(root)).await?;
+    assert_eq!((indexed.files_added, indexed.files_failed), (5, 0));
     assert_index_and_queries(
         &engine,
         root,
-        &filter,
-        &paths(&["script", "settings.json", "source.rs"]),
+        &QueryFilter::default(),
+        &paths(&[
+            "script",
+            "page.html",
+            "note.md",
+            "settings.json",
+            "source.rs",
+        ]),
     )
     .await?;
-    let python = FileFilter {
-        formats: vec![FileFormat::Python],
-        ..FileFilter::default()
-    };
     for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
         assert_eq!(
-            search_paths(&engine, root, mode, python.clone()).await?,
-            paths(&["script"])
+            search_paths(&engine, root, mode, filter.clone()).await?,
+            paths(&["settings.json", "source.rs"])
         );
+    }
+    let python = QueryFilter {
+        formats: vec![FileFormat::Python],
+        ..QueryFilter::default()
+    };
+    for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
         assert!(
+            search_paths(&engine, root, mode, python.clone())
+                .await?
+                .is_empty(),
+            "a shebang helps extraction but does not change filename-based query filters"
+        );
+        assert_eq!(
             search_paths(
                 &engine,
                 root,
                 mode,
-                FileFilter {
+                QueryFilter {
                     categories: vec![FileCategory::Document],
-                    ..FileFilter::default()
+                    ..QueryFilter::default()
                 }
             )
-            .await?
-            .is_empty()
+            .await?,
+            paths(&["page.html", "note.md"])
         );
     }
+
     let info = engine.info(info_options(root)).await?;
     let files = native_file_records(&info.index_path)?;
     let script = files
         .iter()
         .find(|file| file["value"]["relative_path"]["value"] == "script")
         .expect("stored script");
-    assert_eq!(
-        script["value"]["formats"],
-        json!([FileFormat::Python as u16])
-    );
+    assert!(script["value"].get("formats").is_none());
 
     fs::write(
         root.join("script"),
         "orchard is now a plain text document with no shebang",
     )?;
     let updated = engine.index(index_options(root)).await?;
-    assert_eq!((updated.files_deleted, updated.files_failed), (1, 0));
+    assert_eq!(
+        (
+            updated.files_modified,
+            updated.files_deleted,
+            updated.files_failed
+        ),
+        (1, 0, 0)
+    );
+    let files = native_file_records(&info.index_path)?;
+    let script = files
+        .iter()
+        .find(|file| file["value"]["relative_path"]["value"] == "script")
+        .expect("reclassified script stays indexed");
+    assert!(script["value"].get("formats").is_none());
     assert_index_and_queries(
         &engine,
         root,
-        &filter,
-        &paths(&["settings.json", "source.rs"]),
+        &QueryFilter::default(),
+        &paths(&[
+            "script",
+            "page.html",
+            "note.md",
+            "settings.json",
+            "source.rs",
+        ]),
     )
     .await?;
+    for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
+        assert_eq!(
+            search_paths(&engine, root, mode, filter.clone()).await?,
+            paths(&["settings.json", "source.rs"])
+        );
+        assert!(
+            search_paths(&engine, root, mode, python.clone())
+                .await?
+                .is_empty()
+        );
+    }
+    fs::remove_file(root.join("source.rs"))?;
+    for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
+        assert_eq!(
+            search_paths(
+                &engine,
+                root,
+                mode,
+                QueryFilter {
+                    formats: vec![FileFormat::Rust],
+                    ..QueryFilter::default()
+                },
+            )
+            .await?,
+            paths(&["source.rs"]),
+            "format filtering uses the stored filename without reading the missing source"
+        );
+    }
+    engine.drop_index(info_options(root)).await?;
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Compare native filename predicates and error propagation through both public query routes"
+)]
+async fn catalog_name_predicates_filter_both_native_search_routes() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(root, server.address)?;
+    let sources = [
+        ("main.rs", "/// orchard\npub fn main() {}\n"),
+        ("upper.RS", "orchard\n"),
+        ("tsconfig.json", "{\"orchard\": true}\n"),
+        ("CMakeLists.txt", "# orchard\nproject(orchard)\n"),
+        ("notes.txt", "orchard\n"),
+        ("script", "orchard\n"),
+        ("header.h", "/// orchard\nint orchard(void);\n"),
+    ];
+    write_sources(root, &sources)?;
+    let engine = ZvecGrep::new();
+    let indexed = engine.index(index_options(root)).await?;
+    assert_eq!(
+        (indexed.files_added, indexed.files_failed),
+        (sources.len(), 0)
+    );
+    for (name, _) in sources {
+        fs::remove_file(root.join(name))?;
+    }
+    let cases = [
+        (
+            QueryFilter {
+                formats: vec![FileFormat::Rust],
+                ..Default::default()
+            },
+            vec!["main.rs"],
+        ),
+        (
+            QueryFilter {
+                formats: vec![FileFormat::Text],
+                ..Default::default()
+            },
+            vec!["notes.txt"],
+        ),
+        (
+            QueryFilter {
+                formats: vec![FileFormat::Cmake],
+                ..Default::default()
+            },
+            vec!["CMakeLists.txt"],
+        ),
+        (
+            QueryFilter {
+                formats: vec![FileFormat::Json],
+                categories: vec![FileCategory::Code],
+                ..Default::default()
+            },
+            vec!["tsconfig.json"],
+        ),
+    ];
+    for (filter, expected) in cases {
+        for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
+            assert_eq!(
+                search_paths(&engine, root, mode, filter.clone()).await?,
+                paths(&expected),
+                "{mode:?}: {filter:?}"
+            );
+        }
+    }
+
+    // Negated suffixes are delegated to zvec. Compare with the native query so
+    // this also verifies the results when zvec adds support for NOT LIKE.
+    let info = engine.info(info_options(root)).await?;
+    let mut options = zvec_rust::CollectionOptions::new()?;
+    options.set_read_only(true)?;
+    let collection = zvec_rust::Collection::open(
+        info.index_path.join("files").to_str().expect("UTF-8 path"),
+        Some(&options),
+    )?;
+    let mut query = zvec_rust::SearchQuery::scalar(64)?;
+    query.set_filter("(file_name NOT LIKE '%%.rs' OR file_name = '.rs')")?;
+    let native_result = collection.query(&query);
+    collection.close()?;
+    for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
+        let result = search_paths(
+            &engine,
+            root,
+            mode,
+            QueryFilter {
+                excluded_formats: vec![FileFormat::Rust],
+                ..Default::default()
+            },
+        )
+        .await;
+        match &native_result {
+            Ok(_) => assert_eq!(
+                result?,
+                paths(&[
+                    "upper.RS",
+                    "tsconfig.json",
+                    "CMakeLists.txt",
+                    "notes.txt",
+                    "script",
+                    "header.h",
+                ])
+            ),
+            Err(native_error) => {
+                let error = result.expect_err("native query failure must reach the caller");
+                let error = error.downcast_ref::<EngineError>().expect("engine error");
+                assert_eq!(error.code(), EngineError::STORAGE_FAILURE);
+                assert!(
+                    error.message().contains(&native_error.to_string()),
+                    "{error}"
+                );
+            }
+        }
+    }
     engine.drop_index(info_options(root)).await?;
     engine.close();
     Ok(())
@@ -512,20 +677,15 @@ async fn explicit_empty_false_and_null_updates_persist_and_survive_rebuild() -> 
     let engine = ZvecGrep::new();
     let initial = engine
         .index(IndexOptions {
-            filter: FileFilterUpdate {
+            scan: ScanRulesUpdate {
                 globs: Some(vec!["*.txt".into()]),
-                formats: Some(vec![FileFormat::Text]),
-                categories: Some(vec![FileCategory::Document]),
-                ..FileFilterUpdate::default()
-            },
-            scan: ScanOptionsUpdate {
                 hidden: Some(true),
                 no_ignore: Some(true),
-                follow: Some(true),
+                follow_symlinks: Some(true),
                 ignore_files: Some(vec![PathBuf::from(".customignore")]),
                 max_depth: Some(Some(1)),
                 max_file_size_bytes: Some(Some(40)),
-                ..ScanOptionsUpdate::default()
+                ..ScanRulesUpdate::default()
             },
             ..index_options(root)
         })
@@ -544,19 +704,16 @@ async fn explicit_empty_false_and_null_updates_persist_and_survive_rebuild() -> 
         .await?
         .workspace_index
         .expect("workspace");
-    assert_eq!(unchanged.filter, before.filter);
     assert_eq!(unchanged.scan, before.scan);
     assert_eq!(server.requests.load(Ordering::Acquire), requests);
     assert_eq!(server.inputs.load(Ordering::Acquire), inputs);
 
-    let filter: FileFilterUpdate = serde_json::from_value(json!({"globs": [], "formats": []}))?;
-    let scan: ScanOptionsUpdate = serde_json::from_value(json!({
-        "hidden": false, "no_ignore": false, "follow": false,
+    let scan: ScanRulesUpdate = serde_json::from_value(json!({
+        "globs": [], "hidden": false, "no_ignore": false, "follow_symlinks": false,
         "ignore_files": [], "max_depth": null, "max_file_size_bytes": null
     }))?;
     let updated = engine
         .index(IndexOptions {
-            filter,
             scan,
             ..index_options(root)
         })
@@ -569,10 +726,7 @@ async fn explicit_empty_false_and_null_updates_persist_and_survive_rebuild() -> 
         ),
         (2, 2, 0)
     );
-    let expected_filter = FileFilter {
-        categories: vec![FileCategory::Document],
-        ..FileFilter::default()
-    };
+    let expected_filter = QueryFilter::default();
     let expected_paths = paths(&["normal.txt", "large.txt", "deep/nested.md"]);
     assert_index_and_queries(&engine, root, &expected_filter, &expected_paths).await?;
     engine.close();
@@ -580,13 +734,12 @@ async fn explicit_empty_false_and_null_updates_persist_and_survive_rebuild() -> 
     let engine = ZvecGrep::new();
     let info = engine.info(info_options(root)).await?;
     let reopened = info.workspace_index.expect("reopened workspace");
-    assert_eq!(reopened.filter, expected_filter);
-    assert_eq!(reopened.scan, ScanOptions::default());
+    assert_eq!(reopened.scan, ScanRules::default());
     let manifest: Value = serde_json::from_slice(&fs::read(info.home.join("manifest.json"))?)?;
-    assert_eq!(manifest["filter"], serde_json::to_value(&expected_filter)?);
+    assert!(manifest.get("filter").is_none());
     assert_eq!(
         manifest["scan"],
-        serde_json::to_value(ScanOptions::default())?
+        serde_json::to_value(ScanRules::default())?
     );
     let rebuilt = engine
         .index(IndexOptions {
@@ -602,9 +755,107 @@ async fn explicit_empty_false_and_null_updates_persist_and_survive_rebuild() -> 
             .workspace_index
             .expect("rebuilt workspace")
             .scan,
-        ScanOptions::default()
+        ScanRules::default()
     );
     assert_index_and_queries(&engine, root, &expected_filter, &expected_paths).await?;
+    engine.drop_index(info_options(root)).await?;
+    engine.close();
+    Ok(())
+}
+
+fn set_modified(path: &Path, millis: u64) -> std::io::Result<()> {
+    fs::File::options().write(true).open(path)?.set_times(
+        fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)),
+    )
+}
+
+#[tokio::test]
+async fn query_filters_combine_without_changing_saved_scan_rules() -> TestResult {
+    const OLD: u64 = 1_700_000_000_000;
+    const INDEXED: u64 = OLD + 10_000;
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(root, server.address)?;
+    fs::create_dir(root.join("src"))?;
+    fs::write(root.join("src/old.rs"), "/// orchard\npub fn old() {}\n")?;
+    fs::write(
+        root.join("src/current.rs"),
+        "/// orchard\npub fn current() {}\n/// orchard\npub struct Record;\n",
+    )?;
+    fs::write(root.join("src/readme.md"), "# orchard\n")?;
+    set_modified(&root.join("src/old.rs"), OLD)?;
+    set_modified(&root.join("src/current.rs"), INDEXED)?;
+    set_modified(&root.join("src/readme.md"), INDEXED)?;
+
+    let engine = ZvecGrep::new();
+    engine
+        .index(IndexOptions {
+            scan: ScanRulesUpdate {
+                globs: Some(vec!["src/**".into()]),
+                ..ScanRulesUpdate::default()
+            },
+            ..index_options(root)
+        })
+        .await?;
+    let before = engine.info(info_options(root)).await?.workspace_index;
+
+    // A query must use stored timestamps even if source metadata has since changed.
+    set_modified(&root.join("src/current.rs"), INDEXED + 10_000)?;
+    for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
+        let result = engine
+            .context(ContextOptions {
+                root: Some(root.to_path_buf()),
+                routes: vec![ContextRoute {
+                    mode,
+                    query: "orchard".into(),
+                }],
+                filter: QueryFilter {
+                    globs: vec!["src/**".into()],
+                    formats: vec![FileFormat::Rust],
+                    modified_after_epoch_ms: Some(INDEXED),
+                    modified_before_epoch_ms: Some(INDEXED),
+                    symbol_types: vec![SymbolType::Function],
+                    ..QueryFilter::default()
+                },
+                auto_update: false,
+                allow_remote: true,
+                ..ContextOptions::default()
+            })
+            .await?;
+        assert!(
+            !result.items.is_empty(),
+            "{mode:?} must match the stored snapshot"
+        );
+        assert!(result.items.iter().all(|item| {
+            item.relative_path == Path::new("src/current.rs")
+                && matches!(&item.metadata, Some(EntityMetadata::Code(metadata))
+                    if metadata.symbol_type == Some(SymbolType::Function))
+        }));
+    }
+    let direct = engine
+        .context(ContextOptions {
+            root: Some(root.to_path_buf()),
+            rg: true,
+            query: Some("orchard".into()),
+            rg_paths: vec!["src/current.rs".into()],
+            rg_options: RgOptions {
+                modified_after_epoch_ms: Some(INDEXED),
+                modified_before_epoch_ms: Some(INDEXED),
+                ..RgOptions::default()
+            },
+            ..ContextOptions::default()
+        })
+        .await?;
+    assert!(
+        direct.items.is_empty(),
+        "direct search uses the current filesystem time"
+    );
+    assert_eq!(
+        engine.info(info_options(root)).await?.workspace_index,
+        before
+    );
     engine.drop_index(info_options(root)).await?;
     engine.close();
     Ok(())

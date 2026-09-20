@@ -153,7 +153,7 @@ mod tests {
                 query: "vector".into(),
             }],
             limit: Some(7),
-            filter: zg_engine::api::index::options::FileFilter {
+            filter: zg_engine::api::context::options::QueryFilter {
                 globs: vec!["*.rs".into()],
                 ..Default::default()
             },

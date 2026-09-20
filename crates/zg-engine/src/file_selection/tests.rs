@@ -5,8 +5,22 @@ use std::{
 
 use zg_host_native::{NativeScanner, PathPolicy, ScanRequest, TaskControl, WorkspaceScannerPort};
 
-use super::{FileMatcher, ScanOptions, ScanPolicy};
-use crate::domain::{FileCategory, FileFilter, FileFormat, GlobRule};
+use super::{GlobMatcher, ScanPolicy};
+use crate::domain::{GlobRule, ScanRules};
+
+fn make_policy(
+    root: &Path,
+    globs: &[GlobRule],
+    options: &ScanRules,
+) -> crate::EngineResult<ScanPolicy> {
+    ScanPolicy::new(
+        root,
+        &ScanRules {
+            globs: globs.to_vec(),
+            ..options.clone()
+        },
+    )
+}
 
 fn write(root: &Path, path: &str, text: &str) {
     let path = root.join(path);
@@ -16,14 +30,23 @@ fn write(root: &Path, path: &str, text: &str) {
 
 async fn scan(
     root: &Path,
-    filter: &FileFilter,
-    options: &ScanOptions,
+    globs: &[GlobRule],
+    options: &ScanRules,
     scope: Vec<PathBuf>,
 ) -> Vec<PathBuf> {
     let snapshot = NativeScanner::new()
         .discover(
             &ScanRequest {
-                roots: vec![ScanPolicy::root_spec(root, filter, options).expect("policy")],
+                roots: vec![
+                    ScanPolicy::root_spec(
+                        root,
+                        &ScanRules {
+                            globs: globs.to_vec(),
+                            ..options.clone()
+                        },
+                    )
+                    .expect("policy"),
+                ],
                 scope_paths: scope,
             },
             &TaskControl::default(),
@@ -53,9 +76,9 @@ async fn scan_and_query_use_identical_ordered_path_rules() {
     for path in paths {
         write(root, path, "example");
     }
-    let options = ScanOptions {
+    let options = ScanRules {
         no_ignore: true,
-        ..ScanOptions::default()
+        ..ScanRules::default()
     };
     let cases = [
         vec!["*.rs".into()],
@@ -77,11 +100,7 @@ async fn scan_and_query_use_identical_ordered_path_rules() {
         ],
     ];
     for globs in cases {
-        let filter = FileFilter {
-            globs,
-            ..FileFilter::default()
-        };
-        let matcher = FileMatcher::new(root, &filter).expect("matcher");
+        let matcher = GlobMatcher::new(root, &globs).expect("matcher");
         let mut expected: Vec<_> = paths
             .iter()
             .map(PathBuf::from)
@@ -89,10 +108,9 @@ async fn scan_and_query_use_identical_ordered_path_rules() {
             .collect();
         expected.sort();
         assert_eq!(
-            scan(root, &filter, &options, vec![]).await,
+            scan(root, &globs, &options, vec![]).await,
             expected,
-            "{:?}",
-            filter.globs
+            "{globs:?}"
         );
     }
 }
@@ -104,19 +122,16 @@ async fn nested_repositories_are_selected_and_metadata_is_never_scanned() {
     write(root, "nested/.git/config", "git metadata");
     write(root, "nested/code.rs", "fn main() {}");
     write(root, "nested/.zvec-grep/state.rs", "index metadata");
-    let filter = FileFilter {
-        globs: vec!["nested/**".into()],
-        ..FileFilter::default()
-    };
+    let globs = vec!["nested/**".into()];
     for no_ignore in [false, true] {
         assert_eq!(
             scan(
                 root,
-                &filter,
-                &ScanOptions {
+                &globs,
+                &ScanRules {
                     no_ignore,
                     hidden: true,
-                    ..ScanOptions::default()
+                    ..ScanRules::default()
                 },
                 vec![]
             )
@@ -134,32 +149,21 @@ async fn explicit_globs_override_ignores_but_scope_cannot_bypass_excluded_parent
     write(root, "nested/.git/config", "metadata");
     write(root, "nested/code.rs", "fn main() {}");
     assert!(
-        scan(
-            root,
-            &FileFilter::default(),
-            &ScanOptions::default(),
-            vec![]
-        )
-        .await
-        .is_empty()
+        scan(root, &[], &ScanRules::default(), vec![])
+            .await
+            .is_empty()
     );
-    let filter = FileFilter {
-        globs: vec!["nested".into(), "nested/**".into()],
-        ..FileFilter::default()
-    };
+    let globs = vec!["nested".into(), "nested/**".into()];
     assert_eq!(
-        scan(root, &filter, &ScanOptions::default(), vec![]).await,
+        scan(root, &globs, &ScanRules::default(), vec![]).await,
         vec![PathBuf::from("nested/code.rs")]
     );
-    let filter = FileFilter {
-        globs: vec!["!nested".into(), "nested/code.rs".into()],
-        ..FileFilter::default()
-    };
+    let globs = vec!["!nested".into(), "nested/code.rs".into()];
     assert!(
         scan(
             root,
-            &filter,
-            &ScanOptions::default(),
+            &globs,
+            &ScanRules::default(),
             vec![root.join("nested/code.rs")]
         )
         .await
@@ -177,28 +181,25 @@ async fn nested_git_switch_prunes_directory_and_file_markers_including_increment
     write(root, "nested/code.rs", "nested source");
     write(root, "module/.git", "gitdir: ../.git/modules/module\n");
     write(root, "module/code.rs", "submodule source");
-    let filter = FileFilter {
-        globs: vec!["**".into()],
-        ..FileFilter::default()
-    };
-    let mut options = ScanOptions {
+    let globs = vec!["**".into()];
+    let mut options = ScanRules {
         nested_git: false,
         no_ignore: true,
         hidden: true,
-        ..ScanOptions::default()
+        ..ScanRules::default()
     };
     assert_eq!(
-        scan(root, &filter, &options, vec![]).await,
+        scan(root, &globs, &options, vec![]).await,
         vec![PathBuf::from("main.rs")]
     );
     assert!(
-        scan(root, &filter, &options, vec![root.join("module/code.rs")])
+        scan(root, &globs, &options, vec![root.join("module/code.rs")])
             .await
             .is_empty()
     );
     options.nested_git = true;
     assert_eq!(
-        scan(root, &filter, &options, vec![]).await,
+        scan(root, &globs, &options, vec![]).await,
         vec![
             PathBuf::from("main.rs"),
             PathBuf::from("module/code.rs"),
@@ -213,12 +214,12 @@ fn repository_marker_changes_reconcile_membership_without_affecting_workspace_ro
     let root = temporary.path();
     write(root, ".git/config", "workspace metadata");
     write(root, "module/code.rs", "source");
-    let policy = ScanPolicy::new(
+    let policy = make_policy(
         root,
-        &FileFilter::default(),
-        &ScanOptions {
+        &[],
+        &ScanRules {
             nested_git: false,
-            ..ScanOptions::default()
+            ..ScanRules::default()
         },
     )
     .expect("policy");
@@ -271,15 +272,12 @@ fn repository_marker_changes_reconcile_membership_without_affecting_workspace_ro
             .can_descend(&root.join("module"))
             .expect("directory marker pruned")
     );
-    let excluded = ScanPolicy::new(
+    let excluded = make_policy(
         root,
-        &FileFilter {
-            globs: vec!["!module".into()],
-            ..FileFilter::default()
-        },
-        &ScanOptions {
+        &["!module".into()],
+        &ScanRules {
             nested_git: false,
-            ..ScanOptions::default()
+            ..ScanRules::default()
         },
     )
     .expect("excluded policy");
@@ -292,25 +290,11 @@ fn repository_marker_changes_reconcile_membership_without_affecting_workspace_ro
 }
 
 #[test]
-fn multi_category_selection_uses_detected_formats_and_exclusions_win() {
-    let filter = FileFilter {
-        categories: vec![FileCategory::Code],
-        excluded_categories: vec![FileCategory::Document],
-        ..FileFilter::default()
-    };
-    let matcher = FileMatcher::new(Path::new("/workspace"), &filter).expect("matcher");
-    assert!(matcher.matches_formats(&[FileFormat::Rust]));
-    assert!(!matcher.matches_formats(&[FileFormat::Html]));
-    assert!(!matcher.matches_formats(&[FileFormat::Markdown]));
-}
-
-#[test]
 fn ignore_control_changes_invalidate_rules_even_when_not_selected() {
     let temporary = tempfile::tempdir().expect("workspace");
     let root = temporary.path();
     write(root, ".gitignore", "blocked/\n");
-    let policy =
-        ScanPolicy::new(root, &FileFilter::default(), &ScanOptions::default()).expect("policy");
+    let policy = make_policy(root, &[], &ScanRules::default()).expect("policy");
     assert!(!policy.can_descend(&root.join("blocked")).expect("excluded"));
     write(root, ".gitignore", "");
     assert_eq!(
@@ -322,12 +306,12 @@ fn ignore_control_changes_invalidate_rules_even_when_not_selected() {
     assert!(policy.can_descend(&root.join("blocked")).expect("included"));
     let external = tempfile::NamedTempFile::new().expect("external rules");
     fs::write(external.path(), "blocked/\n").expect("rules");
-    let policy = ScanPolicy::new(
+    let policy = make_policy(
         root,
-        &FileFilter::default(),
-        &ScanOptions {
+        &[],
+        &ScanRules {
             ignore_files: vec![external.path().to_path_buf()],
-            ..ScanOptions::default()
+            ..ScanRules::default()
         },
     )
     .expect("policy");
@@ -349,26 +333,14 @@ fn ignore_control_changes_invalidate_rules_even_when_not_selected() {
 
 #[test]
 fn adversarial_globs_are_bounded_and_do_not_use_backtracking_regex() {
-    let filter = FileFilter {
-        globs: vec![format!("{}Z", "**".repeat(20)).into()],
-        ..FileFilter::default()
-    };
-    let matcher = FileMatcher::new(Path::new("/workspace"), &filter).expect("bounded glob");
+    let globs = vec![format!("{}Z", "**".repeat(20)).into()];
+    let matcher = GlobMatcher::new(Path::new("/workspace"), &globs).expect("bounded glob");
     assert!(!matcher.matches_path(Path::new("src/authorization/operation.ts")));
     for globs in [
         vec!["x".repeat(4_097).into()],
         vec![GlobRule::from("*.rs"); 1_025],
     ] {
-        assert!(
-            FileMatcher::new(
-                Path::new("/workspace"),
-                &FileFilter {
-                    globs,
-                    ..FileFilter::default()
-                }
-            )
-            .is_err()
-        );
+        assert!(GlobMatcher::new(Path::new("/workspace"), &globs).is_err());
     }
 }
 
@@ -377,8 +349,7 @@ fn reconciliation_refreshes_ignore_rules_after_a_missed_deletion_event() {
     let temporary = tempfile::tempdir().expect("workspace");
     let root = temporary.path();
     write(root, "src/.gitignore", "blocked/\n");
-    let policy =
-        ScanPolicy::new(root, &FileFilter::default(), &ScanOptions::default()).expect("policy");
+    let policy = make_policy(root, &[], &ScanRules::default()).expect("policy");
     assert!(
         !policy
             .can_descend(&root.join("src/blocked"))
@@ -409,8 +380,7 @@ fn large_ignore_files_fail_explicitly_instead_of_unbounded_compilation() {
     let temporary = tempfile::tempdir().expect("workspace");
     let root = temporary.path();
     write(root, ".gitignore", &"*".repeat(1_048_577));
-    let policy =
-        ScanPolicy::new(root, &FileFilter::default(), &ScanOptions::default()).expect("policy");
+    let policy = make_policy(root, &[], &ScanRules::default()).expect("policy");
     let error = policy
         .includes_file(&root.join("main.rs"))
         .expect_err("oversized rules");
@@ -424,13 +394,13 @@ fn external_ignore_aliases_match_canonical_change_events() {
     let root = base.join("workspace");
     fs::create_dir(&root).expect("workspace");
     write(&base, "rules.ignore", "blocked/\n");
-    let policy = ScanPolicy::new(
+    let policy = make_policy(
         &root,
-        &FileFilter::default(),
-        &ScanOptions {
+        &[],
+        &ScanRules {
             no_ignore: true,
             ignore_files: vec![PathBuf::from("../rules.ignore")],
-            ..ScanOptions::default()
+            ..ScanRules::default()
         },
     )
     .expect("policy");
@@ -460,12 +430,12 @@ fn ignore_symlinks_watch_alias_and_target_and_refresh_after_retargeting() {
     let first = base.join("first/rules");
     let second = base.join("second/rules");
     std::os::unix::fs::symlink(&first, &alias).expect("link rules");
-    let policy = ScanPolicy::new(
+    let policy = make_policy(
         &root,
-        &FileFilter::default(),
-        &ScanOptions {
+        &[],
+        &ScanRules {
             ignore_files: vec![alias.clone()],
-            ..ScanOptions::default()
+            ..ScanRules::default()
         },
     )
     .expect("policy");
@@ -496,8 +466,7 @@ fn nested_ignore_symlinks_are_controls_without_following_source_symlinks() {
     let alias = root.join("src/.gitignore");
     let target = base.join("rules");
     std::os::unix::fs::symlink(&target, &alias).expect("link rules");
-    let policy =
-        ScanPolicy::new(&root, &FileFilter::default(), &ScanOptions::default()).expect("policy");
+    let policy = make_policy(&root, &[], &ScanRules::default()).expect("policy");
     assert!(
         policy
             .can_descend(&root.join("src"))

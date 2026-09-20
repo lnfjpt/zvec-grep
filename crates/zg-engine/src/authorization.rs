@@ -109,7 +109,7 @@ pub fn query_authorization(
     if options.rg || options.allow_remote {
         return Ok(None);
     }
-    let request = crate::pipelines::search::context::normalize_context_request(options)?;
+    let request = crate::pipelines::indexed_search::context::normalize_context_request(options)?;
     let query_text = request
         .routes
         .iter()
@@ -579,7 +579,7 @@ mod tests {
         use crate::{
             api::context::{ContextOptions, options::RefreshPolicy},
             domain::{
-                FileFilter, IndexDescriptor, IndexState, Workspace,
+                IndexDescriptor, IndexState, Workspace,
                 model::{EmbeddingModelInfo, Metric, ModelConfig},
             },
             workspace::{build::prepare_build, manifest::write_workspace_manifest},
@@ -590,7 +590,7 @@ mod tests {
             Workspace {
                 name: "workspace".to_owned(),
                 root: directory.path().to_path_buf(),
-                filter: FileFilter::default(),
+                scan: crate::domain::ScanRules::default(),
                 index: IndexState::Enabled(IndexDescriptor {
                     fts: crate::domain::FTS_CONFIG,
                     embedding: EmbeddingModelInfo {

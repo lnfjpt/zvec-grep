@@ -88,24 +88,38 @@ fn direct_and_server_modes_share_embedded_lexical_behavior() -> Result<(), Box<d
 }
 
 #[test]
-fn managed_rg_rules_override_preceding_workspace_globs() -> Result<(), Box<dyn Error>> {
+fn managed_rg_preserves_mixed_glob_order_before_and_across_rg() -> Result<(), Box<dyn Error>> {
     let root = TempDir::new()?;
     fs::write(root.path().join("sample.rs"), "needle\n")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_zg"))
-        .current_dir(root.path())
-        .args([
-            "query", "--glob", "!*.rs", "--rg", "--iglob", "*.RS", "needle", ".",
-        ])
-        .output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout)?,
-        "sample.rs\n  1: needle\n"
-    );
+    fs::write(root.path().join("unrelated.txt"), "needle\n")?;
+    let cases: &[(&[&str], bool)] = &[
+        (&["--iglob", "*.RS", "--glob", "!*.rs", "--rg"], false),
+        (&["--glob", "!*.rs", "--iglob", "*.RS", "--rg"], true),
+        (&["--iglob", "*.RS", "--rg", "--glob", "!*.rs"], false),
+        (&["--glob", "!*.rs", "--rg", "--iglob", "*.RS"], true),
+    ];
+    for (args, included) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_zg"))
+            .current_dir(root.path())
+            .arg("query")
+            .args(*args)
+            .args(["needle", "."])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout)?,
+            if *included {
+                "sample.rs\n  1: needle\n"
+            } else {
+                "No matches.\n"
+            },
+            "{args:?}"
+        );
+    }
     Ok(())
 }
 

@@ -156,14 +156,13 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::domain::{FileFormat, FileSnapshot};
+    use crate::domain::FileSnapshot;
 
     fn source() -> FileRecord {
         FileRecord {
             index_status: crate::domain::FileIndexStatus::NotIndexed,
             id: FileId::new(0),
             relative_path: crate::domain::SourcePath::new("nested/source.rs").expect("source path"),
-            formats: vec![FileFormat::Rust],
             snapshot: FileSnapshot {
                 size_bytes: 42,
                 modified_epoch_ms: Some(123),
@@ -214,6 +213,10 @@ mod tests {
         assert_eq!(record["files"].as_array().expect("pending files").len(), 2);
         for change in record["files"].as_array().expect("pending files") {
             assert_eq!(change.as_object().expect("pending change").len(), 2);
+            if let Some(source) = change["source"].as_str() {
+                let payload: Value = serde_json::from_str(source).expect("source payload");
+                assert!(payload["value"].get("formats").is_none());
+            }
         }
         assert_eq!(read(directory.path()).expect("read pending batch"), changes);
         clear(directory.path()).expect("clear pending batch");
@@ -255,7 +258,11 @@ mod tests {
         let changes = PendingChanges::from([(source.id, PendingChange::Reindex(source.clone()))]);
         write(directory.path(), &changes).expect("write initial pending batch");
         let mut invalid_source = source.clone();
-        invalid_source.formats.clear();
+        invalid_source.index_status = FileIndexStatus::Indexed {
+            indexed_epoch_ms: 1,
+            entity_count: 1,
+        };
+        invalid_source.snapshot.content_hash = None;
         for invalid in [
             PendingChanges::new(),
             PendingChanges::from([(FileId::new(2), PendingChange::Reindex(source))]),

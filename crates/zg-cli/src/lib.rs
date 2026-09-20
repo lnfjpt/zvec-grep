@@ -20,14 +20,14 @@ use thiserror::Error;
 use zg_engine::api::{
     context::{
         ContextOptions,
-        options::{ContextRoute, ContextRouteMode, SymbolType},
+        options::{
+            ContextRoute, ContextRouteMode, FileCategory, FileFormat, QueryFilter, RgGlob,
+            SymbolType,
+        },
     },
     index::{
         IndexOptions,
-        options::{
-            Device, EmbeddingModelSpec, FileCategory, FileFilterUpdate, FileFormat, GlobRule,
-            ScanOptionsUpdate,
-        },
+        options::{Device, EmbeddingModelSpec, GlobRule, ScanRulesUpdate},
     },
     info::InfoOptions,
 };
@@ -282,21 +282,13 @@ impl From<SymbolTypeArg> for SymbolType {
 }
 
 #[derive(Clone, Debug, Default, Args)]
-pub struct FileSelectionArgs {
+pub struct ScanArgs {
     #[arg(short = 'g', long = "glob", value_name = "GLOB")]
     pub globs: Vec<String>,
     #[arg(long = "iglob", value_name = "GLOB")]
     pub insensitive_globs: Vec<String>,
     #[arg(skip)]
     pub glob_rules: Vec<GlobRule>,
-    #[arg(short = 't', long = "type", value_name = "FORMAT")]
-    pub file_types: Vec<String>,
-    #[arg(short = 'T', long = "type-not", value_name = "FORMAT")]
-    pub excluded_file_types: Vec<String>,
-    #[arg(long = "category", value_name = "CATEGORY")]
-    pub categories: Vec<String>,
-    #[arg(long = "category-not", value_name = "CATEGORY")]
-    pub excluded_categories: Vec<String>,
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub hidden: Option<bool>,
     #[arg(long = "no-ignore", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
@@ -309,117 +301,126 @@ pub struct FileSelectionArgs {
     pub max_depth: Option<usize>,
     #[arg(long = "max-filesize", value_parser = parse_byte_size)]
     pub max_file_size_bytes: Option<u64>,
-    #[arg(short = 'L', long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-    pub follow: Option<bool>,
+    #[arg(short = 'L', long = "follow", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub follow_symlinks: Option<bool>,
 }
 
-impl FileSelectionArgs {
-    fn filter_update(&self) -> Result<FileFilterUpdate, CliError> {
-        Ok(FileFilterUpdate {
+impl ScanArgs {
+    fn update(&self) -> ScanRulesUpdate {
+        ScanRulesUpdate {
             globs: (!self.glob_rules.is_empty()).then(|| self.glob_rules.clone()),
-            formats: optional_formats(&self.file_types)?,
-            excluded_formats: optional_formats(&self.excluded_file_types)?,
-            categories: optional_categories(&self.categories)?,
-            excluded_categories: optional_categories(&self.excluded_categories)?,
-        })
-    }
-
-    fn scan_update(&self) -> ScanOptionsUpdate {
-        ScanOptionsUpdate {
             hidden: self.hidden,
             no_ignore: self.no_ignore,
             nested_git: self.nested_git,
             ignore_files: (!self.ignore_files.is_empty()).then(|| self.ignore_files.clone()),
             max_depth: self.max_depth.map(Some),
             max_file_size_bytes: self.max_file_size_bytes.map(Some),
-            follow: self.follow,
+            follow_symlinks: self.follow_symlinks,
         }
-    }
-
-    fn apply_context(&self, request: &mut ContextOptions) -> Result<(), CliError> {
-        if self.nested_git.is_some() {
-            return Err(CliError::NestedGitRequiresIndex);
-        }
-        if request.rg {
-            if !self.categories.is_empty() || !self.excluded_categories.is_empty() {
-                return Err(CliError::RgWithIndexedOptions);
-            }
-            request.globs.extend(self.globs.iter().cloned());
-            request
-                .insensitive_globs
-                .extend(self.insensitive_globs.iter().cloned());
-            request.file_types.extend(self.file_types.iter().cloned());
-            request
-                .excluded_file_types
-                .extend(self.excluded_file_types.iter().cloned());
-            if let Some(value) = self.hidden {
-                request.hidden = value;
-            }
-            if let Some(value) = self.no_ignore {
-                request.no_ignore = value;
-            }
-            if let Some(value) = self.follow {
-                request.follow = value;
-            }
-            request
-                .ignore_files
-                .extend(self.ignore_files.iter().cloned());
-            request.max_depth = self.max_depth.or(request.max_depth);
-            request.max_file_size_bytes = self.max_file_size_bytes.or(request.max_file_size_bytes);
-        } else {
-            if self.has_scan_options() {
-                return Err(CliError::IndexedScanOptions);
-            }
-            self.filter_update()?.apply(&mut request.filter);
-        }
-        Ok(())
     }
 
     fn has_scan_options(&self) -> bool {
         self.hidden.is_some()
             || self.no_ignore.is_some()
             || self.nested_git.is_some()
-            || self.follow.is_some()
+            || self.follow_symlinks.is_some()
             || !self.ignore_files.is_empty()
             || self.max_depth.is_some()
             || self.max_file_size_bytes.is_some()
     }
 
     fn is_empty(&self) -> bool {
-        self.globs.is_empty()
-            && self.insensitive_globs.is_empty()
-            && self.file_types.is_empty()
-            && self.excluded_file_types.is_empty()
-            && self.categories.is_empty()
-            && self.excluded_categories.is_empty()
-            && !self.has_scan_options()
+        self.globs.is_empty() && self.insensitive_globs.is_empty() && !self.has_scan_options()
     }
 }
 
-fn optional_formats(values: &[String]) -> Result<Option<Vec<FileFormat>>, CliError> {
-    if values.is_empty() {
-        return Ok(None);
+#[derive(Clone, Debug, Default, Args)]
+pub struct QueryFileArgs {
+    #[command(flatten)]
+    pub scan: ScanArgs,
+    /// Include formats inferred from file names; rg mode uses its native type definitions.
+    #[arg(short = 't', long = "type", value_name = "FORMAT")]
+    pub file_types: Vec<String>,
+    /// Exclude formats inferred from file names; rg mode uses its native type definitions.
+    #[arg(short = 'T', long = "type-not", value_name = "FORMAT")]
+    pub excluded_file_types: Vec<String>,
+    /// Include categories inferred from indexed file names.
+    #[arg(long = "category", value_name = "CATEGORY")]
+    pub categories: Vec<String>,
+    /// Exclude categories inferred from indexed file names.
+    #[arg(long = "category-not", value_name = "CATEGORY")]
+    pub excluded_categories: Vec<String>,
+}
+
+impl QueryFileArgs {
+    fn apply_context(&self, request: &mut ContextOptions) -> Result<(), CliError> {
+        let scan = &self.scan;
+        if scan.nested_git.is_some() {
+            return Err(CliError::NestedGitRequiresIndex);
+        }
+        if request.rg {
+            if !self.categories.is_empty() || !self.excluded_categories.is_empty() {
+                return Err(CliError::RgWithIndexedOptions);
+            }
+            // Keep the CLI's mixed -g/--iglob order before native parser rules.
+            let mut rules = scan
+                .glob_rules
+                .iter()
+                .map(|rule| RgGlob {
+                    pattern: rule.pattern.clone(),
+                    case_insensitive: rule.case_insensitive,
+                })
+                .collect::<Vec<_>>();
+            rules.append(&mut request.rg_options.glob_rules);
+            request.rg_options.glob_rules = rules;
+            request.file_types.extend(self.file_types.iter().cloned());
+            request
+                .excluded_file_types
+                .extend(self.excluded_file_types.iter().cloned());
+            if let Some(value) = scan.hidden {
+                request.hidden = value;
+            }
+            if let Some(value) = scan.no_ignore {
+                request.no_ignore = value;
+            }
+            if let Some(value) = scan.follow_symlinks {
+                request.follow = value;
+            }
+            request
+                .ignore_files
+                .extend(scan.ignore_files.iter().cloned());
+            request.max_depth = scan.max_depth.or(request.max_depth);
+            request.max_file_size_bytes = scan.max_file_size_bytes.or(request.max_file_size_bytes);
+        } else {
+            if scan.has_scan_options() {
+                return Err(CliError::IndexedScanOptions);
+            }
+            request.filter.globs.clone_from(&scan.glob_rules);
+            request.filter.formats = parse_formats(&self.file_types)?;
+            request.filter.excluded_formats = parse_formats(&self.excluded_file_types)?;
+            request.filter.categories = parse_categories(&self.categories)?;
+            request.filter.excluded_categories = parse_categories(&self.excluded_categories)?;
+        }
+        Ok(())
     }
+}
+
+fn parse_formats(values: &[String]) -> Result<Vec<FileFormat>, CliError> {
     values
         .iter()
         .map(|value| {
             FileFormat::parse(value).ok_or_else(|| CliError::InvalidFileFormat(value.clone()))
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+        .collect()
 }
 
-fn optional_categories(values: &[String]) -> Result<Option<Vec<FileCategory>>, CliError> {
-    if values.is_empty() {
-        return Ok(None);
-    }
+fn parse_categories(values: &[String]) -> Result<Vec<FileCategory>, CliError> {
     values
         .iter()
         .map(|value| {
             FileCategory::parse(value).ok_or_else(|| CliError::InvalidFileCategory(value.clone()))
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+        .collect()
 }
 
 fn ordered_glob_rules(matches: &clap::ArgMatches) -> Vec<GlobRule> {
@@ -495,7 +496,7 @@ pub struct QueryArgs {
     #[arg(long = "allow-remote")]
     pub allow_remote: bool,
     #[command(flatten)]
-    pub files: FileSelectionArgs,
+    pub files: QueryFileArgs,
     #[arg(value_name = "QUERY", allow_hyphen_values = true)]
     pub values: Vec<String>,
 }
@@ -540,7 +541,7 @@ pub struct IndexArgs {
     #[arg(long = "allow-remote")]
     pub allow_remote: bool,
     #[command(flatten)]
-    pub files: FileSelectionArgs,
+    pub files: ScanArgs,
 }
 
 #[derive(Debug, Args)]
@@ -748,7 +749,7 @@ impl Cli {
                 args.files.glob_rules = ordered_glob_rules(submatches);
             }
             (Some(CommandLine::Query(args)), Some((_, submatches))) => {
-                args.files.glob_rules = ordered_glob_rules(submatches);
+                args.files.scan.glob_rules = ordered_glob_rules(submatches);
             }
             _ => {}
         }
@@ -1115,7 +1116,12 @@ fn query_plan(args: QueryArgs, current_dir: PathBuf) -> Result<CliPlan, CliError
                 && (mode != ClientMode::Direct || matches!(args.refresh, Some(RefreshMode::Wait))),
             trace: args.trace,
             prefer_symbol: args.prefer_symbol,
-            symbol_types: args.symbol_types.into_iter().map(Into::into).collect(),
+            filter: QueryFilter {
+                symbol_types: args.symbol_types.into_iter().map(Into::into).collect(),
+                modified_after_epoch_ms: args.modified_after,
+                modified_before_epoch_ms: args.modified_before,
+                ..QueryFilter::default()
+            },
             ..ContextOptions::default()
         }
     };
@@ -1126,11 +1132,13 @@ fn query_plan(args: QueryArgs, current_dir: PathBuf) -> Result<CliPlan, CliError
         .model_cache
         .map(|path| resolve_from(&current_dir, Some(&path)));
     request.limit = args.limit;
-    request.modified_after_epoch_ms = args.modified_after;
-    request.modified_before_epoch_ms = args.modified_before;
-    if request
-        .modified_after_epoch_ms
-        .zip(request.modified_before_epoch_ms)
+    if request.rg {
+        request.rg_options.modified_after_epoch_ms = args.modified_after;
+        request.rg_options.modified_before_epoch_ms = args.modified_before;
+    }
+    if args
+        .modified_after
+        .zip(args.modified_before)
         .is_some_and(|(after, before)| after > before)
     {
         return Err(CliError::InvalidModifiedRange);
@@ -1195,8 +1203,7 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             output,
         });
     }
-    let filter = args.files.filter_update()?;
-    let mut scan = args.files.scan_update();
+    let mut scan = args.files.update();
     scan.ignore_files = scan.ignore_files.map(|paths| {
         paths
             .into_iter()
@@ -1218,7 +1225,6 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             name: args.name,
             rebuild: args.rebuild,
             reset_paths: args.reset_paths,
-            filter,
             scan,
             embedding,
             allow_remote: args.allow_remote,
@@ -1390,7 +1396,7 @@ pub fn parse_modified_time(value: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, CliPlan, IndexOperation, parse_byte_size, parse_modified_time};
+    use super::{Cli, CliPlan, IndexOperation, QueryFilter, parse_byte_size, parse_modified_time};
     use std::path::PathBuf;
 
     #[test]
@@ -1554,6 +1560,58 @@ mod tests {
     }
 
     #[test]
+    fn index_rejects_query_format_and_category_options() {
+        for (option, value) in [
+            ("-t", "rust"),
+            ("--type", "rust"),
+            ("-T", "rust"),
+            ("--type-not", "rust"),
+            ("--category", "code"),
+            ("--category-not", "code"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["zg", "index", option, value]).is_err(),
+                "index must reject query option {option}"
+            );
+        }
+    }
+
+    #[test]
+    fn modification_bounds_belong_to_the_selected_query_mode() {
+        for rg in [false, true] {
+            let mut args = vec![
+                "zg",
+                "query",
+                "--modified-after",
+                "1000",
+                "--modified-before",
+                "2000",
+            ];
+            if rg {
+                args.push("--rg");
+            }
+            args.push("needle");
+            let CliPlan::Query { request, .. } = Cli::try_parse_from(args)
+                .expect("query syntax")
+                .into_plan(PathBuf::from("/workspace"))
+                .expect("query plan")
+            else {
+                panic!("query");
+            };
+            if rg {
+                assert_eq!(request.filter, QueryFilter::default());
+                assert_eq!(request.rg_options.modified_after_epoch_ms, Some(1000));
+                assert_eq!(request.rg_options.modified_before_epoch_ms, Some(2000));
+            } else {
+                assert_eq!(request.filter.modified_after_epoch_ms, Some(1000));
+                assert_eq!(request.filter.modified_before_epoch_ms, Some(2000));
+                assert_eq!(request.rg_options.modified_after_epoch_ms, None);
+                assert_eq!(request.rg_options.modified_before_epoch_ms, None);
+            }
+        }
+    }
+
+    #[test]
     fn nested_git_is_an_index_only_option_with_explicit_false_and_omission() {
         let cases: &[(&[&str], Option<bool>)] = &[
             (&[], None),
@@ -1606,9 +1664,9 @@ mod tests {
             panic!("index");
         };
         assert_eq!(request.scan.hidden, Some(false));
-        assert_eq!(request.scan.follow, Some(false));
+        assert_eq!(request.scan.follow_symlinks, Some(false));
         assert_eq!(request.scan.no_ignore, Some(false));
-        assert_eq!(request.filter.globs, None);
+        assert_eq!(request.scan.globs, None);
         assert_eq!(request.scan.ignore_files, None);
         assert_eq!(request.scan.max_depth, None);
     }
@@ -1706,7 +1764,7 @@ mod tests {
         assert_eq!(request.name.as_deref(), Some("search-engine"));
         assert_eq!(request.embedding_concurrency, Some(4));
         assert_eq!(
-            request.filter.globs.as_ref().expect("valid test fixture")[0].pattern,
+            request.scan.globs.as_ref().expect("valid test fixture")[0].pattern,
             "src/**"
         );
         assert_eq!(
@@ -1794,7 +1852,7 @@ mod tests {
             panic!("query")
         };
         assert_eq!(
-            serde_json::json!(request.symbol_types),
+            serde_json::json!(request.filter.symbol_types),
             serde_json::json!(types)
         );
     }

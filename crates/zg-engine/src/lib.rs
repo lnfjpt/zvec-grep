@@ -98,11 +98,7 @@ impl ZvecGrep {
                 "workspace index version is incompatible; rebuild it with `zg index --rebuild`",
             ));
         }
-        let root = file_selection::ScanPolicy::root_spec(
-            &workspace.root,
-            &workspace.filter,
-            &workspace.scan,
-        )?;
+        let root = file_selection::ScanPolicy::root_spec(&workspace.root, &workspace.scan)?;
         zg_host_native::NativeWatcherFactory::default()
             .watch(&zg_host_native::WatchRequest { root }, control)
             .await

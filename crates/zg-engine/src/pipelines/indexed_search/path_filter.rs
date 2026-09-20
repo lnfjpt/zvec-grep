@@ -133,7 +133,7 @@ fn literal_like(name: &str) -> bool {
     literal_name(name) && !name.contains('_')
 }
 
-fn any(predicates: Vec<StoragePathFilter>) -> StoragePathFilter {
+pub(super) fn any(predicates: Vec<StoragePathFilter>) -> StoragePathFilter {
     let mut result = Vec::new();
     for predicate in predicates {
         match predicate {
@@ -149,7 +149,7 @@ fn any(predicates: Vec<StoragePathFilter>) -> StoragePathFilter {
     }
 }
 
-fn all(predicates: Vec<StoragePathFilter>) -> StoragePathFilter {
+pub(super) fn all(predicates: Vec<StoragePathFilter>) -> StoragePathFilter {
     let mut result = Vec::new();
     for predicate in predicates {
         match predicate {
@@ -165,10 +165,11 @@ fn all(predicates: Vec<StoragePathFilter>) -> StoragePathFilter {
     }
 }
 
-fn negate(predicate: StoragePathFilter) -> StoragePathFilter {
+pub(super) fn negate(predicate: StoragePathFilter) -> StoragePathFilter {
     match predicate {
         StoragePathFilter::All => StoragePathFilter::None,
         StoragePathFilter::None => StoragePathFilter::All,
+        StoragePathFilter::Not(predicate) => *predicate,
         predicate => StoragePathFilter::Not(Box::new(predicate)),
     }
 }

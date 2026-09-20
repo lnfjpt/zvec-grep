@@ -1,6 +1,6 @@
 mod content;
 mod entity;
-mod file_filter;
+mod glob;
 mod metadata;
 pub(crate) mod model;
 mod source;
@@ -31,10 +31,11 @@ pub use metadata::{CodeMetadata, EntityMetadata, MarkdownMetadata, SymbolType};
 // Fragments.
 pub(crate) use entity::{EntityFragment, FragmentId, WindowFragment, validate_fragments};
 
-// File filters.
-pub use file_filter::{FileFilter, GlobRule};
+// Ordered path rules.
+pub use glob::GlobRule;
 
 // Workspaces.
+pub use workspace::ScanRules;
 pub(crate) use workspace::{FTS_CONFIG, FtsConfig, IndexDescriptor, IndexState, Workspace};
 
 // Models.

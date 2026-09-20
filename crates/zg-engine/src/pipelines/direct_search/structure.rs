@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{
+    api::context::result::{StructureEnrichmentDiagnostics, StructureEnrichmentSource},
     domain::{
         CodeMetadata, EntityId, EntityMetadata, FileCategory, FileFormat, MarkdownMetadata,
         SourcePath, SourceRange, TextRange,
@@ -13,27 +14,7 @@ use crate::{
     utils::{decode_text, sha256_hex_parts},
 };
 
-use serde::{Deserialize, Serialize};
-
-use super::types::LexicalMatch;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct StructureEnrichmentDiagnostics {
-    pub source: StructureEnrichmentSource,
-    pub file_limit: usize,
-    pub matched_files: usize,
-    pub parsed_files: usize,
-    pub enriched_files: usize,
-    pub enriched_items: usize,
-    pub skipped_files: usize,
-    pub truncated: bool,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StructureEnrichmentSource {
-    StructuralExtraction,
-}
+use crate::lexical::types::LexicalMatch;
 
 pub(crate) const RG_STRUCTURE_ENRICH_FILE_LIMIT: usize = 100;
 const STRUCTURE_NAMESPACE: &str = "__rg_structure__";

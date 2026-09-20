@@ -85,7 +85,6 @@ struct Record<T> {
 struct FilePayload<'a> {
     id: u32,
     relative_path: PathRecord,
-    formats: Vec<u16>,
     snapshot: SnapshotRecord<'a>,
     index_status: IndexStatusRecord<'a>,
 }
@@ -152,7 +151,6 @@ impl<'a> FilePayload<'a> {
             index_status: (&file.index_status).into(),
             id: file.id.get(),
             relative_path: PathRecord::from_path(&file.relative_path)?,
-            formats: file.formats.iter().map(|format| *format as u16).collect(),
             snapshot: SnapshotRecord {
                 size_bytes: file.snapshot.size_bytes,
                 modified_epoch_ms: file.snapshot.modified_epoch_ms,
@@ -166,11 +164,6 @@ impl<'a> FilePayload<'a> {
             index_status: self.index_status.into(),
             id: FileId::new(self.id),
             relative_path: SourcePath::new(self.relative_path.into_path()?)?,
-            formats: self
-                .formats
-                .into_iter()
-                .map(format_from_id)
-                .collect::<EngineResult<_>>()?,
             snapshot: FileSnapshot {
                 size_bytes: self.snapshot.size_bytes,
                 modified_epoch_ms: self.snapshot.modified_epoch_ms,
@@ -362,7 +355,7 @@ impl EntityRecord<'_> {
 enum ContentRecord<'a> {
     Text(Cow<'a, str>),
     Image {
-        format: u16,
+        format: FileFormat,
         #[serde(with = "image_bytes")]
         data: Cow<'a, [u8]>,
     },
@@ -431,7 +424,7 @@ fn encode_contents(contents: &[Content]) -> Vec<ContentRecord<'_>> {
         .map(|content| match content {
             Content::Text(text) => ContentRecord::Text(text.as_str().into()),
             Content::Image(image) => ContentRecord::Image {
-                format: image.format() as u16,
+                format: image.format(),
                 data: image.data().into(),
             },
             Content::Table(table) => ContentRecord::Table {
@@ -464,10 +457,9 @@ fn decode_contents(contents: Vec<ContentRecord<'_>>) -> EngineResult<Vec<Content
         .map(|content| {
             Ok(match content {
                 ContentRecord::Text(text) => Content::Text(text.into_owned()),
-                ContentRecord::Image { format, data } => Content::Image(ImageContent::new(
-                    data.into_owned(),
-                    format_from_id(format)?,
-                )?),
+                ContentRecord::Image { format, data } => {
+                    Content::Image(ImageContent::new(data.into_owned(), format)?)
+                }
                 ContentRecord::Table {
                     row_count,
                     column_count,
@@ -496,11 +488,6 @@ fn decode_contents(contents: Vec<ContentRecord<'_>>) -> EngineResult<Vec<Content
             })
         })
         .collect()
-}
-
-fn format_from_id(id: u16) -> EngineResult<FileFormat> {
-    FileFormat::from_id(id)
-        .ok_or_else(|| EngineError::invalid_argument(format!("unrecognized file format ID: {id}")))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -670,7 +657,6 @@ mod tests {
             index_status: FileIndexStatus::NotIndexed,
             id: FileId::new(1),
             relative_path: SourcePath::new("nested/tsconfig.json").expect("source path"),
-            formats: vec![FileFormat::Json, FileFormat::TypeScript],
             snapshot: FileSnapshot {
                 size_bytes: 123,
                 modified_epoch_ms: Some(456),
@@ -754,18 +740,18 @@ mod tests {
     }
 
     #[test]
-    fn source_records_preserve_format_ids_snapshots_and_native_paths() {
+    fn source_records_preserve_snapshots_and_native_paths_without_formats() {
         let mut source = file();
         let encoded = encode_file(&source).expect("encode source");
         let record: Value = serde_json::from_str(&encoded).expect("JSON record");
         assert_eq!(record["version"], VERSION);
+        assert!(record["value"].get("formats").is_none());
         assert_eq!(
             record["value"],
             json!({
                 "id": 1,
                 "index_status": {"kind": "not_indexed"},
                 "relative_path": {"encoding": "utf8", "value": "nested/tsconfig.json"},
-                "formats": [FileFormat::Json as u16, FileFormat::TypeScript as u16],
                 "snapshot": {
                     "size_bytes": 123,
                     "modified_epoch_ms": 456,
@@ -893,6 +879,10 @@ mod tests {
             encoded["value"]["value"]["content"]["value"][1]["value"]["data"],
             "AAH/"
         );
+        assert_eq!(
+            encoded["value"]["value"]["content"]["value"][1]["value"]["format"],
+            "png"
+        );
         assert_eq!(encoded["version"], VERSION);
         let ranges = [
             (SourceRange::File, json!({"kind": "file"})),
@@ -1007,27 +997,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_corrupt_versions_ids_formats_images_and_ranges() {
+    fn rejects_corrupt_versions_ids_images_and_ranges() {
         let file_record: Value =
             serde_json::from_str(&encode_file(&file()).expect("encode file")).expect("file JSON");
-        for (field, value) in [
-            ("id", json!(" ")),
-            ("formats", json!([65535])),
-            ("formats", json!([])),
-            (
-                "formats",
-                json!([FileFormat::Rust as u16, FileFormat::Rust as u16]),
-            ),
-        ] {
-            let mut record = file_record.clone();
-            record["value"][field] = value;
-            assert_eq!(
-                decode_file(&record.to_string())
-                    .expect_err("invalid source")
-                    .code(),
-                EngineError::STORAGE_FAILURE
-            );
-        }
+        let mut invalid_file = file_record.clone();
+        invalid_file["value"]["id"] = json!(" ");
+        assert_eq!(
+            decode_file(&invalid_file.to_string())
+                .expect_err("invalid source identity")
+                .code(),
+            EngineError::STORAGE_FAILURE
+        );
         let original: Value =
             serde_json::from_str(&encode_fragment(&fragment()).expect("encode fragment"))
                 .expect("fragment JSON");
@@ -1071,7 +1051,8 @@ mod tests {
             assert_corrupt_fragment(&record);
         }
         for (field, value) in [
-            ("format", json!(FileFormat::Rust as u16)),
+            ("format", json!("rust")),
+            ("format", json!("not-a-format")),
             ("format", json!(65535)),
             ("data", json!("")),
             ("data", json!("invalid base64!")),

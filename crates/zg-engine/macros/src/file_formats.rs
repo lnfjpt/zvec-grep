@@ -3,14 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
-    Ident, LitInt, LitStr, Result, Token, bracketed, parenthesized,
+    Ident, LitStr, Result, Token, bracketed, parenthesized,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
 };
 
 struct Format {
     variant: Ident,
-    id: LitInt,
     name: LitStr,
     categories: Punctuated<Ident, Token![,]>,
     extensions: Punctuated<LitStr, Token![,]>,
@@ -63,15 +62,14 @@ impl Format {
             if !value.is_ascii()
                 || value.split('.').any(str::is_empty)
                 || value.bytes().any(|byte| {
-                    byte.is_ascii_uppercase()
-                        || byte.is_ascii_whitespace()
+                    byte.is_ascii_whitespace()
                         || byte.is_ascii_control()
                         || matches!(byte, b'/' | b'\\')
                 })
             {
                 return Err(syn::Error::new_spanned(
                     extension,
-                    "extensions must contain nonempty lowercase ASCII components separated by dots, without whitespace, control characters, or path separators",
+                    "extensions must contain nonempty ASCII components separated by dots, without whitespace, control characters, or path separators",
                 ));
             }
             if !extensions.insert(value) {
@@ -112,8 +110,6 @@ impl Parse for Format {
         input.parse::<Token![=>]>()?;
         let fields;
         parenthesized!(fields in input);
-        let id = fields.parse()?;
-        fields.parse::<Token![,]>()?;
         let name = fields.parse()?;
         fields.parse::<Token![,]>()?;
         let category_list;
@@ -135,7 +131,6 @@ impl Parse for Format {
         }
         Ok(Self {
             variant,
-            id,
             name,
             categories,
             extensions,
@@ -154,17 +149,10 @@ impl Parse for Catalog {
 
 impl Catalog {
     fn validate(&self) -> Result<()> {
-        let mut ids = BTreeSet::from([0]);
         let mut variants = BTreeSet::from(["Unknown".to_owned()]);
         let mut names = BTreeSet::from(["unknown".to_owned()]);
         for format in &self.0 {
             format.validate()?;
-            if !ids.insert(format.id.base10_parse::<u16>()?) {
-                return Err(syn::Error::new_spanned(
-                    &format.id,
-                    "duplicate format ID; 0 is reserved for Unknown",
-                ));
-            }
             let variant = format.variant.to_string();
             let variant = variant.strip_prefix("r#").unwrap_or(&variant);
             if !variants.insert(variant.to_owned()) {
@@ -187,12 +175,18 @@ impl Catalog {
         let names = self.0.iter().map(|format| &format.name);
         let variants = self.0.iter().map(|format| &format.variant);
         quote! {
-                /// Resolves a canonical format name or an unambiguous extension alias.
+                /// Resolves a case-insensitive canonical name or an exact extension alias.
+                /// A leading dot selects extension lookup, so `c` and `.C` can differ.
                 #[must_use]
                 pub fn parse(name: &str) -> Option<Self> {
-                    let normalized = name.trim().to_ascii_lowercase();
-                    let name = normalized.strip_prefix('.').unwrap_or(&normalized);
-                    match name {
+                    let name = name.trim();
+                    if let Some(extension) = name.strip_prefix('.') {
+                        return match lookup_extension(extension) {
+                            [format] => Some(*format),
+                            _ => None,
+                        };
+                    }
+                    match name.to_ascii_lowercase().as_str() {
                         "unknown" => Some(Self::Unknown),
                         #(#names => Some(Self::#variants),)*
                         _ => match lookup_extension(name) {
@@ -209,16 +203,23 @@ impl Catalog {
         self.validate()?;
         let parse_method = self.parse_method();
         let variants: Vec<_> = self.0.iter().map(|format| &format.variant).collect();
-        let ids: Vec<_> = self.0.iter().map(|format| &format.id).collect();
         let names: Vec<_> = self.0.iter().map(|format| &format.name).collect();
         let category_arms = self.0.iter().map(|format| {
             let variant = &format.variant;
             let categories = format.categories.iter();
             quote! { Self::#variant => &[#(FileCategory::#categories),*], }
         });
+        let extensions_by_format = self.0.iter().map(|format| {
+            let variant = &format.variant;
+            let extensions = format.extensions.iter();
+            quote! { Self::#variant => &[#(#extensions),*], }
+        });
+        let names_by_format = self.0.iter().map(|format| {
+            let variant = &format.variant;
+            let names = format.file_names.iter();
+            quote! { Self::#variant => &[#(#names),*], }
+        });
         let mut extensions: BTreeMap<String, Vec<&Ident>> = BTreeMap::new();
-        let mut extension_entries = Vec::new();
-        let mut name_entries = Vec::new();
         let mut file_names: BTreeMap<String, Vec<&Ident>> = BTreeMap::new();
         for format in &self.0 {
             let variant = &format.variant;
@@ -227,11 +228,9 @@ impl Catalog {
                     .entry(extension.value())
                     .or_default()
                     .push(variant);
-                extension_entries.push(quote! { (#extension, FileFormat::#variant) });
             }
             for name in &format.file_names {
                 file_names.entry(name.value()).or_default().push(variant);
-                name_entries.push(quote! { (#name, FileFormat::#variant) });
             }
         }
         let max_extension_len = extensions.keys().map(String::len).max().unwrap_or(0);
@@ -244,14 +243,34 @@ impl Catalog {
         });
 
         Ok(quote! {
-            #[repr(u16)]
-            #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+            #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
             pub enum FileFormat {
-                Unknown = 0,
-                #(#variants = #ids,)*
+                Unknown,
+                #(#variants,)*
             }
 
             impl FileFormat {
+                pub(crate) const ALL: &[Self] = &[
+                    Self::Unknown,
+                    #(Self::#variants,)*
+                ];
+
+                /// Exact, case-sensitive suffixes, without a leading dot.
+                pub(crate) const fn extensions(self) -> &'static [&'static str] {
+                    match self {
+                        Self::Unknown => &[],
+                        #(#extensions_by_format)*
+                    }
+                }
+
+                /// Exact, case-sensitive basenames.
+                pub(crate) const fn file_names(self) -> &'static [&'static str] {
+                    match self {
+                        Self::Unknown => &[],
+                        #(#names_by_format)*
+                    }
+                }
+
                 pub(crate) const fn categories(self) -> &'static [FileCategory] {
                     match self {
                         Self::Unknown => &[FileCategory::Unknown],
@@ -268,14 +287,6 @@ impl Catalog {
                 }
 
                 #parse_method
-
-                pub(crate) const fn from_id(id: u16) -> Option<Self> {
-                    match id {
-                        0 => Some(Self::Unknown),
-                        #(#ids => Some(Self::#variants),)*
-                        _ => None,
-                    }
-                }
             }
 
             pub(super) fn lookup_name(name: &str) -> &'static [FileFormat] {
@@ -293,22 +304,6 @@ impl Catalog {
             }
 
             pub(super) const MAX_EXTENSION_LEN: usize = #max_extension_len;
-
-            #[cfg(test)]
-            pub(super) const FORMATS: &[FileFormat] = &[
-                FileFormat::Unknown,
-                #(FileFormat::#variants,)*
-            ];
-
-            #[cfg(test)]
-            pub(super) const EXTENSIONS: &[(&str, FileFormat)] = &[
-                #(#extension_entries,)*
-            ];
-
-            #[cfg(test)]
-            pub(super) const FILE_NAMES: &[(&str, FileFormat)] = &[
-                #(#name_entries,)*
-            ];
         })
     }
 }
@@ -342,39 +337,31 @@ mod tests {
     fn rejects_duplicate_or_reserved_definitions() {
         let cases = [
             (
-                quote! { Alpha => (1, "alpha", [Code, Code], [], []) },
+                quote! { Alpha => ("alpha", [Code, Code], [], []) },
                 "duplicate category in the same format",
             ),
             (
-                quote! { Alpha => (0, "alpha", [Unknown], [], []) },
-                "0 is reserved",
-            ),
-            (
-                quote! { Unknown => (1, "alpha", [Unknown], [], []) },
+                quote! { Unknown => ("alpha", [Unknown], [], []) },
                 "Unknown is reserved",
             ),
             (
-                quote! { Alpha => (1, "unknown", [Unknown], [], []) },
+                quote! { Alpha => ("unknown", [Unknown], [], []) },
                 "unknown is reserved",
             ),
             (
-                quote! { Alpha => (7, "alpha", [Unknown], [], []), Beta => (7, "beta", [Unknown], [], []) },
-                "duplicate format ID",
-            ),
-            (
-                quote! { Alpha => (1, "alpha", [Unknown], [], []), Alpha => (2, "beta", [Unknown], [], []) },
+                quote! { Alpha => ("alpha", [Unknown], [], []), Alpha => ("beta", [Unknown], [], []) },
                 "duplicate format variant",
             ),
             (
-                quote! { Alpha => (1, "alpha", [Unknown], [], []), Beta => (2, "alpha", [Unknown], [], []) },
+                quote! { Alpha => ("alpha", [Unknown], [], []), Beta => ("alpha", [Unknown], [], []) },
                 "duplicate format name",
             ),
             (
-                quote! { Alpha => (1, "alpha", [Unknown], ["a", "a"], []) },
+                quote! { Alpha => ("alpha", [Unknown], ["a", "a"], []) },
                 "duplicate extension in the same format",
             ),
             (
-                quote! { Alpha => (1, "alpha", [Unknown], [], ["KnownFile", "KnownFile"]) },
+                quote! { Alpha => ("alpha", [Unknown], [], ["KnownFile", "KnownFile"]) },
                 "duplicate file name in the same format",
             ),
         ];
@@ -386,8 +373,8 @@ mod tests {
     #[test]
     fn groups_shared_extensions_and_file_names() {
         let output = expand(quote! {
-            Alpha => (7, "alpha", [Unknown], ["a", "shared"], ["KnownFile", "SharedFile"]),
-            Beta => (3, "beta", [Unknown], ["b", "shared"], ["SharedFile"]),
+            Alpha => ("alpha", [Unknown], ["a", "shared"], ["KnownFile", "SharedFile"]),
+            Beta => ("beta", [Unknown], ["b", "shared"], ["SharedFile"]),
         });
         let extensions = quote! {
             match extension {
@@ -412,7 +399,7 @@ mod tests {
 
     #[test]
     fn allows_definitions_without_aliases() {
-        let output = expand(quote! { Alpha => (1, "alpha", [Unknown], [], []) });
+        let output = expand(quote! { Alpha => ("alpha", [Unknown], [], []) });
         let extensions = quote! { match extension { _ => &[], } }.to_string();
         let names = quote! { match name { _ => &[], } }.to_string();
         let maximum = quote! { const MAX_EXTENSION_LEN: usize = 0usize; }.to_string();
@@ -421,19 +408,19 @@ mod tests {
         assert!(output.contains(&maximum), "{output}");
 
         expand(quote! {
-            Alpha => (1, "alpha", [Unknown], ["a"], []),
-            Beta => (2, "beta", [Unknown], [], ["KnownFile"]),
+            Alpha => ("alpha", [Unknown], ["a"], []),
+            Beta => ("beta", [Unknown], [], ["KnownFile"]),
         });
     }
 
     #[test]
     fn validates_declaration_syntax_and_characters() {
         assert_invalid(
-            quote! { Alpha => (1, "alpha", [], [], []) },
+            quote! { Alpha => ("alpha", [], [], []) },
             "formats must have at least one category",
         );
         assert_invalid(
-            quote! { Alpha => (1, "alpha", [Unknown, Code], [], []) },
+            quote! { Alpha => ("alpha", [Unknown, Code], [], []) },
             "Unknown cannot be combined with specific categories",
         );
         for name in [
@@ -449,38 +436,34 @@ mod tests {
             "a\\b",
         ] {
             assert_invalid(
-                quote! { Alpha => (1, #name, [Unknown], [], []) },
+                quote! { Alpha => (#name, [Unknown], [], []) },
                 "format names must be",
             );
         }
         for extension in [
-            "", ".a", "a.", "a..b", "A", "a b", "a\t", "a\0", "α", "a/b", "a\\b",
+            "", ".a", "a.", "a..b", "a b", "a\t", "a\0", "α", "a/b", "a\\b",
         ] {
             assert_invalid(
-                quote! { Alpha => (1, "alpha", [Unknown], [#extension], []) },
+                quote! { Alpha => ("alpha", [Unknown], [#extension], []) },
                 "extensions must contain",
             );
         }
         for name in ["", ".", "..", "dir/File", "dir\\File", "File\0", "File\n"] {
             assert_invalid(
-                quote! { Alpha => (1, "alpha", [Unknown], [], [#name]) },
+                quote! { Alpha => ("alpha", [Unknown], [], [#name]) },
                 "exact file names must be",
             );
         }
         assert_invalid(
-            quote! { Alpha => (65536, "alpha", [Unknown], [], []) },
-            "number too large",
-        );
-        assert_invalid(
-            quote! { Alpha => (1, "alpha", [Unknown], [], [], "extra") },
+            quote! { Alpha => ("alpha", [Unknown], [], [], "extra") },
             "unexpected format fields",
         );
         assert_invalid(
-            quote! { Alpha => (1 "alpha", [Unknown], [], []) },
+            quote! { Alpha => ("alpha" [Unknown], [], []) },
             "expected `,`",
         );
         expand(quote! {
-            Alpha => (7, "alpha-family", [Unknown], ["a++", "a-b", "a_b", "a.long", "7a",], ["Known File", "文件", ".settings",],),
+            Alpha => ("alpha-family", [Unknown], ["a", "A", "a++", "a-b", "a_b", "a.long", "7a",], ["Known File", "文件", ".settings",],),
         });
     }
 }
