@@ -28,7 +28,10 @@ Storage types are exposed under `zg_graph::persistence`.
 
 ## Ownership
 
-Only two tables are stored: `edges` and `pending_refs`. Entity content, names,
+Only one table is stored: `edges`. An unresolved reference has a NULL target
+and provenance; resolution fills those columns on the same row. Original
+reference details remain available after resolution. There is no separate
+reference table, foreign key or status column. Entity content, names,
 paths, ranges and other node metadata remain in zvec. `FileGraph.entity_ids`
 contains the current file's entity IDs for ownership validation; these IDs are
 not persisted in a second entity/file table. IDs are opaque strings at this
@@ -36,10 +39,11 @@ boundary; integration must encode each engine file ID consistently for both
 ownership and file-level endpoints, using the existing entity IDs for nodes.
 
 `SqliteGraphStorage::open(path, OpenMode::ReadWrite)` initializes an empty graph
-and enables WAL, foreign keys, and a busy timeout. Read-only opening neither
+and enables WAL and a busy timeout. Read-only opening neither
 creates a missing database nor migrates its schema. Both modes validate the
 application ID and schema version. An unrelated or unsupported database is
-rejected. Drop closes a connection; `close(self)` also reports close failures.
+rejected. Schema version 2 replaces the earlier two-table layout; existing
+graph databases must be rebuilt, with no migration provided. Drop closes a connection; `close(self)` also reports close failures.
 All operations are synchronous. Writes require `&mut self` and use SQLite
 `BEGIN IMMEDIATE` transactions; the calling engine chooses its blocking boundary.
 
@@ -55,8 +59,8 @@ All operations are synchronous. Writes require `&mut self` and use SQLite
   invalidates its incoming resolved references.
 - File-level import targets are invalidated even when the entity-ID list is empty.
   Large ID lists are processed in bounded SQL parameter batches within one transaction.
-- Invalidation removes resolved edges, returns their references to pending, and
-  preserves their original reference details for another resolution pass.
+- Invalidation clears the target and provenance of incoming reference rows,
+  preserving their IDs and original reference details for another resolution pass.
 
 Transactions cover SQLite only. The indexer must coordinate graph writes with
 zvec's file-update journal/checkpoints and use the workspace write lock. Do not
@@ -68,7 +72,7 @@ not add another workspace recovery journal or a ready marker.
 1. `list_pending_refs(limit, cursor)` returns pending refs and their database IDs. Use cursor `0` initially; limits are `1..=1000`. `next_cursor` is only
    present when another page exists. Restart pagination after file changes.
 2. A language-aware resolver selects and validates a target in the entity store.
-3. `apply_resolutions(&results)` inserts the resulting edges and updates statuses
+3. `apply_resolutions(&results)` updates target and provenance on the existing rows
    atomically. Missing or already-resolved references count as `stale`;
    local edges are preserved. Malformed inputs or SQL errors roll back the batch.
 

@@ -208,7 +208,7 @@ fn file_level_import_targets_are_invalidated_without_entity_ids() {
     let raw = Connection::open(&path).expect("inspect persisted edges");
     let import_count = || {
         raw.query_row(
-            "SELECT count(*) FROM edges WHERE kind = 'imports' AND file_id = 'source-file'",
+            "SELECT count(*) FROM edges WHERE kind = 'imports' AND target IS NOT NULL AND file_id = 'source-file'",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -393,7 +393,7 @@ fn sql_failure_rolls_back_an_entire_resolution_batch() {
         })
         .collect();
     Connection::open(&path).expect("raw").execute_batch(
-        "CREATE TRIGGER fail_second BEFORE INSERT ON edges WHEN NEW.target = 'target-1' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+        "CREATE TRIGGER fail_second BEFORE UPDATE OF target ON edges WHEN NEW.target = 'target-1' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
     ).expect("trigger");
     assert!(db.apply_resolutions(&proposals).is_err());
     assert!(db.get_callees("a").expect("no partial edge").is_empty());
@@ -463,7 +463,7 @@ fn schemas_reject_foreign_and_newer_databases_without_rewriting_versions() {
 }
 
 #[test]
-fn schema_contains_only_edges_and_pending_refs_and_enforces_json_objects() {
+fn schema_contains_only_edges_and_enforces_json_objects() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("graph.sqlite");
     open(&path).close().expect("init");
@@ -476,7 +476,7 @@ fn schema_contains_only_edges_and_pending_refs_and_enforces_json_objects() {
         .expect("query")
         .collect::<rusqlite::Result<_>>()
         .expect("rows");
-    assert_eq!(names, ["edges", "pending_refs"]);
+    assert_eq!(names, ["edges"]);
     assert!(raw.execute("INSERT INTO edges (file_id, kind, source, target, provenance, metadata) VALUES ('f', 'calls', 'a', 'b', 'file_local', '[]')", []).is_err());
     assert!(raw.execute("INSERT INTO edges (file_id, kind, source, target, provenance, line) VALUES ('f', 'calls', 'a', 'b', 'file_local', 0)", []).is_err());
 }
@@ -625,5 +625,129 @@ fn neighborhood_returns_all_edges_without_a_limit() {
         db.neighborhood("a", Direction::Both, None)
             .expect("all edges"),
         edges
+    );
+}
+
+#[test]
+fn resolution_and_invalidation_preserve_the_same_row_and_reference_details() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("graph.sqlite");
+    let mut db = open(&path);
+    let original = reference("a", "remote");
+    db.write_file_graph(
+        "source",
+        &graph(&["a"], vec![], vec![original.clone()]),
+        &[],
+    )
+    .expect("source");
+    db.write_file_graph("target", &graph(&["remote"], vec![], vec![]), &[])
+        .expect("target");
+    let before = db.list_pending_refs(100, 0).expect("pending").refs;
+    assert!(
+        db.neighborhood("a", Direction::Both, None)
+            .expect("unresolved hidden")
+            .is_empty()
+    );
+    let raw = Connection::open(&path).expect("raw");
+    let state = || {
+        raw.query_row("SELECT id, target, provenance FROM edges", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .expect("single row")
+    };
+    assert_eq!(state(), (before[0].id, None, None));
+    db.apply_resolutions(&[proposal(&db, "remote")])
+        .expect("resolve");
+    assert_eq!(
+        state(),
+        (
+            before[0].id,
+            Some("remote".into()),
+            Some("import_scoped".into())
+        )
+    );
+    assert!(
+        db.list_pending_refs(100, 0)
+            .expect("resolved hidden")
+            .refs
+            .is_empty()
+    );
+    db.delete_file_graph("target", &["remote".into()])
+        .expect("invalidate");
+    assert_eq!(state(), (before[0].id, None, None));
+    assert_eq!(
+        db.list_pending_refs(100, 0).expect("preserved").refs,
+        before
+    );
+    db.apply_resolutions(&[proposal(&db, "new-target")])
+        .expect("resolve again");
+    assert_eq!(
+        db.get_callees("a").expect("edge")[0].metadata,
+        original.metadata
+    );
+    db.delete_file_graph("source", &["a".into()])
+        .expect("delete source");
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM edges", [], |row| row.get::<_, i64>(0))
+            .expect("count"),
+        0
+    );
+}
+
+#[test]
+fn schema_rejects_inconsistent_pending_and_resolved_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("graph.sqlite");
+    open(&path).close().expect("init");
+    let raw = Connection::open(&path).expect("raw");
+    for values in [
+        // An unresolved row requires the original reference and its location.
+        "'calls', NULL, NULL, NULL, NULL, NULL",
+        "'calls', NULL, NULL, 'b', NULL, 0",
+        // Target and provenance must be present or absent together.
+        "'calls', 'b', NULL, 'b', 1, 0",
+        "'calls', NULL, 'import_scoped', 'b', 1, 0",
+        // Cross-file edges retain evidence; local edges have no pending reference.
+        "'calls', 'b', 'import_scoped', NULL, 1, 0",
+        "'calls', 'b', 'file_local', 'b', 1, 0",
+        // Structural containment cannot be an unresolved name reference.
+        "'contains', NULL, NULL, 'b', 1, 0",
+    ] {
+        let sql = format!(
+            "INSERT INTO edges (file_id, source, kind, target, provenance, ref_name, line, column) VALUES ('f', 'a', {values})"
+        );
+        assert!(raw.execute(&sql, []).is_err(), "{values}");
+    }
+}
+
+#[test]
+fn prior_schema_version_requires_rebuild_without_mutation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("old.sqlite");
+    let raw = Connection::open(&path).expect("raw");
+    raw.execute_batch("PRAGMA application_id = 1514623568; PRAGMA user_version = 1; CREATE TABLE pending_refs (id INTEGER PRIMARY KEY);").expect("old schema");
+    for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+        assert!(matches!(
+            SqliteGraphStorage::open(&path, mode),
+            Err(Error::UnsupportedSchema { version: 1, .. })
+        ));
+    }
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("version"),
+        1
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'pending_refs'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .expect("old table"),
+        1
     );
 }

@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Error, Result};
 
-pub(crate) const VERSION: i64 = 1;
+pub(crate) const VERSION: i64 = 2;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;
 
 pub(crate) fn validate(connection: &Connection) -> Result<()> {
@@ -42,35 +42,31 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<()> {
 }
 
 const SCHEMA: &str = "
-CREATE TABLE pending_refs (
-    id INTEGER PRIMARY KEY,
-    file_id TEXT NOT NULL,
-    owner_id TEXT NOT NULL,
-    ref_name TEXT NOT NULL,
-    receiver_name TEXT,
-    ref_kind TEXT NOT NULL CHECK (ref_kind IN ('calls', 'imports', 'extends', 'implements')),
-    arity INTEGER CHECK (arity >= 0),
-    line INTEGER NOT NULL CHECK (line >= 1),
-    column INTEGER NOT NULL CHECK (column >= 0),
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved', 'failed')),
-    metadata TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata) AND json_type(metadata) = 'object')
-) STRICT;
-CREATE INDEX pending_refs_file ON pending_refs(file_id);
-CREATE INDEX pending_refs_status_id ON pending_refs(status, id);
 CREATE TABLE edges (
     id INTEGER PRIMARY KEY,
     file_id TEXT NOT NULL,
-    ref_id INTEGER REFERENCES pending_refs(id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN ('contains', 'calls', 'imports', 'extends', 'implements')),
     source TEXT NOT NULL,
-    target TEXT NOT NULL,
+    target TEXT,
+    ref_name TEXT,
+    receiver_name TEXT,
+    arity INTEGER CHECK (arity >= 0),
     line INTEGER CHECK (line >= 1),
     column INTEGER CHECK (column >= 0),
-    provenance TEXT NOT NULL CHECK (provenance IN ('file_local', 'import_scoped', 'preferred_file', 'workspace_unique')),
-    metadata TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata) AND json_type(metadata) = 'object')
+    provenance TEXT CHECK (provenance IN ('file_local', 'import_scoped', 'preferred_file', 'workspace_unique')),
+    metadata TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata) AND json_type(metadata) = 'object'),
+    CHECK ((target IS NULL) = (provenance IS NULL)),
+    CHECK (
+        (ref_name IS NULL AND target IS NOT NULL AND provenance = 'file_local'
+            AND receiver_name IS NULL AND arity IS NULL)
+        OR
+        (ref_name IS NOT NULL AND length(trim(ref_name)) > 0 AND kind <> 'contains'
+            AND line IS NOT NULL AND column IS NOT NULL
+            AND (provenance IS NULL OR provenance <> 'file_local'))
+    )
 ) STRICT;
 CREATE INDEX edges_file ON edges(file_id);
 CREATE INDEX edges_source_kind ON edges(source, kind);
 CREATE INDEX edges_target_kind ON edges(target, kind);
-CREATE UNIQUE INDEX edges_ref ON edges(ref_id) WHERE ref_id IS NOT NULL;
+CREATE INDEX edges_pending ON edges(id) WHERE target IS NULL;
 ";

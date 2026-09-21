@@ -93,7 +93,7 @@ pub struct Edge {
 }
 
 /// Extraction output that still requires name resolution.
-/// New snapshots can only insert pending references; storage owns their status.
+/// New snapshots insert unresolved references; storage fills their target.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PendingRef {
     pub owner_id: String,
@@ -117,7 +117,7 @@ pub struct FileGraph {
     pub pending_refs: Vec<PendingRef>,
 }
 
-/// A pending reference with its database identity.
+/// An unresolved edge with its database identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredPendingRef {
     pub id: i64,
@@ -136,6 +136,7 @@ pub struct PendingRefPage {
 /// serialize the entire read, resolution and writeback cycle with workspace writes/deletions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resolution {
+    /// ID of the unresolved row in the edges table.
     pub ref_id: i64,
     pub target_id: String,
     /// Must be a cross-file provenance; `FileLocal` is rejected.
