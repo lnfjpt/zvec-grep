@@ -4,7 +4,7 @@ use super::{
 };
 use rusqlite::{Row, TransactionBehavior, params};
 
-const SELECT_REF: &str = "SELECT id, file_id, source, ref_name, receiver_name, kind, arity, line, column, metadata FROM edges";
+const SELECT_REF: &str = "SELECT id, file_id, CASE ref_direction WHEN 'in' THEN target ELSE source END, ref_name, receiver_name, kind, arity, line, column, metadata, ref_direction FROM edges";
 
 impl SqliteGraphStorage {
     /// Lists only pending refs using keyset pagination; no snapshot spans pages.
@@ -18,7 +18,7 @@ impl SqliteGraphStorage {
             ));
         }
         let mut statement = self.connection.prepare(&format!(
-            "{SELECT_REF} WHERE target IS NULL AND id > ? ORDER BY id LIMIT ?"
+            "{SELECT_REF} WHERE (source IS NULL OR target IS NULL) AND id > ? ORDER BY id LIMIT ?"
         ))?;
         let mut refs: Vec<_> = statement
             .query_map(params![cursor, limit + 1], ref_from_row)?
@@ -40,7 +40,7 @@ impl SqliteGraphStorage {
     /// Rejects invalid proposals and SQLite failures; the entire batch rolls back.
     pub fn apply_resolutions(&mut self, resolutions: &[Resolution]) -> Result<ResolutionStats> {
         for resolution in resolutions {
-            nonempty(&resolution.target_id)?;
+            nonempty(&resolution.entity_id)?;
             if resolution.ref_id < 1 || resolution.provenance == Provenance::FileLocal {
                 return Err(Error::InvalidInput(
                     "resolution requires a positive ref ID and cross-file provenance",
@@ -53,12 +53,15 @@ impl SqliteGraphStorage {
         let mut stats = ResolutionStats::default();
         {
             let mut update = tx.prepare(
-                "UPDATE edges SET target = ?, provenance = ?
-                 WHERE id = ? AND target IS NULL",
+                "UPDATE edges SET
+                    source = CASE WHEN ref_direction = 'in' THEN ?1 ELSE source END,
+                    target = CASE WHEN ref_direction = 'out' THEN ?1 ELSE target END,
+                    provenance = ?2
+                 WHERE id = ?3 AND (source IS NULL OR target IS NULL)",
             )?;
             for resolution in resolutions {
                 let changed = update.execute(params![
-                    resolution.target_id,
+                    resolution.entity_id,
                     resolution.provenance.as_str(),
                     resolution.ref_id,
                 ])?;
@@ -80,6 +83,7 @@ fn ref_from_row(row: &Row<'_>) -> rusqlite::Result<StoredPendingRef> {
         file_id: row.get(1)?,
         reference: PendingRef {
             owner_id: row.get(2)?,
+            direction: decode_enum(row.get(10)?)?,
             ref_name: row.get(3)?,
             receiver_name: row.get(4)?,
             ref_kind: decode_enum(row.get(5)?)?,

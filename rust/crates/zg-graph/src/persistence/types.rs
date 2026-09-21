@@ -57,7 +57,7 @@ impl From<RefKind> for EdgeKind {
     }
 }
 
-/// Evidence used to select an edge target.
+/// Evidence used to select an edge endpoint.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
@@ -84,7 +84,7 @@ pub struct Edge {
     pub kind: EdgeKind,
     pub source: String,
     pub target: String,
-    /// One-based source line of the relationship, if known.
+    /// One-based relationship location in the file that produced this edge.
     pub line: Option<u32>,
     /// Zero-based source column, if known.
     pub column: Option<u32>,
@@ -92,16 +92,37 @@ pub struct Edge {
     pub metadata: Metadata,
 }
 
+/// Direction relative to the known, locally owned endpoint.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefDirection {
+    /// Unknown source -> known owner.
+    In,
+    /// Known owner -> unknown target.
+    Out,
+}
+
+impl RefDirection {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+        }
+    }
+}
+
 /// Extraction output that still requires name resolution.
-/// New snapshots insert unresolved references; storage fills their target.
+/// New snapshots insert unresolved references; storage fills the endpoint selected by direction.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PendingRef {
+    /// Known endpoint in the file that produced this reference.
     pub owner_id: String,
+    pub direction: RefDirection,
     pub ref_name: String,
     pub receiver_name: Option<String>,
     pub ref_kind: RefKind,
     pub arity: Option<u32>,
-    /// One-based source line.
+    /// One-based reference location in the file that produced this reference.
     pub line: u32,
     /// Zero-based source column.
     pub column: u32,
@@ -132,13 +153,14 @@ pub struct PendingRefPage {
     pub next_cursor: Option<i64>,
 }
 
-/// A resolver's proposed edge. The caller must validate the target in zvec and
+/// A resolver's proposed edge. The caller must validate the resolved endpoint in zvec and
 /// serialize the entire read, resolution and writeback cycle with workspace writes/deletions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resolution {
     /// ID of the unresolved row in the edges table.
     pub ref_id: i64,
-    pub target_id: String,
+    /// Fills source for an incoming ref, target for an outgoing ref.
+    pub entity_id: String,
     /// Must be a cross-file provenance; `FileLocal` is rejected.
     pub provenance: Provenance,
 }

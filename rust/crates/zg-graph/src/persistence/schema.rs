@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Error, Result};
 
-pub(crate) const VERSION: i64 = 2;
+pub(crate) const VERSION: i64 = 3;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;
 
 pub(crate) fn validate(connection: &Connection) -> Result<()> {
@@ -46,8 +46,9 @@ CREATE TABLE edges (
     id INTEGER PRIMARY KEY,
     file_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('contains', 'calls', 'imports', 'extends', 'implements')),
-    source TEXT NOT NULL,
+    source TEXT,
     target TEXT,
+    ref_direction TEXT CHECK (ref_direction IN ('in', 'out')),
     ref_name TEXT,
     receiver_name TEXT,
     arity INTEGER CHECK (arity >= 0),
@@ -55,18 +56,22 @@ CREATE TABLE edges (
     column INTEGER CHECK (column >= 0),
     provenance TEXT CHECK (provenance IN ('file_local', 'import_scoped', 'preferred_file', 'workspace_unique')),
     metadata TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata) AND json_type(metadata) = 'object'),
-    CHECK ((target IS NULL) = (provenance IS NULL)),
+    CHECK ((source IS NULL OR target IS NULL) = (provenance IS NULL)),
     CHECK (
-        (ref_name IS NULL AND target IS NOT NULL AND provenance = 'file_local'
-            AND receiver_name IS NULL AND arity IS NULL)
+        (ref_direction IS NULL AND ref_name IS NULL
+            AND source IS NOT NULL AND target IS NOT NULL
+            AND provenance = 'file_local' AND receiver_name IS NULL AND arity IS NULL)
         OR
-        (ref_name IS NOT NULL AND length(trim(ref_name)) > 0 AND kind <> 'contains'
+        (ref_direction IS NOT NULL AND ref_name IS NOT NULL
+            AND length(trim(ref_name)) > 0 AND kind <> 'contains'
             AND line IS NOT NULL AND column IS NOT NULL
-            AND (provenance IS NULL OR provenance <> 'file_local'))
+            AND (provenance IS NULL OR provenance <> 'file_local')
+            AND ((ref_direction = 'in' AND target IS NOT NULL)
+                OR (ref_direction = 'out' AND source IS NOT NULL)))
     )
 ) STRICT;
 CREATE INDEX edges_file ON edges(file_id);
 CREATE INDEX edges_source_kind ON edges(source, kind);
 CREATE INDEX edges_target_kind ON edges(target, kind);
-CREATE INDEX edges_pending ON edges(id) WHERE target IS NULL;
+CREATE INDEX edges_pending ON edges(id) WHERE source IS NULL OR target IS NULL;
 ";
