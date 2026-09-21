@@ -2,6 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Error, Result};
 
+// Unsupported versions require an index rebuild; no schema migration is provided.
 pub(crate) const VERSION: i64 = 8;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;
 
@@ -41,6 +42,9 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+// Direct local edges and references share one table. Resolution fills the target
+// on the existing reference row; invalidation clears it and retains the evidence.
+// `failed` is reserved for resolver integration; no API currently sets it.
 const SCHEMA: &str = "
 CREATE TABLE edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

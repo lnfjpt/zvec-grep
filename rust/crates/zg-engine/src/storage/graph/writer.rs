@@ -9,6 +9,8 @@ impl SqliteGraphStorage {
     /// an empty slice for a new file. Entity IDs in the new snapshot are not stored
     /// in a second node table. The implicit file endpoint is `f{file_id}`, matching
     /// the zvec file document key. Cross-file edges must use `apply_resolutions`.
+    /// Read old IDs before mutating zvec, under the same workspace write lock.
+    /// This transaction covers SQLite only; the coordinator owns cross-store recovery.
     ///
     /// # Errors
     /// Rejects invalid ownership, duplicate/empty IDs, non-local edges, invalid
@@ -30,7 +32,8 @@ impl SqliteGraphStorage {
         targets.dedup();
         for chunk in targets.chunks(500) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            // Retain the original reference for the next resolution pass.
+            // Even unchanged target IDs require re-resolution. Preserve the row ID
+            // and reference context, but discard candidates from the old snapshot.
             tx.execute(
                 &format!("UPDATE edges SET status = 'pending', target = NULL, provenance = NULL, candidates = NULL
                   WHERE target IN ({placeholders}) AND file_id <> ? AND reference_name IS NOT NULL"),

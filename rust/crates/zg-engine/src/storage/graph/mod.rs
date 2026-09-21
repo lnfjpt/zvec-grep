@@ -4,6 +4,7 @@
 //! atomic within SQLite; the indexing coordinator owns consistency with zvec.
 //! Callers must serialize reference reads, resolution and writeback with file updates.
 //! This module does not resolve names, run FTS, or manage workspace locks.
+//! Indexing integration is pending; this storage is not yet opened by `IndexStore`.
 
 mod pending;
 mod reader;

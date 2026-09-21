@@ -36,6 +36,8 @@ impl SqliteGraphStorage {
     /// Atomically applies proposals for existing pending refs, skipping missing
     /// or already resolved refs. The caller must serialize the entire read,
     /// resolution and writeback cycle with workspace writes/deletions.
+    /// Validate targets in zvec before writeback. Row IDs alone cannot detect
+    /// outdated proposals for references that were resolved and then invalidated.
     /// # Errors
     /// Rejects invalid proposals and SQLite failures; the entire batch rolls back.
     pub(crate) fn apply_resolutions(
