@@ -39,7 +39,7 @@ All operations are synchronous. Writes require `&mut self` and use SQLite
 - File-level import targets are invalidated even when the entity-ID list is empty.
   Large ID lists are processed in bounded SQL parameter batches within one transaction.
 - Invalidation removes resolved edges, returns their references to pending, and
-  rotates tokens so stale workers cannot recreate invalidated edges.
+  preserves their original reference details for another resolution pass.
 
 Transactions cover SQLite only. The indexer must coordinate graph writes with
 zvec's file-update journal/checkpoints and use the workspace write lock. Do not
@@ -48,19 +48,20 @@ not add another workspace recovery journal or a ready marker.
 
 ## Reference resolution protocol
 
-1. `list_pending_refs(limit, cursor)` returns pending refs and their identity
-   tokens. Use cursor `0` initially; limits are `1..=1000`. `next_cursor` is only
+1. `list_pending_refs(limit, cursor)` returns pending refs and their database IDs. Use cursor `0` initially; limits are `1..=1000`. `next_cursor` is only
    present when another page exists. Restart pagination after file changes.
 2. A language-aware resolver selects and validates a target in the entity store.
 3. `apply_resolutions(&results)` inserts the resulting edges and updates statuses
-   atomically. Missing, changed or already-resolved references count as `stale`;
+   atomically. Missing or already-resolved references count as `stale`;
    local edges are preserved. Malformed inputs or SQL errors roll back the batch.
 
-Target existence/version validation and writeback must be serialized with file
-updates/deletions by the coordinator. A reference token protects the reference's
-state; it does not prove that an arbitrary target still exists. Symbol-index
-changes that introduce ambiguity may also require re-resolving references; the
-indexing/resolver integration must define that policy.
+The coordinator must hold the workspace write lock across the entire reference
+read, target lookup/validation and writeback cycle, and prevent file mutations
+through the same writer during that cycle. Storage does not detect outdated
+results for reused or invalidated reference IDs. Graph storage is not yet
+connected to the engine's workspace lock.
+Symbol-index changes that introduce ambiguity may also require re-resolving
+references; the indexing/resolver integration must define that policy.
 
 ## Queries
 
@@ -86,6 +87,6 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p zg-graph-storage --no-deps
 ```
 
 Tests exercise real SQLite connections: read-only opening, schema guards,
-replacement/deletion, reverse invalidation, stale tokens/row-ID reuse, keyset
+replacement/deletion, reverse invalidation, missing/already-resolved references, keyset
 pagination, SQL-trigger-injected transaction failures, multi-connection
 visibility, large files, metadata round trips and both call relationship queries.

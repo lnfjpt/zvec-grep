@@ -2,7 +2,7 @@
 //!
 //! Nodes and file metadata remain in the entity store. Each file replacement is
 //! atomic within SQLite; the indexing coordinator owns consistency with zvec.
-//! Reference resolution uses tokens to reject stale writebacks after invalidation.
+//! Callers must serialize reference reads, resolution and writeback with file updates.
 //! This crate does not resolve names, run FTS, or manage workspace locks.
 
 mod pending;

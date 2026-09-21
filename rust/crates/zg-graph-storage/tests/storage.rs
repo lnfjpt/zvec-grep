@@ -45,7 +45,6 @@ fn proposal(storage: &SqliteGraphStorage, target: &str) -> Resolution {
     let stored = &pending.refs[0];
     Resolution {
         ref_id: stored.id,
-        ref_token: stored.token.clone(),
         target_id: target.into(),
         provenance: Provenance::ImportScoped,
     }
@@ -123,7 +122,7 @@ fn replacement_and_repeated_deletion_remove_only_owned_rows() {
 }
 
 #[test]
-fn cross_file_resolution_is_idempotent_and_invalidation_rotates_tokens() {
+fn cross_file_resolution_is_idempotent_and_invalidation_requeues_refs() {
     let mut db = SqliteGraphStorage::in_memory().expect("open");
     let local = edge(EdgeKind::Calls, "a", "b", 1);
     db.write_file_graph(
@@ -165,13 +164,6 @@ fn cross_file_resolution_is_idempotent_and_invalidation_rotates_tokens() {
     assert_eq!(db.get_callees("a").expect("local retained"), vec![local]);
     let renewed = proposal(&db, "replacement");
     assert_eq!(renewed.ref_id, resolution.ref_id);
-    assert_ne!(renewed.ref_token, resolution.ref_token);
-    assert_eq!(
-        db.apply_resolutions(&[resolution])
-            .expect("stale write")
-            .stale,
-        1
-    );
     assert_eq!(
         db.apply_resolutions(&[renewed])
             .expect("resolve again")
@@ -233,21 +225,6 @@ fn file_level_import_targets_are_invalidated_without_entity_ids() {
         .expect("delete empty target");
     assert_eq!(import_count(), 0);
     assert_eq!(db.list_pending_refs(100, 0).expect("pending").refs.len(), 1);
-}
-
-#[test]
-fn reused_reference_row_ids_cannot_accept_old_tokens() {
-    let mut db = SqliteGraphStorage::in_memory().expect("open");
-    let snapshot = graph(&["a"], vec![], vec![reference("a", "b")]);
-    db.write_file_graph("file", &snapshot, &[]).expect("write");
-    let old = proposal(&db, "b");
-    db.write_file_graph("file", &snapshot, &["a".into()])
-        .expect("replace");
-    let new = proposal(&db, "b");
-    assert_eq!(old.ref_id, new.ref_id);
-    assert_ne!(old.ref_token, new.ref_token);
-    assert_eq!(db.apply_resolutions(&[old]).expect("stale").stale, 1);
-    assert_eq!(db.apply_resolutions(&[new]).expect("current").resolved, 1);
 }
 
 #[test]
@@ -411,7 +388,6 @@ fn sql_failure_rolls_back_an_entire_resolution_batch() {
         .enumerate()
         .map(|(i, stored)| Resolution {
             ref_id: stored.id,
-            ref_token: stored.token.clone(),
             target_id: format!("target-{i}"),
             provenance: Provenance::WorkspaceUnique,
         })
@@ -517,10 +493,6 @@ fn invalid_and_stale_resolution_proposals_do_not_mutate_pending_refs() {
             ..valid.clone()
         },
         Resolution {
-            ref_token: String::new(),
-            ..valid.clone()
-        },
-        Resolution {
             target_id: " ".into(),
             ..valid.clone()
         },
@@ -540,7 +512,7 @@ fn invalid_and_stale_resolution_proposals_do_not_mutate_pending_refs() {
         assert!(db.get_callees("a").expect("no edge").is_empty());
     }
     let stale = Resolution {
-        ref_token: "old-token".into(),
+        ref_id: i64::MAX,
         ..valid.clone()
     };
     assert_eq!(
@@ -553,7 +525,7 @@ fn invalid_and_stale_resolution_proposals_do_not_mutate_pending_refs() {
 }
 
 #[test]
-fn independent_connections_observe_commits_and_reject_stale_writeback() {
+fn independent_connections_observe_commits_and_skip_deleted_refs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("graph.sqlite");
     let mut writer = open(&path);

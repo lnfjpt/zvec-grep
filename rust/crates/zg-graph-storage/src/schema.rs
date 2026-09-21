@@ -45,7 +45,6 @@ const SCHEMA: &str = "
 CREATE TABLE pending_refs (
     id INTEGER PRIMARY KEY,
     file_id TEXT NOT NULL,
-    token TEXT NOT NULL,
     owner_id TEXT NOT NULL,
     ref_name TEXT NOT NULL,
     receiver_name TEXT,
@@ -58,7 +57,6 @@ CREATE TABLE pending_refs (
 ) STRICT;
 CREATE INDEX pending_refs_file ON pending_refs(file_id);
 CREATE INDEX pending_refs_status_id ON pending_refs(status, id);
-CREATE UNIQUE INDEX pending_refs_token ON pending_refs(token);
 CREATE TABLE edges (
     id INTEGER PRIMARY KEY,
     file_id TEXT NOT NULL,

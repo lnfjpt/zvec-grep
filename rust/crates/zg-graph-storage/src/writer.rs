@@ -1,6 +1,5 @@
 use rusqlite::{TransactionBehavior, params, params_from_iter};
 use std::collections::HashSet;
-use uuid::Uuid;
 
 use crate::{Error, FileGraph, Provenance, Result, SqliteGraphStorage, nonempty};
 
@@ -29,10 +28,9 @@ impl SqliteGraphStorage {
         targets.dedup();
         for chunk in targets.chunks(500) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            // Rotate the token before deleting the resolved edge. A worker that
-            // observed the old reference may not restore a deleted/replaced target.
+            // Retain the original reference for the next resolution pass.
             tx.execute(
-                &format!("UPDATE pending_refs SET status = 'pending', token = lower(hex(randomblob(16)))
+                &format!("UPDATE pending_refs SET status = 'pending'
                   WHERE id IN (SELECT ref_id FROM edges WHERE target IN ({placeholders}) AND file_id <> ?)"),
                 params_from_iter(chunk.iter().copied().chain(std::iter::once(file_id))),
             )?;
@@ -62,12 +60,11 @@ impl SqliteGraphStorage {
                 ])?;
             }
             let mut insert = tx.prepare("INSERT INTO pending_refs
-                (file_id, token, owner_id, ref_name, receiver_name, ref_kind, arity, line, column, status, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)")?;
+                (file_id, owner_id, ref_name, receiver_name, ref_kind, arity, line, column, status, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)")?;
             for reference in &graph.pending_refs {
                 insert.execute(params![
                     file_id,
-                    Uuid::new_v4().to_string(),
                     reference.owner_id,
                     reference.ref_name,
                     reference.receiver_name,

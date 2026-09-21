@@ -4,7 +4,7 @@ use crate::{
 };
 use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
 
-const SELECT_REF: &str = "SELECT id, token, file_id, owner_id, ref_name, receiver_name, ref_kind, arity, line, column, metadata FROM pending_refs";
+const SELECT_REF: &str = "SELECT id, file_id, owner_id, ref_name, receiver_name, ref_kind, arity, line, column, metadata FROM pending_refs";
 
 impl SqliteGraphStorage {
     /// Lists only pending refs using keyset pagination; no snapshot spans pages.
@@ -33,14 +33,13 @@ impl SqliteGraphStorage {
         Ok(PendingRefPage { refs, next_cursor })
     }
 
-    /// Atomically applies valid pending-ref tokens, skipping stale/already applied
-    /// proposals. Local edges are retained. Target existence/version validation
-    /// and serialization with workspace changes belong to the calling pipeline.
+    /// Atomically applies proposals for existing pending refs, skipping missing
+    /// or already resolved refs. The caller must serialize the entire read,
+    /// resolution and writeback cycle with workspace writes/deletions.
     /// # Errors
     /// Rejects invalid proposals and SQLite failures; the entire batch rolls back.
     pub fn apply_resolutions(&mut self, resolutions: &[Resolution]) -> Result<ResolutionStats> {
         for resolution in resolutions {
-            nonempty(&resolution.ref_token)?;
             nonempty(&resolution.target_id)?;
             if resolution.ref_id < 1 || resolution.provenance == Provenance::FileLocal {
                 return Err(Error::InvalidInput(
@@ -53,9 +52,8 @@ impl SqliteGraphStorage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut stats = ResolutionStats::default();
         {
-            let mut find = tx.prepare(&format!(
-                "{SELECT_REF} WHERE id = ? AND token = ? AND status = 'pending'"
-            ))?;
+            let mut find =
+                tx.prepare(&format!("{SELECT_REF} WHERE id = ? AND status = 'pending'"))?;
             let mut insert = tx.prepare(
                 "INSERT INTO edges
                 (file_id, ref_id, kind, source, target, line, column, provenance, metadata)
@@ -65,10 +63,7 @@ impl SqliteGraphStorage {
                 tx.prepare("UPDATE pending_refs SET status = 'resolved' WHERE id = ?")?;
             for resolution in resolutions {
                 let reference = find
-                    .query_row(
-                        params![resolution.ref_id, resolution.ref_token],
-                        ref_from_row,
-                    )
+                    .query_row(params![resolution.ref_id], ref_from_row)
                     .optional()?;
                 let Some(stored) = reference else {
                     stats.stale += 1;
@@ -98,17 +93,16 @@ impl SqliteGraphStorage {
 fn ref_from_row(row: &Row<'_>) -> rusqlite::Result<StoredPendingRef> {
     Ok(StoredPendingRef {
         id: row.get(0)?,
-        token: row.get(1)?,
-        file_id: row.get(2)?,
+        file_id: row.get(1)?,
         reference: PendingRef {
-            owner_id: row.get(3)?,
-            ref_name: row.get(4)?,
-            receiver_name: row.get(5)?,
-            ref_kind: decode_enum(row.get(6)?)?,
-            arity: row.get(7)?,
-            line: row.get(8)?,
-            column: row.get(9)?,
-            metadata: decode_metadata(&row.get::<_, String>(10)?)?,
+            owner_id: row.get(2)?,
+            ref_name: row.get(3)?,
+            receiver_name: row.get(4)?,
+            ref_kind: decode_enum(row.get(5)?)?,
+            arity: row.get(6)?,
+            line: row.get(7)?,
+            column: row.get(8)?,
+            metadata: decode_metadata(&row.get::<_, String>(9)?)?,
         },
     })
 }

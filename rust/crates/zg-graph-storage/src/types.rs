@@ -117,11 +117,10 @@ pub struct FileGraph {
     pub pending_refs: Vec<PendingRef>,
 }
 
-/// A pending reference with its database identity and optimistic writeback token.
+/// A pending reference with its database identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredPendingRef {
     pub id: i64,
-    pub token: String,
     pub file_id: String,
     pub reference: PendingRef,
 }
@@ -134,17 +133,16 @@ pub struct PendingRefPage {
 }
 
 /// A resolver's proposed edge. The caller must validate the target in zvec and
-/// serialize that validation and writeback with workspace writes/deletions.
+/// serialize the entire read, resolution and writeback cycle with workspace writes/deletions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resolution {
     pub ref_id: i64,
-    pub ref_token: String,
     pub target_id: String,
     /// Must be a cross-file provenance; `FileLocal` is rejected.
     pub provenance: Provenance,
 }
 
-/// Applied and stale proposals in an atomic resolution batch.
+/// Applied proposals and missing/already resolved references in an atomic batch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResolutionStats {
     pub resolved: usize,
