@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 use serde_json::json;
-use zg_graph_storage::{
+use zg_graph::persistence::{
     Direction, Edge, EdgeKind, Error, FileGraph, Metadata, OpenMode, PendingRef, Provenance,
     RefKind, Resolution, ResolutionStats, SqliteGraphStorage,
 };

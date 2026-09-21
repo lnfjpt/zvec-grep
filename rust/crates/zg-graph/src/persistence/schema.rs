@@ -1,6 +1,6 @@
 use rusqlite::{Connection, TransactionBehavior};
 
-use crate::{Error, Result};
+use super::{Error, Result};
 
 pub(crate) const VERSION: i64 = 1;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;

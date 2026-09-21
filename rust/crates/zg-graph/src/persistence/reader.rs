@@ -1,4 +1,4 @@
-use crate::{
+use super::{
     Direction, Edge, EdgeKind, Result, SqliteGraphStorage, decode_enum, decode_metadata, nonempty,
 };
 use rusqlite::{Row, params_from_iter};

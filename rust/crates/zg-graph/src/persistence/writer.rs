@@ -1,7 +1,7 @@
 use rusqlite::{TransactionBehavior, params, params_from_iter};
 use std::collections::HashSet;
 
-use crate::{Error, FileGraph, Provenance, Result, SqliteGraphStorage, nonempty};
+use super::{Error, FileGraph, Provenance, Result, SqliteGraphStorage, nonempty};
 
 impl SqliteGraphStorage {
     /// Atomically replaces one file's local graph and invalidates inbound edges.
@@ -68,7 +68,7 @@ impl SqliteGraphStorage {
                     reference.owner_id,
                     reference.ref_name,
                     reference.receiver_name,
-                    crate::EdgeKind::from(reference.ref_kind).as_str(),
+                    super::EdgeKind::from(reference.ref_kind).as_str(),
                     reference.arity,
                     reference.line,
                     reference.column,

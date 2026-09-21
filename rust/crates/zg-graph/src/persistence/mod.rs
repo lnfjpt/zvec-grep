@@ -3,7 +3,7 @@
 //! Nodes and file metadata remain in the entity store. Each file replacement is
 //! atomic within SQLite; the indexing coordinator owns consistency with zvec.
 //! Callers must serialize reference reads, resolution and writeback with file updates.
-//! This crate does not resolve names, run FTS, or manage workspace locks.
+//! This module does not resolve names, run FTS, or manage workspace locks.
 
 mod pending;
 mod reader;

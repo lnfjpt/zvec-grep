@@ -1,5 +1,5 @@
 [package]
-name = "zg-graph-storage"
+name = "zg-graph"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

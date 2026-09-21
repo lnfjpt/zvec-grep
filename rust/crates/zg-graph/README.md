@@ -1,6 +1,7 @@
-# Graph storage
+# Graph
 
-`zg-graph-storage` ports the TypeScript graph persistence protocol to Rust. It is
+The `zg_graph::persistence` module ports the TypeScript graph persistence protocol
+to Rust. The `zg-graph` crate is
 an independent Cargo workspace member so its SQLite behavior can be validated
 without loading embeddings, zvec, or a daemon. `rusqlite` owns the connection and
 builds a bundled SQLite; Node.js and a system SQLite installation are not needed.
@@ -8,6 +9,22 @@ builds a bundled SQLite; Node.js and a system SQLite installation are not needed
 This is the storage-only migration. The engine does not use the crate yet.
 Extraction, indexing orchestration, zvec symbol lookup, FTS fallback, resolvers,
 MCP/CLI tools, and engine API methods belong in subsequent integration changes.
+
+## Structure
+
+```text
+src/
+├── lib.rs
+└── persistence/
+    ├── mod.rs
+    ├── types.rs
+    ├── schema.rs
+    ├── writer.rs
+    ├── reader.rs
+    └── pending.rs
+```
+
+Storage types are exposed under `zg_graph::persistence`.
 
 ## Ownership
 
@@ -79,11 +96,11 @@ in the relationship pipeline.
 Run from `rust/`:
 
 ```sh
-cargo fmt -p zg-graph-storage --check
-cargo check -p zg-graph-storage --all-targets
-cargo clippy -p zg-graph-storage --all-targets -- -D warnings
-cargo test -p zg-graph-storage
-RUSTDOCFLAGS="-D warnings" cargo doc -p zg-graph-storage --no-deps
+cargo fmt -p zg-graph --check
+cargo check -p zg-graph --all-targets
+cargo clippy -p zg-graph --all-targets -- -D warnings
+cargo test -p zg-graph
+RUSTDOCFLAGS="-D warnings" cargo doc -p zg-graph --no-deps
 ```
 
 Tests exercise real SQLite connections: read-only opening, schema guards,

@@ -1,4 +1,4 @@
-use crate::{
+use super::{
     Error, PendingRef, PendingRefPage, Provenance, Resolution, ResolutionStats, Result,
     SqliteGraphStorage, StoredPendingRef, decode_enum, decode_metadata, nonempty,
 };
@@ -73,7 +73,7 @@ impl SqliteGraphStorage {
                 insert.execute(params![
                     stored.file_id,
                     stored.id,
-                    crate::EdgeKind::from(reference.ref_kind).as_str(),
+                    super::EdgeKind::from(reference.ref_kind).as_str(),
                     reference.owner_id,
                     resolution.target_id,
                     reference.line,
