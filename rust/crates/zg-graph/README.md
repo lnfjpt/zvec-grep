@@ -73,8 +73,10 @@ not add another workspace recovery journal or a ready marker.
 Each reference has one known endpoint, `PendingRef.owner_id`, owned by its
 extraction file. `PendingRef.direction` determines the unresolved endpoint:
 
-- `RefDirection::Out`: `owner -> unresolved`; fill `target`.
-- `RefDirection::In`: `unresolved -> owner`; fill `source`.
+- `Direction::Out`: `owner -> unresolved`; fill `target`.
+- `Direction::In`: `unresolved -> owner`; fill `source`.
+
+`Direction::Both` is accepted for queries but rejected when writing a reference.
 
 SQLite retains `ref_direction` after resolution so invalidation clears the
 correct endpoint. `Resolution.entity_id` supplies the resolved entity; the

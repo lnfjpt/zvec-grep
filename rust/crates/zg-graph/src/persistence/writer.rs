@@ -1,7 +1,7 @@
 use rusqlite::{TransactionBehavior, params, params_from_iter};
 use std::collections::HashSet;
 
-use super::{Error, FileGraph, Provenance, RefDirection, Result, SqliteGraphStorage, nonempty};
+use super::{Direction, Error, FileGraph, Provenance, Result, SqliteGraphStorage, nonempty};
 
 impl SqliteGraphStorage {
     /// Atomically replaces one file's local graph and invalidates references to either endpoint.
@@ -72,15 +72,20 @@ impl SqliteGraphStorage {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )?;
             for reference in &graph.pending_refs {
-                let (source, target) = match reference.direction {
-                    RefDirection::In => (None, Some(&reference.owner_id)),
-                    RefDirection::Out => (Some(&reference.owner_id), None),
+                let (source, target, direction) = match reference.direction {
+                    Direction::In => (None, Some(&reference.owner_id), "in"),
+                    Direction::Out => (Some(&reference.owner_id), None, "out"),
+                    Direction::Both => {
+                        return Err(Error::InvalidInput(
+                            "pending refs require in or out direction",
+                        ));
+                    }
                 };
                 insert.execute(params![
                     file_id,
                     source,
                     target,
-                    reference.direction.as_str(),
+                    direction,
                     reference.ref_name,
                     reference.receiver_name,
                     super::EdgeKind::from(reference.ref_kind).as_str(),
@@ -131,6 +136,11 @@ fn validate(file_id: &str, graph: &FileGraph, old_entity_ids: &[String]) -> Resu
         }
     }
     for reference in &graph.pending_refs {
+        if reference.direction == Direction::Both {
+            return Err(Error::InvalidInput(
+                "pending refs require in or out direction",
+            ));
+        }
         nonempty(&reference.ref_name)?;
         if !owns(&reference.owner_id) || reference.line == 0 {
             return Err(Error::InvalidInput(

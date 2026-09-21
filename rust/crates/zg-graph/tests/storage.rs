@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use serde_json::json;
 use zg_graph::persistence::{
     Direction, Edge, EdgeKind, Error, FileGraph, Metadata, OpenMode, PendingRef, Provenance,
-    RefDirection, RefKind, Resolution, ResolutionStats, SqliteGraphStorage,
+    RefKind, Resolution, ResolutionStats, SqliteGraphStorage,
 };
 
 fn edge(kind: EdgeKind, source: &str, target: &str, line: u32) -> Edge {
@@ -22,7 +22,7 @@ fn edge(kind: EdgeKind, source: &str, target: &str, line: u32) -> Edge {
 fn reference(owner: &str, name: &str) -> PendingRef {
     PendingRef {
         owner_id: owner.into(),
-        direction: RefDirection::Out,
+        direction: Direction::Out,
         ref_name: name.into(),
         receiver_name: Some("module".into()),
         ref_kind: RefKind::Calls,
@@ -755,7 +755,7 @@ fn prior_schema_version_requires_rebuild_without_mutation() {
 
 fn incoming_reference(owner: &str, name: &str) -> PendingRef {
     PendingRef {
-        direction: RefDirection::In,
+        direction: Direction::In,
         ..reference(owner, name)
     }
 }
@@ -773,7 +773,7 @@ fn incoming_reference_resolves_source_and_requeues_after_source_changes() {
     db.write_file_graph("caller-file", &graph(&["caller"], vec![], vec![]), &[])
         .expect("write source");
     let pending = db.list_pending_refs(100, 0).expect("pending").refs;
-    assert_eq!(pending[0].reference.direction, RefDirection::In);
+    assert_eq!(pending[0].reference.direction, Direction::In);
     assert_eq!(pending[0].reference.owner_id, "callee");
     assert!(
         db.get_callers("callee")
@@ -857,8 +857,8 @@ fn mixed_direction_resolution_rolls_back_atomically_and_pages_both_directions() 
     let second = db
         .list_pending_refs(1, first.next_cursor.expect("cursor"))
         .expect("second");
-    assert_eq!(first.refs[0].reference.direction, RefDirection::Out);
-    assert_eq!(second.refs[0].reference.direction, RefDirection::In);
+    assert_eq!(first.refs[0].reference.direction, Direction::Out);
+    assert_eq!(second.refs[0].reference.direction, Direction::In);
     let before = db.list_pending_refs(100, 0).expect("all").refs;
     let resolutions: Vec<_> = before
         .iter()
@@ -958,4 +958,37 @@ fn schema_requires_known_endpoint_matching_reference_direction() {
     for (source, target, direction) in [(None, Some("owner"), "in"), (Some("owner"), None, "out")] {
         raw.execute("INSERT INTO edges (file_id, kind, source, target, ref_direction, ref_name, line, column) VALUES ('f', 'calls', ?, ?, ?, 'name', 1, 0)", rusqlite::params![source, target, direction]).expect("valid pending row");
     }
+}
+
+#[test]
+fn both_direction_reference_is_rejected_without_replacing_existing_graph() {
+    let mut db = SqliteGraphStorage::in_memory().expect("open");
+    let original = graph(
+        &["a", "b"],
+        vec![edge(EdgeKind::Calls, "a", "b", 1)],
+        vec![reference("a", "external")],
+    );
+    db.write_file_graph("file", &original, &[]).expect("write");
+    let before = db.list_pending_refs(100, 0).expect("refs").refs;
+    let invalid = PendingRef {
+        direction: Direction::Both,
+        ..reference("a", "external")
+    };
+    assert!(matches!(
+        db.write_file_graph(
+            "file",
+            &graph(&["a"], vec![], vec![invalid]),
+            &["a".into(), "b".into()]
+        ),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(
+        db.list_pending_refs(100, 0).expect("unchanged refs").refs,
+        before
+    );
+    assert_eq!(
+        db.neighborhood("a", Direction::Both, None)
+            .expect("both query still works"),
+        original.edges
+    );
 }

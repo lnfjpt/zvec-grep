@@ -4,8 +4,9 @@ use serde_json::{Map, Value};
 /// Extensible evidence attached to edges and unresolved references.
 pub type Metadata = Map<String, Value>;
 
-/// Direction of a one-hop query relative to its endpoint.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Direction relative to a query endpoint or a reference's known owner.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Direction {
     In,
     Out,
@@ -92,32 +93,14 @@ pub struct Edge {
     pub metadata: Metadata,
 }
 
-/// Direction relative to the known, locally owned endpoint.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RefDirection {
-    /// Unknown source -> known owner.
-    In,
-    /// Known owner -> unknown target.
-    Out,
-}
-
-impl RefDirection {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::In => "in",
-            Self::Out => "out",
-        }
-    }
-}
-
 /// Extraction output that still requires name resolution.
 /// New snapshots insert unresolved references; storage fills the endpoint selected by direction.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PendingRef {
     /// Known endpoint in the file that produced this reference.
     pub owner_id: String,
-    pub direction: RefDirection,
+    /// Must be In or Out; Both is only supported for queries.
+    pub direction: Direction,
     pub ref_name: String,
     pub receiver_name: Option<String>,
     pub ref_kind: RefKind,
