@@ -3,8 +3,8 @@ use std::path::Path;
 use rusqlite::Connection;
 use serde_json::json;
 use zg_graph_storage::{
-    Edge, EdgeKind, Error, FileGraph, Metadata, OpenMode, PendingRef, Provenance, RefKind,
-    Resolution, ResolutionStats, SqliteGraphStorage,
+    Direction, Edge, EdgeKind, Error, FileGraph, Metadata, OpenMode, PendingRef, Provenance,
+    RefKind, Resolution, ResolutionStats, SqliteGraphStorage,
 };
 
 fn edge(kind: EdgeKind, source: &str, target: &str, line: u32) -> Edge {
@@ -573,5 +573,85 @@ fn independent_connections_observe_commits_and_reject_stale_writeback() {
             .expect("committed delete")
             .refs
             .is_empty()
+    );
+}
+
+#[test]
+fn neighborhood_filters_direction_and_kinds() {
+    let mut db = SqliteGraphStorage::in_memory().expect("open");
+    let edges = vec![
+        edge(EdgeKind::Calls, "a", "b", 1),
+        edge(EdgeKind::Calls, "a", "b", 2),
+        edge(EdgeKind::Calls, "b", "b", 3),
+        edge(EdgeKind::Imports, "b", "a", 4),
+        edge(EdgeKind::Contains, "file", "b", 5),
+        edge(EdgeKind::Extends, "a", "c", 6),
+    ];
+    db.write_file_graph(
+        "file",
+        &graph(
+            &["a", "b", "c"],
+            edges.clone(),
+            vec![reference("b", "pending")],
+        ),
+        &[],
+    )
+    .expect("write");
+    assert_eq!(
+        db.neighborhood("b", Direction::Both, None).expect("both"),
+        edges[..5]
+    );
+    assert_eq!(
+        db.neighborhood("b", Direction::In, None).expect("in"),
+        vec![
+            edges[0].clone(),
+            edges[1].clone(),
+            edges[2].clone(),
+            edges[4].clone()
+        ]
+    );
+    assert_eq!(
+        db.neighborhood("b", Direction::Out, None).expect("out"),
+        edges[2..4]
+    );
+    assert_eq!(
+        db.neighborhood(
+            "b",
+            Direction::Both,
+            Some(&[EdgeKind::Imports, EdgeKind::Calls, EdgeKind::Calls])
+        )
+        .expect("kinds"),
+        edges[..4]
+    );
+    assert!(
+        db.neighborhood("b", Direction::Both, Some(&[]))
+            .expect("empty kinds")
+            .is_empty()
+    );
+    assert!(
+        db.neighborhood("missing", Direction::Both, None)
+            .expect("missing")
+            .is_empty()
+    );
+    assert!(db.neighborhood(" ", Direction::Both, None).is_err());
+    assert_eq!(
+        db.neighborhood("file", Direction::Out, None)
+            .expect("file endpoint"),
+        vec![edges[4].clone()]
+    );
+}
+
+#[test]
+fn neighborhood_returns_all_edges_without_a_limit() {
+    let mut db = SqliteGraphStorage::in_memory().expect("open");
+    let edges: Vec<_> = (1..=1100)
+        .map(|line| edge(EdgeKind::Calls, "a", "b", line))
+        .collect();
+    db.write_file_graph("file", &graph(&["a", "b"], edges.clone(), vec![]), &[])
+        .expect("write");
+    assert_eq!(
+        db.neighborhood("a", Direction::Both, None)
+            .expect("all edges"),
+        edges
     );
 }

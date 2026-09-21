@@ -1,30 +1,62 @@
-use crate::{Edge, Result, SqliteGraphStorage, decode_enum, decode_metadata, nonempty};
-use rusqlite::Row;
+use crate::{
+    Direction, Edge, EdgeKind, Result, SqliteGraphStorage, decode_enum, decode_metadata, nonempty,
+};
+use rusqlite::{Row, params_from_iter};
 
 impl SqliteGraphStorage {
     /// All incoming call edges, in insertion order; retains distinct call sites.
     /// # Errors
     /// Rejects blank IDs, invalid stored data, and SQLite errors.
     pub fn get_callers(&self, target_id: &str) -> Result<Vec<Edge>> {
-        self.read_calls("target", target_id)
+        self.neighborhood(target_id, Direction::In, Some(&[EdgeKind::Calls]))
     }
 
     /// All outgoing call edges, in insertion order.
     /// # Errors
     /// Rejects blank IDs, invalid stored data, and SQLite errors.
     pub fn get_callees(&self, source_id: &str) -> Result<Vec<Edge>> {
-        self.read_calls("source", source_id)
+        self.neighborhood(source_id, Direction::Out, Some(&[EdgeKind::Calls]))
     }
 
-    fn read_calls(&self, field: &str, id: &str) -> Result<Vec<Edge>> {
+    /// All resolved one-hop edges in insertion order, with no result limit.
+    /// `None` selects all kinds; `Some(&[])` selects none.
+    /// Self-loops appear once; distinct stored call sites are preserved.
+    ///
+    /// # Errors
+    /// Rejects blank IDs, invalid stored data, and SQLite errors.
+    pub fn neighborhood(
+        &self,
+        id: &str,
+        direction: Direction,
+        kinds: Option<&[EdgeKind]>,
+    ) -> Result<Vec<Edge>> {
         nonempty(id)?;
-        // `field` is a private constant selected above; endpoint values are bound.
-        let mut statement = self.connection.prepare(&format!(
+        let endpoint = match direction {
+            Direction::In => "target = ?1",
+            Direction::Out => "source = ?1",
+            Direction::Both => "(source = ?1 OR target = ?1)",
+        };
+        let mut sql = format!(
             "SELECT kind, source, target, line, column, provenance, metadata
-             FROM edges WHERE {field} = ? AND kind = 'calls' ORDER BY id"
-        ))?;
+             FROM edges WHERE {endpoint}"
+        );
+        let mut values = vec![id];
+        if let Some(kinds) = kinds {
+            if kinds.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut names: Vec<&str> = kinds.iter().map(|kind| kind.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            sql.push_str(" AND kind IN (");
+            sql.push_str(&vec!["?"; names.len()].join(", "));
+            sql.push(')');
+            values.extend(names);
+        }
+        sql.push_str(" ORDER BY id");
+        let mut statement = self.connection.prepare(&sql)?;
         Ok(statement
-            .query_map([id], edge_from_row)?
+            .query_map(params_from_iter(values), edge_from_row)?
             .collect::<rusqlite::Result<_>>()?)
     }
 }

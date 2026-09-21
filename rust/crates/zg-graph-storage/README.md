@@ -66,9 +66,12 @@ indexing/resolver integration must define that policy.
 
 `get_callers` and `get_callees` return incoming and outgoing call edges in
 insertion order. Other edge kinds, pending refs and node metadata are excluded.
-Distinct stored call sites are preserved. There is no neighborhood API, fuzzy
-lookup, ranking, or query limit here; result formatting, per-symbol limits and
-totals belong in the relationship pipeline.
+`neighborhood(id, direction, kinds)` returns one-hop edges for `Direction::In`,
+`Out`, or `Both`. Pass `None` for all kinds or `Some(&[])` for none. Self-loops
+appear once, and distinct stored call sites are preserved. All three queries
+have no limit parameter and return all matching edges in insertion order.
+Fuzzy lookup, ranking, result formatting, per-symbol limits and totals belong
+in the relationship pipeline.
 
 ## Checks
 

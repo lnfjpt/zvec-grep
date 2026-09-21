@@ -4,6 +4,15 @@ use serde_json::{Map, Value};
 /// Extensible evidence attached to edges and unresolved references.
 pub type Metadata = Map<String, Value>;
 
+/// Direction of a one-hop query relative to its endpoint.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Direction {
+    In,
+    Out,
+    #[default]
+    Both,
+}
+
 /// Kinds of directed graph edges.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
