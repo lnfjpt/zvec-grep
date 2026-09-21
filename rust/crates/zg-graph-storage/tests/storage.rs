@@ -76,23 +76,6 @@ fn local_queries_preserve_direction_kinds_order_metadata_and_call_sites() {
     assert_eq!(db.get_callers("b").expect("callers"), edges[..3]);
     assert_eq!(db.get_callees("a").expect("callees"), edges[..2]);
     assert!(db.get_callers("a").expect("no incoming").is_empty());
-    assert_eq!(
-        db.get_imports("file").expect("owned imports"),
-        vec![edges[4].clone()]
-    );
-    assert!(db.get_imports("a").expect("not owner").is_empty());
-    assert_eq!(
-        db.get_inheritance("a").expect("extends"),
-        vec![edges[5].clone()]
-    );
-    assert_eq!(
-        db.get_subclasses("b").expect("subclasses"),
-        vec![edges[5].clone()]
-    );
-    assert_eq!(
-        db.get_implementations("b").expect("implements"),
-        vec![edges[6].clone()]
-    );
     assert!(db.get_callees("missing").expect("unknown").is_empty());
     assert!(db.get_callers(" ").is_err());
 }
@@ -227,21 +210,28 @@ fn replacing_a_target_with_the_same_id_invalidates_resolutions() {
 
 #[test]
 fn file_level_import_targets_are_invalidated_without_entity_ids() {
-    let mut db = SqliteGraphStorage::in_memory().expect("open");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("graph.sqlite");
+    let mut db = open(&path);
+    let raw = Connection::open(&path).expect("inspect persisted edges");
+    let import_count = || {
+        raw.query_row(
+            "SELECT count(*) FROM edges WHERE kind = 'imports' AND file_id = 'source-file'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("import count")
+    };
     let mut import = reference("source-file", "module");
     import.ref_kind = RefKind::Imports;
     db.write_file_graph("source-file", &graph(&[], vec![], vec![import]), &[])
         .expect("import");
     let resolution = proposal(&db, "target-file");
     db.apply_resolutions(&[resolution]).expect("resolve");
-    assert_eq!(db.get_imports("source-file").expect("read").len(), 1);
+    assert_eq!(import_count(), 1);
     db.delete_file_graph("target-file", &[])
         .expect("delete empty target");
-    assert!(
-        db.get_imports("source-file")
-            .expect("invalidated import")
-            .is_empty()
-    );
+    assert_eq!(import_count(), 0);
     assert_eq!(db.list_pending_refs(100, 0).expect("pending").refs.len(), 1);
 }
 

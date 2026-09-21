@@ -64,12 +64,11 @@ indexing/resolver integration must define that policy.
 
 ## Queries
 
-`get_callers`, `get_callees`, `get_imports`, `get_inheritance`, `get_subclasses`,
-and `get_implementations` return stored edges in insertion order. Imports are
-filtered by the **owning file**, while other queries filter endpoints. Pending
-refs and node metadata are excluded. Distinct stored call sites are preserved.
-There is no neighborhood API, fuzzy lookup, ranking, or query limit here; result
-formatting, per-symbol limits and totals belong in the relationship pipeline.
+`get_callers` and `get_callees` return incoming and outgoing call edges in
+insertion order. Other edge kinds, pending refs and node metadata are excluded.
+Distinct stored call sites are preserved. There is no neighborhood API, fuzzy
+lookup, ranking, or query limit here; result formatting, per-symbol limits and
+totals belong in the relationship pipeline.
 
 ## Checks
 
@@ -86,4 +85,4 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p zg-graph-storage --no-deps
 Tests exercise real SQLite connections: read-only opening, schema guards,
 replacement/deletion, reverse invalidation, stale tokens/row-ID reuse, keyset
 pagination, SQL-trigger-injected transaction failures, multi-connection
-visibility, large files, metadata round trips and all six relationship queries.
+visibility, large files, metadata round trips and both call relationship queries.
