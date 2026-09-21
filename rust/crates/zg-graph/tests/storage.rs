@@ -397,7 +397,7 @@ fn sql_failure_rolls_back_an_entire_resolution_batch() {
         })
         .collect();
     Connection::open(&path).expect("raw").execute_batch(
-        "CREATE TRIGGER fail_second BEFORE INSERT ON edges WHEN NEW.target = 'target-1' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+        "CREATE TRIGGER fail_second BEFORE UPDATE OF target ON edges WHEN NEW.target = 'target-1' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
     ).expect("trigger");
     assert!(db.apply_resolutions(&proposals).is_err());
     assert!(db.get_callees("a").expect("no partial edge").is_empty());
@@ -467,7 +467,7 @@ fn schemas_reject_foreign_and_newer_databases_without_rewriting_versions() {
 }
 
 #[test]
-fn schema_contains_edges_and_unresolved_refs_and_enforces_json_objects() {
+fn schema_contains_only_edges_and_enforces_json_objects() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("graph.sqlite");
     open(&path).close().expect("init");
@@ -480,9 +480,9 @@ fn schema_contains_edges_and_unresolved_refs_and_enforces_json_objects() {
         .expect("query")
         .collect::<rusqlite::Result<_>>()
         .expect("rows");
-    assert_eq!(names, ["edges", "sqlite_sequence", "unresolved_refs"]);
-    assert!(raw.execute("INSERT INTO edges (file_id, kind, source, target, provenance, metadata) VALUES ('f', 'calls', 'a', 'b', 'file_local', '[]')", []).is_err());
-    assert!(raw.execute("INSERT INTO edges (file_id, kind, source, target, provenance, line) VALUES ('f', 'calls', 'a', 'b', 'file_local', 0)", []).is_err());
+    assert_eq!(names, ["edges", "sqlite_sequence"]);
+    assert!(raw.execute("INSERT INTO edges (file_id, kind, source, target, provenance, status, metadata) VALUES ('f', 'calls', 'a', 'b', 'file_local', 'resolved', '[]')", []).is_err());
+    assert!(raw.execute("INSERT INTO edges (file_id, kind, source, target, provenance, status, line) VALUES ('f', 'calls', 'a', 'b', 'file_local', 'resolved', 0)", []).is_err());
 }
 
 #[test]
@@ -685,18 +685,23 @@ fn resolution_retains_reference_context_and_invalidation_resets_candidates() {
     let raw = Connection::open(&path).expect("raw");
     let (status, candidates): (String, String) = raw
         .query_row(
-            "SELECT status, candidates FROM unresolved_refs WHERE id = ?",
+            "SELECT status, candidates FROM edges WHERE id = ?",
             [stored.id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .expect("retained ref");
     assert_eq!(status, "resolved");
     assert_eq!(
+        raw.query_row("SELECT count(*) FROM edges", [], |r| r.get::<_, i64>(0))
+            .expect("one row"),
+        1
+    );
+    assert_eq!(
         serde_json::from_str::<Vec<String>>(&candidates).expect("json"),
         original.candidates.clone().expect("candidates")
     );
     let (source, target, ref_id): (String, String, i64) = raw
-        .query_row("SELECT source, target, ref_id FROM edges", [], |r| {
+        .query_row("SELECT source, target, id FROM edges", [], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })
         .expect("edge");
@@ -719,28 +724,23 @@ fn resolution_retains_reference_context_and_invalidation_resets_candidates() {
         .expect("resolve again");
     db.delete_file_graph("source-file", &["source".into()])
         .expect("delete source");
-    for table in ["edges", "unresolved_refs"] {
-        assert_eq!(
-            raw.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
-                .get::<_, i64>(0))
-                .expect("count"),
-            0
-        );
-    }
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM edges", [], |r| r.get::<_, i64>(0))
+            .expect("count"),
+        0
+    );
 }
 
 #[test]
-fn reference_schema_defaults_constraints_and_foreign_key() {
+fn reference_schema_defaults_and_state_constraints() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("graph.sqlite");
     open(&path).close().expect("init");
     let raw = Connection::open(&path).expect("raw");
-    raw.pragma_update(None, "foreign_keys", true)
-        .expect("foreign keys");
-    raw.execute("INSERT INTO unresolved_refs (from_node_id, file_id, reference_name, reference_kind, line, col) VALUES ('a', 'f', 'b', 'calls', 1, 0)", []).expect("defaults");
+    raw.execute("INSERT INTO edges (source, file_id, reference_name, kind, line, col) VALUES ('a', 'f', 'b', 'calls', 1, 0)", []).expect("defaults");
     let defaults: (String, String, String, String, Option<String>) = raw
         .query_row(
-            "SELECT file_path, language, name_tail, status, candidates FROM unresolved_refs",
+            "SELECT file_path, language, name_tail, status, candidates FROM edges",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
@@ -755,23 +755,45 @@ fn reference_schema_defaults_constraints_and_foreign_key() {
             None
         )
     );
+    for update in [
+        "candidates = '{}'",
+        "status = 'invalid'",
+        "status = 'resolved'",
+        "target = 'b'",
+        "provenance = 'import_scoped'",
+        "reference_name = NULL",
+    ] {
+        assert!(
+            raw.execute(&format!("UPDATE edges SET {update}"), [])
+                .is_err(),
+            "{update}"
+        );
+    }
+    raw.execute(
+        "UPDATE edges SET status = 'resolved', target = 'b', provenance = 'import_scoped'",
+        [],
+    )
+    .expect("resolved");
     assert!(
-        raw.execute("UPDATE unresolved_refs SET candidates = '{}'", [])
+        raw.execute("UPDATE edges SET status = 'pending'", [])
             .is_err()
     );
+    raw.execute(
+        "UPDATE edges SET status = 'failed', target = NULL, provenance = NULL",
+        [],
+    )
+    .expect("failed");
+    let db = SqliteGraphStorage::open(&path, OpenMode::ReadOnly).expect("reader");
     assert!(
-        raw.execute("UPDATE unresolved_refs SET status = 'invalid'", [])
-            .is_err()
+        db.list_pending_refs(100, 0)
+            .expect("failed excluded")
+            .refs
+            .is_empty()
     );
-    assert!(raw.execute("INSERT INTO edges (file_id, ref_id, kind, source, target, provenance) VALUES ('f', 999, 'calls', 'a', 'b', 'import_scoped')", []).is_err());
-    raw.execute("INSERT INTO edges (file_id, ref_id, kind, source, target, provenance) VALUES ('f', 1, 'calls', 'a', 'b', 'import_scoped')", []).expect("linked edge");
-    raw.execute("DELETE FROM unresolved_refs", [])
-        .expect("delete ref");
-    assert_eq!(
-        raw.query_row("SELECT count(*) FROM edges", [], |r| r.get::<_, i64>(0))
-            .expect("cascade"),
-        0
-    );
+    assert!(db.get_callees("a").expect("failed excluded").is_empty());
+    raw.execute("UPDATE edges SET status = 'pending'", [])
+        .expect("retry");
+    assert_eq!(db.list_pending_refs(100, 0).expect("pending").refs.len(), 1);
 }
 
 #[test]

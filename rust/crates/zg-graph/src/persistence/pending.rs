@@ -2,9 +2,9 @@ use super::{
     Error, PendingRef, PendingRefPage, Provenance, Resolution, ResolutionStats, Result,
     SqliteGraphStorage, StoredPendingRef, decode_enum, decode_metadata, nonempty,
 };
-use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{Row, TransactionBehavior, params};
 
-const SELECT_REF: &str = "SELECT id, file_id, from_node_id, reference_name, receiver_name, reference_kind, arity, line, col, metadata, candidates, file_path, language, name_tail FROM unresolved_refs";
+const SELECT_REF: &str = "SELECT id, file_id, source, reference_name, receiver_name, kind, arity, line, col, metadata, candidates, file_path, language, name_tail FROM edges";
 
 impl SqliteGraphStorage {
     /// Lists only pending refs using keyset pagination; no snapshot spans pages.
@@ -52,37 +52,21 @@ impl SqliteGraphStorage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut stats = ResolutionStats::default();
         {
-            let mut find =
-                tx.prepare(&format!("{SELECT_REF} WHERE id = ? AND status = 'pending'"))?;
-            let mut insert = tx.prepare(
-                "INSERT INTO edges
-                (file_id, ref_id, kind, source, target, line, column, provenance, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            let mut update = tx.prepare(
+                "UPDATE edges SET target = ?, provenance = ?, status = 'resolved'
+                 WHERE id = ? AND status = 'pending'",
             )?;
-            let mut mark =
-                tx.prepare("UPDATE unresolved_refs SET status = 'resolved' WHERE id = ?")?;
             for resolution in resolutions {
-                let reference = find
-                    .query_row(params![resolution.ref_id], ref_from_row)
-                    .optional()?;
-                let Some(stored) = reference else {
-                    stats.stale += 1;
-                    continue;
-                };
-                let reference = stored.reference;
-                insert.execute(params![
-                    stored.file_id,
-                    stored.id,
-                    super::EdgeKind::from(reference.reference_kind).as_str(),
-                    reference.from_node_id,
+                let changed = update.execute(params![
                     resolution.target_id,
-                    reference.line,
-                    reference.col,
                     resolution.provenance.as_str(),
-                    serde_json::to_string(&reference.metadata)?
+                    resolution.ref_id,
                 ])?;
-                mark.execute([stored.id])?;
-                stats.resolved += 1;
+                if changed == 0 {
+                    stats.stale += 1;
+                } else {
+                    stats.resolved += 1;
+                }
             }
         }
         tx.commit()?;

@@ -37,8 +37,8 @@ impl SqliteGraphStorage {
             Direction::Both => "(source = ?1 OR target = ?1)",
         };
         let mut sql = format!(
-            "SELECT kind, source, target, line, column, provenance, metadata
-             FROM edges WHERE {endpoint}"
+            "SELECT kind, source, target, line, col, provenance, metadata
+             FROM edges WHERE {endpoint} AND status = 'resolved'"
         );
         let mut values = vec![id];
         if let Some(kinds) = kinds {

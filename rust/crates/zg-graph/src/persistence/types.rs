@@ -144,7 +144,7 @@ pub struct PendingRefPage {
 /// serialize the entire read, resolution and writeback cycle with workspace writes/deletions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resolution {
-    /// ID of the reference in `unresolved_refs`.
+    /// ID of the pending row in `edges`.
     pub ref_id: i64,
     pub target_id: String,
     /// Must be a cross-file provenance; `FileLocal` is rejected.

@@ -30,8 +30,8 @@ impl SqliteGraphStorage {
             let placeholders = vec!["?"; chunk.len()].join(",");
             // Retain the original reference for the next resolution pass.
             tx.execute(
-                &format!("UPDATE unresolved_refs SET status = 'pending', candidates = NULL
-                  WHERE id IN (SELECT ref_id FROM edges WHERE target IN ({placeholders}) AND file_id <> ?)"),
+                &format!("UPDATE edges SET status = 'pending', target = NULL, provenance = NULL, candidates = NULL
+                  WHERE target IN ({placeholders}) AND file_id <> ? AND reference_name IS NOT NULL"),
                 params_from_iter(chunk.iter().copied().chain(std::iter::once(file_id))),
             )?;
             tx.execute(
@@ -40,12 +40,11 @@ impl SqliteGraphStorage {
             )?;
         }
         tx.execute("DELETE FROM edges WHERE file_id = ?", [file_id])?;
-        tx.execute("DELETE FROM unresolved_refs WHERE file_id = ?", [file_id])?;
         {
             let mut insert = tx.prepare(
                 "INSERT INTO edges
-                (file_id, kind, source, target, line, column, provenance, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (file_id, kind, source, target, line, col, provenance, metadata, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'resolved')",
             )?;
             for edge in &graph.edges {
                 insert.execute(params![
@@ -59,8 +58,8 @@ impl SqliteGraphStorage {
                     serde_json::to_string(&edge.metadata)?
                 ])?;
             }
-            let mut insert = tx.prepare("INSERT INTO unresolved_refs
-                (file_id, from_node_id, reference_name, receiver_name, reference_kind, arity, line, col, candidates, file_path, language, name_tail, status, metadata)
+            let mut insert = tx.prepare("INSERT INTO edges
+                (file_id, source, reference_name, receiver_name, kind, arity, line, col, candidates, file_path, language, name_tail, status, metadata)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)")?;
             for reference in &graph.pending_refs {
                 insert.execute(params![

@@ -28,18 +28,20 @@ Storage types are exposed under `zg_graph::persistence`.
 
 ## Ownership
 
-SQLite stores two tables: `edges` holds resolved relationships;
-`unresolved_refs` holds original references and their resolution state.
-A resolved reference is retained and its edge points back through `ref_id`.
+SQLite stores one `edges` table. Each row is either a direct local edge or a
+reference plus its resolution result. `status` is `pending`, `resolved`, or
+`failed`. Source is always known; target and provenance are populated only for
+resolved rows. Resolution and invalidation update the same row, retaining its
+ID and original reference context. There is no reference table or foreign key.
 Entity content and definition metadata remain in zvec. `FileGraph.entity_ids`
-contains the current file's entity IDs for ownership validation, not a second node registry.
-Entity and file IDs are opaque strings supplied by the indexing coordinator.
+contains the current file's entity IDs for ownership validation, not a second
+node registry. Entity and file IDs are supplied by the indexing coordinator.
 
 `SqliteGraphStorage::open(path, OpenMode::ReadWrite)` initializes an empty graph
-and enables WAL, foreign keys and a busy timeout. Read-only opening neither
+and enables WAL and a busy timeout. Read-only opening neither
 creates a missing database nor migrates its schema. Both modes validate the
 application ID and schema version. An unrelated or unsupported database is
-rejected. Schema version 4 restores separate references and edges; existing
+rejected. Schema version 5 stores references and edges together; existing
 graph databases must be rebuilt, with no migration provided. Drop closes a connection; `close(self)` also reports close failures.
 All operations are synchronous. Writes require `&mut self` and use SQLite
 `BEGIN IMMEDIATE` transactions; the calling engine chooses its blocking boundary.
@@ -56,9 +58,9 @@ All operations are synchronous. Writes require `&mut self` and use SQLite
   also invalidates incoming references.
 - File-level import targets are invalidated even when the entity-ID list is empty.
   Large ID lists are processed in bounded SQL parameter batches within one transaction.
-- Invalidation deletes resolved incoming edges, resets retained references to
-  `pending`, and clears stale candidates. Original reference context is retained.
-  Deleting the source file removes both its references and its edges.
+- Invalidation resets incoming reference rows to `pending` and clears target,
+  provenance and stale candidates. Original reference context is retained.
+  Deleting the source file removes its rows.
 
 Transactions cover SQLite only. The indexer must coordinate graph writes with
 zvec's file-update journal/checkpoints and use the workspace write lock. Do not
@@ -71,16 +73,19 @@ not add another workspace recovery journal or a ready marker.
 extraction file. Only the target is unresolved; references have no direction.
 `Direction` is used only by neighborhood queries.
 
-The reference table contains `reference_name`, `reference_kind`, `line`, `col`,
+Reference rows contain `reference_name`, `line`, `col`,
 `candidates` (optional JSON array of target IDs), `file_path`, `language`,
 `status`, and `name_tail`. IDs use AUTOINCREMENT. File path and language are
 explicit resolution context supplied by the caller; this standalone crate
 does not fetch them from zvec. The supplied name tail has an index.
-Existing `file_id`, `receiver_name`, `arity`, and `metadata` are retained
+`from_node_id` maps to `source`, and `reference_kind` maps to `kind`; these
+are not duplicated columns. Existing `file_id`, `receiver_name`, `arity`, and
+`metadata` are retained
 for file cleanup and resolution evidence.
 
-Snapshots always create pending references. Successful resolution marks them
-resolved and preserves their candidates and original context. The schema
+Snapshots insert local edges as resolved and references as pending. Successful
+resolution fills target and provenance, marks the row resolved, and preserves
+its candidates and original context. The schema
 reserves `failed`, but there is no failure-marking API yet. Candidates are
 currently supplied in the snapshot; the storage does not compute them.
 
@@ -89,8 +94,8 @@ currently supplied in the snapshot; the storage does not compute them.
 1. `list_pending_refs(limit, cursor)` returns pending refs and their database IDs. Use cursor `0` initially; limits are `1..=1000`. `next_cursor` is only
    present when another page exists. Restart pagination after file changes.
 2. A language-aware resolver selects and validates a target in the entity store.
-3. `apply_resolutions(&results)` creates an edge from `from_node_id` to
-   `Resolution.target_id` and marks the reference resolved in one transaction. Missing or already-resolved references count as `stale`;
+3. `apply_resolutions(&results)` fills `Resolution.target_id` and provenance
+   on the existing row and marks it resolved in one transaction. Missing or already-resolved references count as `stale`;
    local edges are preserved. Malformed inputs or SQL errors roll back the batch.
 
 The coordinator must hold the workspace write lock across the entire reference
@@ -104,7 +109,8 @@ references; the indexing/resolver integration must define that policy.
 ## Queries
 
 `get_callers` and `get_callees` return incoming and outgoing call edges in
-insertion order. Other edge kinds, pending refs and node metadata are excluded.
+insertion order. Only resolved rows are returned; pending and failed rows,
+other edge kinds and node metadata are excluded.
 `neighborhood(id, direction, kinds)` returns one-hop edges for `Direction::In`,
 `Out`, or `Both`. Pass `None` for all kinds or `Some(&[])` for none. Self-loops
 appear once, and distinct stored call sites are preserved. All three queries
