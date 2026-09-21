@@ -118,7 +118,7 @@ pub struct PendingRef {
 /// A complete per-file snapshot. Node metadata is deliberately not stored here.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FileGraph {
-    /// Complete current entity IDs; the file ID is an implicit local endpoint.
+    /// Complete current entity IDs; the zvec file key `f{file_id}` is an implicit local endpoint.
     pub entity_ids: Vec<String>,
     pub edges: Vec<Edge>,
     pub pending_refs: Vec<PendingRef>,
@@ -128,7 +128,7 @@ pub struct FileGraph {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredPendingRef {
     pub id: i64,
-    pub file_id: String,
+    pub file_id: u32,
     pub reference: PendingRef,
 }
 

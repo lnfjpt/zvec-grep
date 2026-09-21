@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Error, Result};
 
-pub(crate) const VERSION: i64 = 6;
+pub(crate) const VERSION: i64 = 7;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;
 
 pub(crate) fn validate(connection: &Connection) -> Result<()> {
@@ -44,7 +44,7 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<()> {
 const SCHEMA: &str = "
 CREATE TABLE edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_id TEXT NOT NULL,
+    file_id INTEGER NOT NULL CHECK (file_id BETWEEN 0 AND 4294967295),
     source TEXT NOT NULL,
     target TEXT,
     kind TEXT NOT NULL CHECK (kind IN ('contains', 'calls', 'imports', 'extends', 'implements')),

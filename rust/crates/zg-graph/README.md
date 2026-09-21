@@ -35,13 +35,15 @@ resolved rows. Resolution and invalidation update the same row, retaining its
 ID and original reference context. There is no reference table or foreign key.
 Entity content and definition metadata remain in zvec. `FileGraph.entity_ids`
 contains the current file's entity IDs for ownership validation, not a second
-node registry. Entity and file IDs are supplied by the indexing coordinator.
+node registry. Entity IDs remain strings. File ownership IDs are `u32`, matching zvec
+`FileId::get()`, and are stored as SQLite INTEGER with a u32 range constraint.
+File-level graph endpoints use `f{file_id}`, matching zvec file document keys.
 
 `SqliteGraphStorage::open(path, OpenMode::ReadWrite)` initializes an empty graph
 and enables WAL and a busy timeout. Read-only opening neither
 creates a missing database nor migrates its schema. Both modes validate the
 application ID and schema version. An unrelated or unsupported database is
-rejected. Schema version 6 stores file identity without a duplicate path; existing
+rejected. Schema version 7 stores numeric file ownership IDs; existing
 graph databases must be rebuilt, with no migration provided. Drop closes a connection; `close(self)` also reports close failures.
 All operations are synchronous. Writes require `&mut self` and use SQLite
 `BEGIN IMMEDIATE` transactions; the calling engine chooses its blocking boundary.
@@ -50,7 +52,7 @@ All operations are synchronous. Writes require `&mut self` and use SQLite
 
 - `write_file_graph(file_id, graph, old_entity_ids)` atomically replaces owned
   edges and refs. Snapshots accept only local edges and locally owned pending
-  references. The file ID itself is an implicit local endpoint.
+  references. The zvec file key `f{file_id}` is an implicit local endpoint.
 - `delete_file_graph(file_id, old_entity_ids)` removes owned rows and invalidates
   incoming cross-file references. Repeated deletion is safe.
 - Both require **all pre-update entity IDs from zvec**, including removed

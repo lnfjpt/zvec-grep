@@ -7,23 +7,25 @@ impl SqliteGraphStorage {
     /// Atomically replaces one file's local graph and invalidates inbound edges.
     /// `old_entity_ids` must contain **all** pre-update entity IDs from zvec; pass
     /// an empty slice for a new file. Entity IDs in the new snapshot are not stored
-    /// in a second node table. Cross-file edges must use `apply_resolutions`.
+    /// in a second node table. The implicit file endpoint is `f{file_id}`, matching
+    /// the zvec file document key. Cross-file edges must use `apply_resolutions`.
     ///
     /// # Errors
     /// Rejects invalid ownership, duplicate/empty IDs, non-local edges, invalid
     /// positions, read-only connections, and SQLite failures. Failures roll back.
     pub fn write_file_graph(
         &mut self,
-        file_id: &str,
+        file_id: u32,
         graph: &FileGraph,
         old_entity_ids: &[String],
     ) -> Result<()> {
-        validate(file_id, graph, old_entity_ids)?;
+        let file_node_id = format!("f{file_id}");
+        validate(&file_node_id, graph, old_entity_ids)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut targets: Vec<&str> = old_entity_ids.iter().map(String::as_str).collect();
-        targets.push(file_id);
+        targets.push(&file_node_id);
         targets.sort_unstable();
         targets.dedup();
         for chunk in targets.chunks(500) {
@@ -32,7 +34,10 @@ impl SqliteGraphStorage {
             tx.execute(
                 &format!("UPDATE edges SET status = 'pending', target = NULL, provenance = NULL, candidates = NULL
                   WHERE target IN ({placeholders}) AND file_id <> ? AND reference_name IS NOT NULL"),
-                params_from_iter(chunk.iter().copied().chain(std::iter::once(file_id))),
+                params_from_iter(
+                    chunk.iter().map(|id| rusqlite::types::Value::Text((*id).into()))
+                        .chain(std::iter::once(rusqlite::types::Value::Integer(i64::from(file_id)))),
+                ),
             )?;
             tx.execute(
                 &format!("DELETE FROM edges WHERE target IN ({placeholders})"),
@@ -91,7 +96,7 @@ impl SqliteGraphStorage {
     ///
     /// # Errors
     /// Rejects empty IDs and SQLite failures. The complete mutation is atomic.
-    pub fn delete_file_graph(&mut self, file_id: &str, old_entity_ids: &[String]) -> Result<()> {
+    pub fn delete_file_graph(&mut self, file_id: u32, old_entity_ids: &[String]) -> Result<()> {
         self.write_file_graph(file_id, &FileGraph::default(), old_entity_ids)
     }
 }
