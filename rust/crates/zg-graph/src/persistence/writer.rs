@@ -72,7 +72,7 @@ impl SqliteGraphStorage {
                     reference.from_node_id,
                     reference.reference_name,
                     reference.receiver_name,
-                    super::EdgeKind::from(reference.reference_kind).as_str(),
+                    reference.reference_kind.as_str(),
                     reference.arity,
                     reference.line,
                     reference.col,

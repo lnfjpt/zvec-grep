@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Error, Result};
 
-pub(crate) const VERSION: i64 = 7;
+pub(crate) const VERSION: i64 = 8;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;
 
 pub(crate) fn validate(connection: &Connection) -> Result<()> {
@@ -66,7 +66,7 @@ CREATE TABLE edges (
             AND receiver_name IS NULL AND arity IS NULL AND candidates IS NULL)
         OR
         (reference_name IS NOT NULL AND length(trim(reference_name)) > 0
-            AND kind <> 'contains' AND line IS NOT NULL AND col IS NOT NULL
+            AND line IS NOT NULL AND col IS NOT NULL
             AND (provenance IS NULL OR provenance <> 'file_local'))
     )
 ) STRICT;

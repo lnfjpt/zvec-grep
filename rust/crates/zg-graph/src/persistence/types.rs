@@ -37,27 +37,6 @@ impl EdgeKind {
     }
 }
 
-/// Name references cannot create structural containment edges.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RefKind {
-    Calls,
-    Imports,
-    Extends,
-    Implements,
-}
-
-impl From<RefKind> for EdgeKind {
-    fn from(value: RefKind) -> Self {
-        match value {
-            RefKind::Calls => Self::Calls,
-            RefKind::Imports => Self::Imports,
-            RefKind::Extends => Self::Extends,
-            RefKind::Implements => Self::Implements,
-        }
-    }
-}
-
 /// Evidence used to select an edge endpoint.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,7 +80,7 @@ pub struct PendingRef {
     pub from_node_id: String,
     pub reference_name: String,
     pub receiver_name: Option<String>,
-    pub reference_kind: RefKind,
+    pub reference_kind: EdgeKind,
     pub arity: Option<u32>,
     /// One-based reference location in the file that produced this reference.
     pub line: u32,

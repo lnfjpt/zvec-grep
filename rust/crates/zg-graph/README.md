@@ -43,7 +43,7 @@ File-level graph endpoints use `f{file_id}`, matching zvec file document keys.
 and enables WAL and a busy timeout. Read-only opening neither
 creates a missing database nor migrates its schema. Both modes validate the
 application ID and schema version. An unrelated or unsupported database is
-rejected. Schema version 7 stores numeric file ownership IDs; existing
+rejected. Schema version 8 accepts the same relationship kinds for edges and references; existing
 graph databases must be rebuilt, with no migration provided. Drop closes a connection; `close(self)` also reports close failures.
 All operations are synchronous. Writes require `&mut self` and use SQLite
 `BEGIN IMMEDIATE` transactions; the calling engine chooses its blocking boundary.

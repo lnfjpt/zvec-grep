@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use serde_json::json;
 use zg_graph::persistence::{
     Direction, Edge, EdgeKind, Error, FileGraph, Metadata, OpenMode, PendingRef, Provenance,
-    RefKind, Resolution, ResolutionStats, SqliteGraphStorage,
+    Resolution, ResolutionStats, SqliteGraphStorage,
 };
 
 fn edge(kind: EdgeKind, source: &str, target: &str, line: u32) -> Edge {
@@ -24,7 +24,7 @@ fn reference(owner: &str, name: &str) -> PendingRef {
         from_node_id: owner.into(),
         reference_name: name.into(),
         receiver_name: Some("module".into()),
-        reference_kind: RefKind::Calls,
+        reference_kind: EdgeKind::Calls,
         arity: Some(2),
         candidates: None,
         language: "rust".into(),
@@ -214,7 +214,7 @@ fn file_level_import_targets_are_invalidated_without_entity_ids() {
         .expect("import count")
     };
     let mut import = reference("f6", "module");
-    import.reference_kind = RefKind::Imports;
+    import.reference_kind = EdgeKind::Imports;
     db.write_file_graph(6, &graph(&[], vec![], vec![import]), &[])
         .expect("import");
     let resolution = proposal(&db, "f7");
@@ -827,5 +827,32 @@ fn file_ids_round_trip_as_u32_and_sqlite_rejects_out_of_range_values() {
     assert_eq!(
         db.list_pending_refs(100, 0).expect("remaining").refs[0].file_id,
         0
+    );
+}
+
+#[test]
+fn contains_references_use_the_same_kinds_as_resolved_edges() {
+    let mut db = SqliteGraphStorage::in_memory().expect("open");
+    let mut pending = reference("owner", "member");
+    pending.reference_kind = EdgeKind::Contains;
+    db.write_file_graph(1, &graph(&["owner"], vec![], vec![pending.clone()]), &[])
+        .expect("write contains ref");
+    assert_eq!(
+        db.list_pending_refs(100, 0).expect("pending").refs[0].reference,
+        pending
+    );
+    db.apply_resolutions(&[proposal(&db, "member")])
+        .expect("resolve contains");
+    let edges = db
+        .neighborhood("owner", Direction::Out, Some(&[EdgeKind::Contains]))
+        .expect("contains edges");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].target, "member");
+    assert!(db.get_callees("owner").expect("calls only").is_empty());
+    db.delete_file_graph(2, &["member".into()])
+        .expect("invalidate");
+    assert_eq!(
+        db.list_pending_refs(100, 0).expect("requeued").refs[0].reference,
+        pending
     );
 }
