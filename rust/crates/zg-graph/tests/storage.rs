@@ -27,7 +27,6 @@ fn reference(owner: &str, name: &str) -> PendingRef {
         reference_kind: RefKind::Calls,
         arity: Some(2),
         candidates: None,
-        file_path: "src/example.rs".into(),
         language: "rust".into(),
         name_tail: name.rsplit("::").next().unwrap_or(name).into(),
         line: 3,
@@ -738,22 +737,16 @@ fn reference_schema_defaults_and_state_constraints() {
     open(&path).close().expect("init");
     let raw = Connection::open(&path).expect("raw");
     raw.execute("INSERT INTO edges (source, file_id, reference_name, kind, line, col) VALUES ('a', 'f', 'b', 'calls', 1, 0)", []).expect("defaults");
-    let defaults: (String, String, String, String, Option<String>) = raw
+    let defaults: (String, String, String, Option<String>) = raw
         .query_row(
-            "SELECT file_path, language, name_tail, status, candidates FROM edges",
+            "SELECT language, name_tail, status, candidates FROM edges",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .expect("defaults");
     assert_eq!(
         defaults,
-        (
-            String::new(),
-            "unknown".into(),
-            String::new(),
-            "pending".into(),
-            None
-        )
+        ("unknown".into(), String::new(), "pending".into(), None)
     );
     for update in [
         "candidates = '{}'",

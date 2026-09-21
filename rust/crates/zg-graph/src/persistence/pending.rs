@@ -4,7 +4,7 @@ use super::{
 };
 use rusqlite::{Row, TransactionBehavior, params};
 
-const SELECT_REF: &str = "SELECT id, file_id, source, reference_name, receiver_name, kind, arity, line, col, metadata, candidates, file_path, language, name_tail FROM edges";
+const SELECT_REF: &str = "SELECT id, file_id, source, reference_name, receiver_name, kind, arity, line, col, metadata, candidates, language, name_tail FROM edges";
 
 impl SqliteGraphStorage {
     /// Lists only pending refs using keyset pagination; no snapshot spans pages.
@@ -99,9 +99,8 @@ fn ref_from_row(row: &Row<'_>) -> rusqlite::Result<StoredPendingRef> {
                     })
                 })
                 .transpose()?,
-            file_path: row.get(11)?,
-            language: row.get(12)?,
-            name_tail: row.get(13)?,
+            language: row.get(11)?,
+            name_tail: row.get(12)?,
         },
     })
 }

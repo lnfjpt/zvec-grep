@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Error, Result};
 
-pub(crate) const VERSION: i64 = 5;
+pub(crate) const VERSION: i64 = 6;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;
 
 pub(crate) fn validate(connection: &Connection) -> Result<()> {
@@ -55,7 +55,6 @@ CREATE TABLE edges (
     line INTEGER CHECK (line >= 1),
     col INTEGER CHECK (col >= 0),
     candidates TEXT CHECK (candidates IS NULL OR (json_valid(candidates) AND json_type(candidates) = 'array')),
-    file_path TEXT NOT NULL DEFAULT '',
     language TEXT NOT NULL DEFAULT 'unknown',
     name_tail TEXT NOT NULL DEFAULT '',
     provenance TEXT CHECK (provenance IN ('file_local', 'import_scoped', 'preferred_file', 'workspace_unique')),

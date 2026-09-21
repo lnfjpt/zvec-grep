@@ -41,7 +41,7 @@ node registry. Entity and file IDs are supplied by the indexing coordinator.
 and enables WAL and a busy timeout. Read-only opening neither
 creates a missing database nor migrates its schema. Both modes validate the
 application ID and schema version. An unrelated or unsupported database is
-rejected. Schema version 5 stores references and edges together; existing
+rejected. Schema version 6 stores file identity without a duplicate path; existing
 graph databases must be rebuilt, with no migration provided. Drop closes a connection; `close(self)` also reports close failures.
 All operations are synchronous. Writes require `&mut self` and use SQLite
 `BEGIN IMMEDIATE` transactions; the calling engine chooses its blocking boundary.
@@ -74,10 +74,9 @@ extraction file. Only the target is unresolved; references have no direction.
 `Direction` is used only by neighborhood queries.
 
 Reference rows contain `reference_name`, `line`, `col`,
-`candidates` (optional JSON array of target IDs), `file_path`, `language`,
-`status`, and `name_tail`. IDs use AUTOINCREMENT. File path and language are
-explicit resolution context supplied by the caller; this standalone crate
-does not fetch them from zvec. The supplied name tail has an index.
+`candidates` (optional JSON array of target IDs), `language`,
+`status`, and `name_tail`. IDs use AUTOINCREMENT. Language is supplied by the caller. File paths are not stored here; the
+resolution coordinator retrieves them from zvec using `file_id`. The supplied name tail has an index.
 `from_node_id` maps to `source`, and `reference_kind` maps to `kind`; these
 are not duplicated columns. Existing `file_id`, `receiver_name`, `arity`, and
 `metadata` are retained

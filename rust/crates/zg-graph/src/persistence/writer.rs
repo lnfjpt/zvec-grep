@@ -59,8 +59,8 @@ impl SqliteGraphStorage {
                 ])?;
             }
             let mut insert = tx.prepare("INSERT INTO edges
-                (file_id, source, reference_name, receiver_name, kind, arity, line, col, candidates, file_path, language, name_tail, status, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)")?;
+                (file_id, source, reference_name, receiver_name, kind, arity, line, col, candidates, language, name_tail, status, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)")?;
             for reference in &graph.pending_refs {
                 insert.execute(params![
                     file_id,
@@ -76,7 +76,6 @@ impl SqliteGraphStorage {
                         .as_ref()
                         .map(serde_json::to_string)
                         .transpose()?,
-                    reference.file_path,
                     reference.language,
                     reference.name_tail,
                     serde_json::to_string(&reference.metadata)?

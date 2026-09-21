@@ -110,7 +110,6 @@ pub struct PendingRef {
     pub metadata: Metadata,
     /// Candidate target IDs supplied by extraction or resolution preparation.
     pub candidates: Option<Vec<String>>,
-    pub file_path: String,
     pub language: String,
     /// Last component of the referenced name, available for indexed lookup.
     pub name_tail: String,
