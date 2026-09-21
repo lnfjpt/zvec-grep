@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 /// Extensible evidence attached to edges and unresolved references.
 pub type Metadata = Map<String, Value>;
 
-/// Direction relative to a query endpoint or a reference's known owner.
+/// Direction of a one-hop query relative to its endpoint.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -94,22 +94,26 @@ pub struct Edge {
 }
 
 /// Extraction output that still requires name resolution.
-/// New snapshots insert unresolved references; storage fills the endpoint selected by direction.
+/// New snapshots insert unresolved references; the source is known and only the target requires resolution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PendingRef {
-    /// Known endpoint in the file that produced this reference.
-    pub owner_id: String,
-    /// Must be In or Out; Both is only supported for queries.
-    pub direction: Direction,
-    pub ref_name: String,
+    /// Known source of the eventual edge, owned by the extraction file.
+    pub from_node_id: String,
+    pub reference_name: String,
     pub receiver_name: Option<String>,
-    pub ref_kind: RefKind,
+    pub reference_kind: RefKind,
     pub arity: Option<u32>,
     /// One-based reference location in the file that produced this reference.
     pub line: u32,
     /// Zero-based source column.
-    pub column: u32,
+    pub col: u32,
     pub metadata: Metadata,
+    /// Candidate target IDs supplied by extraction or resolution preparation.
+    pub candidates: Option<Vec<String>>,
+    pub file_path: String,
+    pub language: String,
+    /// Last component of the referenced name, available for indexed lookup.
+    pub name_tail: String,
 }
 
 /// A complete per-file snapshot. Node metadata is deliberately not stored here.
@@ -121,7 +125,7 @@ pub struct FileGraph {
     pub pending_refs: Vec<PendingRef>,
 }
 
-/// An unresolved edge with its database identity.
+/// A pending reference with its database identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredPendingRef {
     pub id: i64,
@@ -136,14 +140,13 @@ pub struct PendingRefPage {
     pub next_cursor: Option<i64>,
 }
 
-/// A resolver's proposed edge. The caller must validate the resolved endpoint in zvec and
+/// A resolver's proposed edge. The caller must validate the target in zvec and
 /// serialize the entire read, resolution and writeback cycle with workspace writes/deletions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resolution {
-    /// ID of the unresolved row in the edges table.
+    /// ID of the reference in `unresolved_refs`.
     pub ref_id: i64,
-    /// Fills source for an incoming ref, target for an outgoing ref.
-    pub entity_id: String,
+    pub target_id: String,
     /// Must be a cross-file provenance; `FileLocal` is rejected.
     pub provenance: Provenance,
 }

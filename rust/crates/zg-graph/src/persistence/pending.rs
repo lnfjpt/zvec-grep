@@ -2,9 +2,9 @@ use super::{
     Error, PendingRef, PendingRefPage, Provenance, Resolution, ResolutionStats, Result,
     SqliteGraphStorage, StoredPendingRef, decode_enum, decode_metadata, nonempty,
 };
-use rusqlite::{Row, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
 
-const SELECT_REF: &str = "SELECT id, file_id, CASE ref_direction WHEN 'in' THEN target ELSE source END, ref_name, receiver_name, kind, arity, line, column, metadata, ref_direction FROM edges";
+const SELECT_REF: &str = "SELECT id, file_id, from_node_id, reference_name, receiver_name, reference_kind, arity, line, col, metadata, candidates, file_path, language, name_tail FROM unresolved_refs";
 
 impl SqliteGraphStorage {
     /// Lists only pending refs using keyset pagination; no snapshot spans pages.
@@ -18,7 +18,7 @@ impl SqliteGraphStorage {
             ));
         }
         let mut statement = self.connection.prepare(&format!(
-            "{SELECT_REF} WHERE (source IS NULL OR target IS NULL) AND id > ? ORDER BY id LIMIT ?"
+            "{SELECT_REF} WHERE status = 'pending' AND id > ? ORDER BY id LIMIT ?"
         ))?;
         let mut refs: Vec<_> = statement
             .query_map(params![cursor, limit + 1], ref_from_row)?
@@ -40,7 +40,7 @@ impl SqliteGraphStorage {
     /// Rejects invalid proposals and SQLite failures; the entire batch rolls back.
     pub fn apply_resolutions(&mut self, resolutions: &[Resolution]) -> Result<ResolutionStats> {
         for resolution in resolutions {
-            nonempty(&resolution.entity_id)?;
+            nonempty(&resolution.target_id)?;
             if resolution.ref_id < 1 || resolution.provenance == Provenance::FileLocal {
                 return Err(Error::InvalidInput(
                     "resolution requires a positive ref ID and cross-file provenance",
@@ -52,24 +52,37 @@ impl SqliteGraphStorage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut stats = ResolutionStats::default();
         {
-            let mut update = tx.prepare(
-                "UPDATE edges SET
-                    source = CASE WHEN ref_direction = 'in' THEN ?1 ELSE source END,
-                    target = CASE WHEN ref_direction = 'out' THEN ?1 ELSE target END,
-                    provenance = ?2
-                 WHERE id = ?3 AND (source IS NULL OR target IS NULL)",
+            let mut find =
+                tx.prepare(&format!("{SELECT_REF} WHERE id = ? AND status = 'pending'"))?;
+            let mut insert = tx.prepare(
+                "INSERT INTO edges
+                (file_id, ref_id, kind, source, target, line, column, provenance, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )?;
+            let mut mark =
+                tx.prepare("UPDATE unresolved_refs SET status = 'resolved' WHERE id = ?")?;
             for resolution in resolutions {
-                let changed = update.execute(params![
-                    resolution.entity_id,
-                    resolution.provenance.as_str(),
-                    resolution.ref_id,
-                ])?;
-                if changed == 0 {
+                let reference = find
+                    .query_row(params![resolution.ref_id], ref_from_row)
+                    .optional()?;
+                let Some(stored) = reference else {
                     stats.stale += 1;
-                } else {
-                    stats.resolved += 1;
-                }
+                    continue;
+                };
+                let reference = stored.reference;
+                insert.execute(params![
+                    stored.file_id,
+                    stored.id,
+                    super::EdgeKind::from(reference.reference_kind).as_str(),
+                    reference.from_node_id,
+                    resolution.target_id,
+                    reference.line,
+                    reference.col,
+                    resolution.provenance.as_str(),
+                    serde_json::to_string(&reference.metadata)?
+                ])?;
+                mark.execute([stored.id])?;
+                stats.resolved += 1;
             }
         }
         tx.commit()?;
@@ -82,15 +95,29 @@ fn ref_from_row(row: &Row<'_>) -> rusqlite::Result<StoredPendingRef> {
         id: row.get(0)?,
         file_id: row.get(1)?,
         reference: PendingRef {
-            owner_id: row.get(2)?,
-            direction: decode_enum(row.get(10)?)?,
-            ref_name: row.get(3)?,
+            from_node_id: row.get(2)?,
+            reference_name: row.get(3)?,
             receiver_name: row.get(4)?,
-            ref_kind: decode_enum(row.get(5)?)?,
+            reference_kind: decode_enum(row.get(5)?)?,
             arity: row.get(6)?,
             line: row.get(7)?,
-            column: row.get(8)?,
+            col: row.get(8)?,
             metadata: decode_metadata(&row.get::<_, String>(9)?)?,
+            candidates: row
+                .get::<_, Option<String>>(10)?
+                .map(|value| {
+                    serde_json::from_str(&value).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            10,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?,
+            file_path: row.get(11)?,
+            language: row.get(12)?,
+            name_tail: row.get(13)?,
         },
     })
 }

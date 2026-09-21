@@ -21,14 +21,17 @@ fn edge(kind: EdgeKind, source: &str, target: &str, line: u32) -> Edge {
 
 fn reference(owner: &str, name: &str) -> PendingRef {
     PendingRef {
-        owner_id: owner.into(),
-        direction: Direction::Out,
-        ref_name: name.into(),
+        from_node_id: owner.into(),
+        reference_name: name.into(),
         receiver_name: Some("module".into()),
-        ref_kind: RefKind::Calls,
+        reference_kind: RefKind::Calls,
         arity: Some(2),
+        candidates: None,
+        file_path: "src/example.rs".into(),
+        language: "rust".into(),
+        name_tail: name.rsplit("::").next().unwrap_or(name).into(),
         line: 3,
-        column: 4,
+        col: 4,
         metadata: Metadata::from_iter([("raw".into(), json!("module.target(x, y)"))]),
     }
 }
@@ -46,7 +49,7 @@ fn proposal(storage: &SqliteGraphStorage, target: &str) -> Resolution {
     let stored = &pending.refs[0];
     Resolution {
         ref_id: stored.id,
-        entity_id: target.into(),
+        target_id: target.into(),
         provenance: Provenance::ImportScoped,
     }
 }
@@ -216,7 +219,7 @@ fn file_level_import_targets_are_invalidated_without_entity_ids() {
         .expect("import count")
     };
     let mut import = reference("source-file", "module");
-    import.ref_kind = RefKind::Imports;
+    import.reference_kind = RefKind::Imports;
     db.write_file_graph("source-file", &graph(&[], vec![], vec![import]), &[])
         .expect("import");
     let resolution = proposal(&db, "target-file");
@@ -389,12 +392,12 @@ fn sql_failure_rolls_back_an_entire_resolution_batch() {
         .enumerate()
         .map(|(i, stored)| Resolution {
             ref_id: stored.id,
-            entity_id: format!("target-{i}"),
+            target_id: format!("target-{i}"),
             provenance: Provenance::WorkspaceUnique,
         })
         .collect();
     Connection::open(&path).expect("raw").execute_batch(
-        "CREATE TRIGGER fail_second BEFORE UPDATE OF target ON edges WHEN NEW.target = 'target-1' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+        "CREATE TRIGGER fail_second BEFORE INSERT ON edges WHEN NEW.target = 'target-1' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
     ).expect("trigger");
     assert!(db.apply_resolutions(&proposals).is_err());
     assert!(db.get_callees("a").expect("no partial edge").is_empty());
@@ -464,7 +467,7 @@ fn schemas_reject_foreign_and_newer_databases_without_rewriting_versions() {
 }
 
 #[test]
-fn schema_contains_only_edges_and_enforces_json_objects() {
+fn schema_contains_edges_and_unresolved_refs_and_enforces_json_objects() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("graph.sqlite");
     open(&path).close().expect("init");
@@ -477,7 +480,7 @@ fn schema_contains_only_edges_and_enforces_json_objects() {
         .expect("query")
         .collect::<rusqlite::Result<_>>()
         .expect("rows");
-    assert_eq!(names, ["edges"]);
+    assert_eq!(names, ["edges", "sqlite_sequence", "unresolved_refs"]);
     assert!(raw.execute("INSERT INTO edges (file_id, kind, source, target, provenance, metadata) VALUES ('f', 'calls', 'a', 'b', 'file_local', '[]')", []).is_err());
     assert!(raw.execute("INSERT INTO edges (file_id, kind, source, target, provenance, line) VALUES ('f', 'calls', 'a', 'b', 'file_local', 0)", []).is_err());
 }
@@ -494,7 +497,7 @@ fn invalid_and_stale_resolution_proposals_do_not_mutate_pending_refs() {
             ..valid.clone()
         },
         Resolution {
-            entity_id: " ".into(),
+            target_id: " ".into(),
             ..valid.clone()
         },
         Resolution {
@@ -630,102 +633,6 @@ fn neighborhood_returns_all_edges_without_a_limit() {
 }
 
 #[test]
-fn resolution_and_invalidation_preserve_the_same_row_and_reference_details() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("graph.sqlite");
-    let mut db = open(&path);
-    let original = reference("a", "remote");
-    db.write_file_graph(
-        "source",
-        &graph(&["a"], vec![], vec![original.clone()]),
-        &[],
-    )
-    .expect("source");
-    db.write_file_graph("target", &graph(&["remote"], vec![], vec![]), &[])
-        .expect("target");
-    let before = db.list_pending_refs(100, 0).expect("pending").refs;
-    assert!(
-        db.neighborhood("a", Direction::Both, None)
-            .expect("unresolved hidden")
-            .is_empty()
-    );
-    let raw = Connection::open(&path).expect("raw");
-    let state = || {
-        raw.query_row("SELECT id, target, provenance FROM edges", [], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })
-        .expect("single row")
-    };
-    assert_eq!(state(), (before[0].id, None, None));
-    db.apply_resolutions(&[proposal(&db, "remote")])
-        .expect("resolve");
-    assert_eq!(
-        state(),
-        (
-            before[0].id,
-            Some("remote".into()),
-            Some("import_scoped".into())
-        )
-    );
-    assert!(
-        db.list_pending_refs(100, 0)
-            .expect("resolved hidden")
-            .refs
-            .is_empty()
-    );
-    db.delete_file_graph("target", &["remote".into()])
-        .expect("invalidate");
-    assert_eq!(state(), (before[0].id, None, None));
-    assert_eq!(
-        db.list_pending_refs(100, 0).expect("preserved").refs,
-        before
-    );
-    db.apply_resolutions(&[proposal(&db, "new-target")])
-        .expect("resolve again");
-    assert_eq!(
-        db.get_callees("a").expect("edge")[0].metadata,
-        original.metadata
-    );
-    db.delete_file_graph("source", &["a".into()])
-        .expect("delete source");
-    assert_eq!(
-        raw.query_row("SELECT count(*) FROM edges", [], |row| row.get::<_, i64>(0))
-            .expect("count"),
-        0
-    );
-}
-
-#[test]
-fn schema_rejects_inconsistent_pending_and_resolved_rows() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("graph.sqlite");
-    open(&path).close().expect("init");
-    let raw = Connection::open(&path).expect("raw");
-    for values in [
-        // An unresolved row requires the original reference and its location.
-        "'calls', NULL, NULL, NULL, NULL, NULL",
-        "'calls', NULL, NULL, 'b', NULL, 0",
-        // Target and provenance must be present or absent together.
-        "'calls', 'b', NULL, 'b', 1, 0",
-        "'calls', NULL, 'import_scoped', 'b', 1, 0",
-        // Cross-file edges retain evidence; local edges have no pending reference.
-        "'calls', 'b', 'import_scoped', NULL, 1, 0",
-        "'calls', 'b', 'file_local', 'b', 1, 0",
-        // Structural containment cannot be an unresolved name reference.
-        "'contains', NULL, NULL, 'b', 1, 0",
-    ] {
-        let sql = format!(
-            "INSERT INTO edges (file_id, source, kind, target, provenance, ref_name, line, column, ref_direction) VALUES ('f', 'a', {values}, 'out')"
-        );
-        assert!(raw.execute(&sql, []).is_err(), "{values}");
-    }
-}
-
-#[test]
 fn prior_schema_version_requires_rebuild_without_mutation() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("old.sqlite");
@@ -753,242 +660,133 @@ fn prior_schema_version_requires_rebuild_without_mutation() {
     );
 }
 
-fn incoming_reference(owner: &str, name: &str) -> PendingRef {
-    PendingRef {
-        direction: Direction::In,
-        ..reference(owner, name)
+#[test]
+fn resolution_retains_reference_context_and_invalidation_resets_candidates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("graph.sqlite");
+    let mut db = open(&path);
+    let mut original = reference("source", "module::target");
+    original.candidates = Some(vec!["target".into(), "alternative".into()]);
+    db.write_file_graph(
+        "source-file",
+        &graph(&["source"], vec![], vec![original.clone()]),
+        &[],
+    )
+    .expect("write");
+    let stored = db.list_pending_refs(100, 0).expect("refs").refs.remove(0);
+    assert_eq!(stored.reference, original);
+    assert!(
+        db.get_callees("source")
+            .expect("pending excluded")
+            .is_empty()
+    );
+    db.apply_resolutions(&[proposal(&db, "target")])
+        .expect("resolve");
+    let raw = Connection::open(&path).expect("raw");
+    let (status, candidates): (String, String) = raw
+        .query_row(
+            "SELECT status, candidates FROM unresolved_refs WHERE id = ?",
+            [stored.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("retained ref");
+    assert_eq!(status, "resolved");
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&candidates).expect("json"),
+        original.candidates.clone().expect("candidates")
+    );
+    let (source, target, ref_id): (String, String, i64) = raw
+        .query_row("SELECT source, target, ref_id FROM edges", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .expect("edge");
+    assert_eq!(
+        (source.as_str(), target.as_str(), ref_id),
+        ("source", "target", stored.id)
+    );
+    db.delete_file_graph("target-file", &["target".into()])
+        .expect("invalidate");
+    let requeued = db
+        .list_pending_refs(100, 0)
+        .expect("requeued")
+        .refs
+        .remove(0);
+    original.candidates = None;
+    assert_eq!(requeued.id, stored.id);
+    assert_eq!(requeued.reference, original);
+    assert!(db.get_callees("source").expect("edge removed").is_empty());
+    db.apply_resolutions(&[proposal(&db, "new-target")])
+        .expect("resolve again");
+    db.delete_file_graph("source-file", &["source".into()])
+        .expect("delete source");
+    for table in ["edges", "unresolved_refs"] {
+        assert_eq!(
+            raw.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .expect("count"),
+            0
+        );
     }
 }
 
 #[test]
-fn incoming_reference_resolves_source_and_requeues_after_source_changes() {
-    let mut db = SqliteGraphStorage::in_memory().expect("open");
-    let incoming = incoming_reference("callee", "caller");
-    db.write_file_graph(
-        "callee-file",
-        &graph(&["callee"], vec![], vec![incoming]),
-        &[],
-    )
-    .expect("write incoming");
-    db.write_file_graph("caller-file", &graph(&["caller"], vec![], vec![]), &[])
-        .expect("write source");
-    let pending = db.list_pending_refs(100, 0).expect("pending").refs;
-    assert_eq!(pending[0].reference.direction, Direction::In);
-    assert_eq!(pending[0].reference.owner_id, "callee");
-    assert!(
-        db.get_callers("callee")
-            .expect("unresolved hidden")
-            .is_empty()
-    );
-    assert!(
-        db.neighborhood("callee", Direction::Both, None)
-            .expect("unresolved hidden")
-            .is_empty()
-    );
-    let resolved = proposal(&db, "caller");
-    db.apply_resolutions(std::slice::from_ref(&resolved))
-        .expect("resolve source");
-    let edges = db.get_callers("callee").expect("callers");
-    assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0].source, "caller");
-    assert_eq!(edges[0].target, "callee");
-    assert_eq!(db.get_callees("caller").expect("callees"), edges);
-    assert_eq!(db.apply_resolutions(&[resolved]).expect("repeat").stale, 1);
-
-    // Replacing the resolved source with the same ID invalidates the relationship.
-    db.write_file_graph(
-        "caller-file",
-        &graph(&["caller"], vec![], vec![]),
-        &["caller".into()],
-    )
-    .expect("replace");
-    assert_eq!(
-        db.list_pending_refs(100, 0).expect("requeued").refs,
-        pending
-    );
-    assert!(db.get_callers("callee").expect("invalidated").is_empty());
-    db.apply_resolutions(&[proposal(&db, "caller")])
-        .expect("resolve again");
-    db.delete_file_graph("caller-file", &["caller".into()])
-        .expect("delete source");
-    assert_eq!(
-        db.list_pending_refs(100, 0)
-            .expect("requeued after delete")
-            .refs,
-        pending
-    );
-
-    db.apply_resolutions(&[proposal(&db, "new-caller")])
-        .expect("resolve new source");
-    db.delete_file_graph("callee-file", &["callee".into()])
-        .expect("delete owner");
-    assert!(
-        db.list_pending_refs(100, 0)
-            .expect("owner removed")
-            .refs
-            .is_empty()
-    );
-    assert!(
-        db.get_callees("new-caller")
-            .expect("owner removed")
-            .is_empty()
-    );
-}
-
-#[test]
-fn mixed_direction_resolution_rolls_back_atomically_and_pages_both_directions() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("graph.sqlite");
-    let mut db = open(&path);
-    db.write_file_graph(
-        "file",
-        &graph(
-            &["owner"],
-            vec![],
-            vec![
-                reference("owner", "outgoing"),
-                incoming_reference("owner", "incoming"),
-            ],
-        ),
-        &[],
-    )
-    .expect("write");
-    let first = db.list_pending_refs(1, 0).expect("first");
-    let second = db
-        .list_pending_refs(1, first.next_cursor.expect("cursor"))
-        .expect("second");
-    assert_eq!(first.refs[0].reference.direction, Direction::Out);
-    assert_eq!(second.refs[0].reference.direction, Direction::In);
-    let before = db.list_pending_refs(100, 0).expect("all").refs;
-    let resolutions: Vec<_> = before
-        .iter()
-        .map(|r| Resolution {
-            ref_id: r.id,
-            entity_id: r.reference.ref_name.clone(),
-            provenance: Provenance::WorkspaceUnique,
-        })
-        .collect();
-    let raw = Connection::open(&path).expect("raw");
-    raw.execute_batch("CREATE TRIGGER fail_source BEFORE UPDATE OF source ON edges WHEN NEW.source = 'incoming' BEGIN SELECT RAISE(ABORT, 'injected'); END;").expect("trigger");
-    assert!(db.apply_resolutions(&resolutions).is_err());
-    assert_eq!(db.list_pending_refs(100, 0).expect("rollback").refs, before);
-    assert!(
-        db.neighborhood("owner", Direction::Both, None)
-            .expect("no partial result")
-            .is_empty()
-    );
-    raw.execute_batch("DROP TRIGGER fail_source;")
-        .expect("drop");
-    assert_eq!(
-        db.apply_resolutions(&resolutions)
-            .expect("resolve both")
-            .resolved,
-        2
-    );
-    assert_eq!(
-        db.get_callers("owner").expect("incoming")[0].source,
-        "incoming"
-    );
-    assert_eq!(
-        db.get_callees("owner").expect("outgoing")[0].target,
-        "outgoing"
-    );
-
-    // Invalidation of incoming refs participates in the replacement transaction.
-    raw.execute_batch("CREATE TRIGGER fail_insert BEFORE INSERT ON edges BEGIN SELECT RAISE(ABORT, 'injected'); END;").expect("trigger");
-    assert!(
-        db.write_file_graph(
-            "incoming-file",
-            &graph(
-                &["incoming"],
-                vec![edge(EdgeKind::Calls, "incoming", "incoming", 1)],
-                vec![]
-            ),
-            &["incoming".into()]
-        )
-        .is_err()
-    );
-    assert_eq!(
-        db.get_callers("owner").expect("incoming restored")[0].source,
-        "incoming"
-    );
-    assert!(
-        db.list_pending_refs(100, 0)
-            .expect("still resolved")
-            .refs
-            .is_empty()
-    );
-}
-
-#[test]
-fn incoming_file_endpoint_can_be_invalidated_without_entity_ids() {
-    let mut db = SqliteGraphStorage::in_memory().expect("open");
-    db.write_file_graph(
-        "owner-file",
-        &graph(
-            &[],
-            vec![],
-            vec![incoming_reference("owner-file", "external-file")],
-        ),
-        &[],
-    )
-    .expect("write");
-    let before = db.list_pending_refs(100, 0).expect("refs").refs;
-    db.apply_resolutions(&[proposal(&db, "external-file")])
-        .expect("resolve");
-    db.delete_file_graph("external-file", &[]).expect("delete");
-    assert_eq!(db.list_pending_refs(100, 0).expect("requeued").refs, before);
-}
-
-#[test]
-fn schema_requires_known_endpoint_matching_reference_direction() {
+fn reference_schema_defaults_constraints_and_foreign_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("graph.sqlite");
     open(&path).close().expect("init");
     let raw = Connection::open(&path).expect("raw");
-    for (source, target, direction) in [
-        (None, None, Some("in")),
-        (None, None, Some("out")),
-        (Some("owner"), None, Some("in")),
-        (None, Some("owner"), Some("out")),
-        (None, Some("owner"), None),
-    ] {
-        assert!(raw.execute("INSERT INTO edges (file_id, kind, source, target, ref_direction, ref_name, line, column) VALUES ('f', 'calls', ?, ?, ?, 'name', 1, 0)", rusqlite::params![source, target, direction]).is_err());
-    }
-    for (source, target, direction) in [(None, Some("owner"), "in"), (Some("owner"), None, "out")] {
-        raw.execute("INSERT INTO edges (file_id, kind, source, target, ref_direction, ref_name, line, column) VALUES ('f', 'calls', ?, ?, ?, 'name', 1, 0)", rusqlite::params![source, target, direction]).expect("valid pending row");
-    }
+    raw.pragma_update(None, "foreign_keys", true)
+        .expect("foreign keys");
+    raw.execute("INSERT INTO unresolved_refs (from_node_id, file_id, reference_name, reference_kind, line, col) VALUES ('a', 'f', 'b', 'calls', 1, 0)", []).expect("defaults");
+    let defaults: (String, String, String, String, Option<String>) = raw
+        .query_row(
+            "SELECT file_path, language, name_tail, status, candidates FROM unresolved_refs",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .expect("defaults");
+    assert_eq!(
+        defaults,
+        (
+            String::new(),
+            "unknown".into(),
+            String::new(),
+            "pending".into(),
+            None
+        )
+    );
+    assert!(
+        raw.execute("UPDATE unresolved_refs SET candidates = '{}'", [])
+            .is_err()
+    );
+    assert!(
+        raw.execute("UPDATE unresolved_refs SET status = 'invalid'", [])
+            .is_err()
+    );
+    assert!(raw.execute("INSERT INTO edges (file_id, ref_id, kind, source, target, provenance) VALUES ('f', 999, 'calls', 'a', 'b', 'import_scoped')", []).is_err());
+    raw.execute("INSERT INTO edges (file_id, ref_id, kind, source, target, provenance) VALUES ('f', 1, 'calls', 'a', 'b', 'import_scoped')", []).expect("linked edge");
+    raw.execute("DELETE FROM unresolved_refs", [])
+        .expect("delete ref");
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM edges", [], |r| r.get::<_, i64>(0))
+            .expect("cascade"),
+        0
+    );
 }
 
 #[test]
-fn both_direction_reference_is_rejected_without_replacing_existing_graph() {
+fn replaced_reference_ids_are_not_reused() {
     let mut db = SqliteGraphStorage::in_memory().expect("open");
-    let original = graph(
-        &["a", "b"],
-        vec![edge(EdgeKind::Calls, "a", "b", 1)],
-        vec![reference("a", "external")],
-    );
-    db.write_file_graph("file", &original, &[]).expect("write");
-    let before = db.list_pending_refs(100, 0).expect("refs").refs;
-    let invalid = PendingRef {
-        direction: Direction::Both,
-        ..reference("a", "external")
-    };
-    assert!(matches!(
-        db.write_file_graph(
-            "file",
-            &graph(&["a"], vec![], vec![invalid]),
-            &["a".into(), "b".into()]
-        ),
-        Err(Error::InvalidInput(_))
-    ));
+    let snapshot = graph(&["a"], vec![], vec![reference("a", "b")]);
+    db.write_file_graph("file", &snapshot, &[]).expect("write");
+    let old = proposal(&db, "b");
+    db.write_file_graph("file", &snapshot, &["a".into()])
+        .expect("replace");
+    let new = proposal(&db, "b");
+    assert!(new.ref_id > old.ref_id);
+    assert_eq!(db.apply_resolutions(&[old]).expect("deleted ref").stale, 1);
     assert_eq!(
-        db.list_pending_refs(100, 0).expect("unchanged refs").refs,
-        before
-    );
-    assert_eq!(
-        db.neighborhood("a", Direction::Both, None)
-            .expect("both query still works"),
-        original.edges
+        db.apply_resolutions(&[new]).expect("current ref").resolved,
+        1
     );
 }

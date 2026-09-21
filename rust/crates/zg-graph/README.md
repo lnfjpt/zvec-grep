@@ -28,21 +28,18 @@ Storage types are exposed under `zg_graph::persistence`.
 
 ## Ownership
 
-Only one table is stored: `edges`. An unresolved reference has one NULL endpoint
-and NULL provenance; resolution fills that endpoint on the same row. Original
-reference details remain available after resolution. There is no separate
-reference table, foreign key or status column. Entity content, names,
-paths, ranges and other node metadata remain in zvec. `FileGraph.entity_ids`
-contains the current file's entity IDs for ownership validation; these IDs are
-not persisted in a second entity/file table. IDs are opaque strings at this
-boundary; integration must encode each engine file ID consistently for both
-ownership and file-level endpoints, using the existing entity IDs for nodes.
+SQLite stores two tables: `edges` holds resolved relationships;
+`unresolved_refs` holds original references and their resolution state.
+A resolved reference is retained and its edge points back through `ref_id`.
+Entity content and definition metadata remain in zvec. `FileGraph.entity_ids`
+contains the current file's entity IDs for ownership validation, not a second node registry.
+Entity and file IDs are opaque strings supplied by the indexing coordinator.
 
 `SqliteGraphStorage::open(path, OpenMode::ReadWrite)` initializes an empty graph
-and enables WAL and a busy timeout. Read-only opening neither
+and enables WAL, foreign keys and a busy timeout. Read-only opening neither
 creates a missing database nor migrates its schema. Both modes validate the
 application ID and schema version. An unrelated or unsupported database is
-rejected. Schema version 3 supports either unresolved endpoint; existing
+rejected. Schema version 4 restores separate references and edges; existing
 graph databases must be rebuilt, with no migration provided. Drop closes a connection; `close(self)` also reports close failures.
 All operations are synchronous. Writes require `&mut self` and use SQLite
 `BEGIN IMMEDIATE` transactions; the calling engine chooses its blocking boundary.
@@ -53,52 +50,53 @@ All operations are synchronous. Writes require `&mut self` and use SQLite
   edges and refs. Snapshots accept only local edges and locally owned pending
   references. The file ID itself is an implicit local endpoint.
 - `delete_file_graph(file_id, old_entity_ids)` removes owned rows and invalidates
-  cross-file references to either endpoint. Repeated deletion is safe.
+  incoming cross-file references. Repeated deletion is safe.
 - Both require **all pre-update entity IDs from zvec**, including removed
-  definitions. Pass `[]` for a new file. Replacing either resolved endpoint with
-  the same ID also invalidates references to it.
+  definitions. Pass `[]` for a new file. Replacing a target with the same ID
+  also invalidates incoming references.
 - File-level import targets are invalidated even when the entity-ID list is empty.
   Large ID lists are processed in bounded SQL parameter batches within one transaction.
-- Invalidation clears the endpoint selected by each reference direction and its
-  provenance, preserving the known owner, row ID and reference details. Deleting
-  the file that produced the reference deletes the entire row.
+- Invalidation deletes resolved incoming edges, resets retained references to
+  `pending`, and clears stale candidates. Original reference context is retained.
+  Deleting the source file removes both its references and its edges.
 
 Transactions cover SQLite only. The indexer must coordinate graph writes with
 zvec's file-update journal/checkpoints and use the workspace write lock. Do not
 publish an index if only one store has committed. This crate deliberately does
 not add another workspace recovery journal or a ready marker.
 
-## Reference direction
+## Reference records
 
-Each reference has one known endpoint, `PendingRef.owner_id`, owned by its
-extraction file. `PendingRef.direction` determines the unresolved endpoint:
+`PendingRef.from_node_id` is always the final edge's source, owned by the
+extraction file. Only the target is unresolved; references have no direction.
+`Direction` is used only by neighborhood queries.
 
-- `Direction::Out`: `owner -> unresolved`; fill `target`.
-- `Direction::In`: `unresolved -> owner`; fill `source`.
+The reference table contains `reference_name`, `reference_kind`, `line`, `col`,
+`candidates` (optional JSON array of target IDs), `file_path`, `language`,
+`status`, and `name_tail`. IDs use AUTOINCREMENT. File path and language are
+explicit resolution context supplied by the caller; this standalone crate
+does not fetch them from zvec. The supplied name tail has an index.
+Existing `file_id`, `receiver_name`, `arity`, and `metadata` are retained
+for file cleanup and resolution evidence.
 
-`Direction::Both` is accepted for queries but rejected when writing a reference.
-
-SQLite retains `ref_direction` after resolution so invalidation clears the
-correct endpoint. `Resolution.entity_id` supplies the resolved entity; the
-stored direction determines where to write it. `file_id` identifies the file
-that produced the reference, which need not be the source endpoint's file.
-Reference positions are locations in that owning file.
-References with both endpoints unknown are outside this anchored-reference
-contract. Relationship queries require both endpoints to be present.
+Snapshots always create pending references. Successful resolution marks them
+resolved and preserves their candidates and original context. The schema
+reserves `failed`, but there is no failure-marking API yet. Candidates are
+currently supplied in the snapshot; the storage does not compute them.
 
 ## Reference resolution protocol
 
 1. `list_pending_refs(limit, cursor)` returns pending refs and their database IDs. Use cursor `0` initially; limits are `1..=1000`. `next_cursor` is only
    present when another page exists. Restart pagination after file changes.
 2. A language-aware resolver selects and validates a target in the entity store.
-3. `apply_resolutions(&results)` updates the unresolved endpoint and provenance
-   atomically. Missing or already-resolved references count as `stale`;
+3. `apply_resolutions(&results)` creates an edge from `from_node_id` to
+   `Resolution.target_id` and marks the reference resolved in one transaction. Missing or already-resolved references count as `stale`;
    local edges are preserved. Malformed inputs or SQL errors roll back the batch.
 
 The coordinator must hold the workspace write lock across the entire reference
-read, endpoint lookup/validation and writeback cycle, and prevent file mutations
+read, target lookup/validation and writeback cycle, and prevent file mutations
 through the same writer during that cycle. Storage does not detect outdated
-results for reused or invalidated reference IDs. Graph storage is not yet
+results for invalidated references. Graph storage is not yet
 connected to the engine's workspace lock.
 Symbol-index changes that introduce ambiguity may also require re-resolving
 references; the indexing/resolver integration must define that policy.

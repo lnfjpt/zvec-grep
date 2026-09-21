@@ -1,10 +1,10 @@
 use rusqlite::{TransactionBehavior, params, params_from_iter};
 use std::collections::HashSet;
 
-use super::{Direction, Error, FileGraph, Provenance, Result, SqliteGraphStorage, nonempty};
+use super::{Error, FileGraph, Provenance, Result, SqliteGraphStorage, nonempty};
 
 impl SqliteGraphStorage {
-    /// Atomically replaces one file's local graph and invalidates references to either endpoint.
+    /// Atomically replaces one file's local graph and invalidates inbound edges.
     /// `old_entity_ids` must contain **all** pre-update entity IDs from zvec; pass
     /// an empty slice for a new file. Entity IDs in the new snapshot are not stored
     /// in a second node table. Cross-file edges must use `apply_resolutions`.
@@ -22,32 +22,25 @@ impl SqliteGraphStorage {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut endpoints: Vec<&str> = old_entity_ids.iter().map(String::as_str).collect();
-        endpoints.push(file_id);
-        endpoints.sort_unstable();
-        endpoints.dedup();
-        for chunk in endpoints.chunks(500) {
+        let mut targets: Vec<&str> = old_entity_ids.iter().map(String::as_str).collect();
+        targets.push(file_id);
+        targets.sort_unstable();
+        targets.dedup();
+        for chunk in targets.chunks(500) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            // Clear only the resolved endpoint; retain the owner and evidence.
-            for (field, direction) in [("source", "in"), ("target", "out")] {
-                tx.execute(
-                    &format!(
-                        "UPDATE edges SET {field} = NULL, provenance = NULL
-                         WHERE {field} IN ({placeholders}) AND file_id <> ?
-                         AND ref_direction = '{direction}'"
-                    ),
-                    params_from_iter(chunk.iter().copied().chain(std::iter::once(file_id))),
-                )?;
-            }
-            // Remaining matches are direct edges or references whose owner was removed.
-            for field in ["source", "target"] {
-                tx.execute(
-                    &format!("DELETE FROM edges WHERE {field} IN ({placeholders})"),
-                    params_from_iter(chunk.iter().copied()),
-                )?;
-            }
+            // Retain the original reference for the next resolution pass.
+            tx.execute(
+                &format!("UPDATE unresolved_refs SET status = 'pending', candidates = NULL
+                  WHERE id IN (SELECT ref_id FROM edges WHERE target IN ({placeholders}) AND file_id <> ?)"),
+                params_from_iter(chunk.iter().copied().chain(std::iter::once(file_id))),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM edges WHERE target IN ({placeholders})"),
+                params_from_iter(chunk.iter().copied()),
+            )?;
         }
         tx.execute("DELETE FROM edges WHERE file_id = ?", [file_id])?;
+        tx.execute("DELETE FROM unresolved_refs WHERE file_id = ?", [file_id])?;
         {
             let mut insert = tx.prepare(
                 "INSERT INTO edges
@@ -66,32 +59,27 @@ impl SqliteGraphStorage {
                     serde_json::to_string(&edge.metadata)?
                 ])?;
             }
-            let mut insert = tx.prepare(
-                "INSERT INTO edges
-                (file_id, source, target, ref_direction, ref_name, receiver_name, kind, arity, line, column, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )?;
+            let mut insert = tx.prepare("INSERT INTO unresolved_refs
+                (file_id, from_node_id, reference_name, receiver_name, reference_kind, arity, line, col, candidates, file_path, language, name_tail, status, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)")?;
             for reference in &graph.pending_refs {
-                let (source, target, direction) = match reference.direction {
-                    Direction::In => (None, Some(&reference.owner_id), "in"),
-                    Direction::Out => (Some(&reference.owner_id), None, "out"),
-                    Direction::Both => {
-                        return Err(Error::InvalidInput(
-                            "pending refs require in or out direction",
-                        ));
-                    }
-                };
                 insert.execute(params![
                     file_id,
-                    source,
-                    target,
-                    direction,
-                    reference.ref_name,
+                    reference.from_node_id,
+                    reference.reference_name,
                     reference.receiver_name,
-                    super::EdgeKind::from(reference.ref_kind).as_str(),
+                    super::EdgeKind::from(reference.reference_kind).as_str(),
                     reference.arity,
                     reference.line,
-                    reference.column,
+                    reference.col,
+                    reference
+                        .candidates
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    reference.file_path,
+                    reference.language,
+                    reference.name_tail,
                     serde_json::to_string(&reference.metadata)?
                 ])?;
             }
@@ -100,8 +88,8 @@ impl SqliteGraphStorage {
         Ok(())
     }
 
-    /// Deletes owned rows and invalidates references to either endpoint, including
-    /// references to the file itself. Repeating deletion is safe.
+    /// Deletes owned rows and invalidates incoming references, including imports
+    /// targeting the file itself. Repeating deletion is safe.
     ///
     /// # Errors
     /// Rejects empty IDs and SQLite failures. The complete mutation is atomic.
@@ -136,13 +124,8 @@ fn validate(file_id: &str, graph: &FileGraph, old_entity_ids: &[String]) -> Resu
         }
     }
     for reference in &graph.pending_refs {
-        if reference.direction == Direction::Both {
-            return Err(Error::InvalidInput(
-                "pending refs require in or out direction",
-            ));
-        }
-        nonempty(&reference.ref_name)?;
-        if !owns(&reference.owner_id) || reference.line == 0 {
+        nonempty(&reference.reference_name)?;
+        if !owns(&reference.from_node_id) || reference.line == 0 {
             return Err(Error::InvalidInput(
                 "pending refs require local ownership and one-based lines",
             ));
