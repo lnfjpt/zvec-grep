@@ -4,9 +4,9 @@ This directory contains the Rust implementation of zvec-grep. The TypeScript /
 Node.js implementation remains at the repository root; the [main README](../README.md)
 and [user documentation](../docs/README.md) describe that implementation.
 
-The standalone [`zg-graph`](crates/zg-graph/README.md) crate provides
-SQLite persistence for code relationships and pending references. It is not yet
-connected to extraction, indexing, or query APIs.
+The engine's internal [graph storage](crates/zg-engine/src/storage/graph/README.md)
+module provides SQLite relationship persistence. Indexing integration follows
+separately.
 
 Run the development commands below from `rust/` (`cd rust` from the repository
 root). See the [contributor guide](CONTRIBUTING.md) for checks and conventions.

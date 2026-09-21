@@ -3936,6 +3936,7 @@ dependencies = [
  "ort",
  "rayon",
  "reqwest",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",
@@ -3968,17 +3969,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "zg-graph"
-version = "0.0.1"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]

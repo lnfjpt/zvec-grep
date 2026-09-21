@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use rusqlite::Connection;
-use serde_json::json;
-use zg_graph::persistence::{
+use super::{
     Direction, Edge, EdgeKind, Error, FileGraph, Metadata, OpenMode, PendingRef, Provenance,
     Resolution, ResolutionStats, SqliteGraphStorage,
 };
+use rusqlite::Connection;
+use serde_json::json;
 
 fn edge(kind: EdgeKind, source: &str, target: &str, line: u32) -> Edge {
     Edge {

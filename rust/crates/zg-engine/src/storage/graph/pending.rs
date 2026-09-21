@@ -11,7 +11,7 @@ impl SqliteGraphStorage {
     /// Restart with cursor 0 after file mutations. Limit must be 1..=1000.
     /// # Errors
     /// Rejects invalid limits/cursors and malformed stored rows or SQLite errors.
-    pub fn list_pending_refs(&self, limit: usize, cursor: i64) -> Result<PendingRefPage> {
+    pub(crate) fn list_pending_refs(&self, limit: usize, cursor: i64) -> Result<PendingRefPage> {
         if !(1..=1000).contains(&limit) || cursor < 0 {
             return Err(Error::InvalidInput(
                 "pending query requires limit 1..1000 and nonnegative cursor",
@@ -38,7 +38,10 @@ impl SqliteGraphStorage {
     /// resolution and writeback cycle with workspace writes/deletions.
     /// # Errors
     /// Rejects invalid proposals and SQLite failures; the entire batch rolls back.
-    pub fn apply_resolutions(&mut self, resolutions: &[Resolution]) -> Result<ResolutionStats> {
+    pub(crate) fn apply_resolutions(
+        &mut self,
+        resolutions: &[Resolution],
+    ) -> Result<ResolutionStats> {
         for resolution in resolutions {
             nonempty(&resolution.target_id)?;
             if resolution.ref_id < 1 || resolution.provenance == Provenance::FileLocal {

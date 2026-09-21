@@ -13,11 +13,11 @@ mod writer;
 
 use rusqlite::{Connection, OpenFlags};
 use std::{path::Path, time::Duration};
-pub use types::*;
+pub(crate) use types::*;
 
 /// Errors at the graph persistence boundary.
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("SQLite graph operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("invalid graph metadata: {0}")]
@@ -35,11 +35,11 @@ pub enum Error {
 }
 
 /// Result of a graph storage operation.
-pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// Read-only opening never creates a database or modifies its schema.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OpenMode {
+pub(crate) enum OpenMode {
     ReadOnly,
     ReadWrite,
 }
@@ -47,7 +47,7 @@ pub enum OpenMode {
 /// Owns one connection. Writes require exclusive Rust access; readers and writers
 /// in separate connections use SQLite transactions and a five-second busy timeout.
 /// Drop closes the connection; `close` additionally reports close errors.
-pub struct SqliteGraphStorage {
+pub(crate) struct SqliteGraphStorage {
     connection: Connection,
 }
 
@@ -56,7 +56,7 @@ impl SqliteGraphStorage {
     ///
     /// # Errors
     /// Rejects missing read-only databases, foreign/newer schemas, and SQLite/I/O errors.
-    pub fn open(path: &Path, mode: OpenMode) -> Result<Self> {
+    pub(crate) fn open(path: &Path, mode: OpenMode) -> Result<Self> {
         if path.as_os_str().is_empty() {
             return Err(Error::InvalidInput("database path is empty"));
         }
@@ -76,7 +76,7 @@ impl SqliteGraphStorage {
     ///
     /// # Errors
     /// Returns SQLite initialization errors.
-    pub fn in_memory() -> Result<Self> {
+    pub(crate) fn in_memory() -> Result<Self> {
         Self::configure(Connection::open_in_memory()?, OpenMode::ReadWrite)
     }
 
@@ -97,7 +97,7 @@ impl SqliteGraphStorage {
     ///
     /// # Errors
     /// Reports SQLite close failures.
-    pub fn close(self) -> Result<()> {
+    pub(crate) fn close(self) -> Result<()> {
         self.connection.close().map_err(|(_, error)| error.into())
     }
 }
@@ -121,3 +121,6 @@ fn decode_metadata(value: &str) -> rusqlite::Result<Metadata> {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
     })
 }
+
+#[cfg(test)]
+mod tests;

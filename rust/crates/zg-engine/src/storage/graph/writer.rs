@@ -13,7 +13,7 @@ impl SqliteGraphStorage {
     /// # Errors
     /// Rejects invalid ownership, duplicate/empty IDs, non-local edges, invalid
     /// positions, read-only connections, and SQLite failures. Failures roll back.
-    pub fn write_file_graph(
+    pub(crate) fn write_file_graph(
         &mut self,
         file_id: u32,
         graph: &FileGraph,
@@ -96,7 +96,11 @@ impl SqliteGraphStorage {
     ///
     /// # Errors
     /// Rejects empty IDs and SQLite failures. The complete mutation is atomic.
-    pub fn delete_file_graph(&mut self, file_id: u32, old_entity_ids: &[String]) -> Result<()> {
+    pub(crate) fn delete_file_graph(
+        &mut self,
+        file_id: u32,
+        old_entity_ids: &[String],
+    ) -> Result<()> {
         self.write_file_graph(file_id, &FileGraph::default(), old_entity_ids)
     }
 }

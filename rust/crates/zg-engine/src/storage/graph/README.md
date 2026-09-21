@@ -1,30 +1,22 @@
 # Graph
 
-The `zg_graph::persistence` module ports the TypeScript graph persistence protocol
-to Rust. The `zg-graph` crate is
-an independent Cargo workspace member so its SQLite behavior can be validated
-without loading embeddings, zvec, or a daemon. `rusqlite` owns the connection and
-builds a bundled SQLite; Node.js and a system SQLite installation are not needed.
-
-This is the storage-only migration. The engine does not use the crate yet.
-Extraction, indexing orchestration, zvec symbol lookup, FTS fallback, resolvers,
-MCP/CLI tools, and engine API methods belong in subsequent integration changes.
+Graph persistence lives in the engine's private storage module at
+`src/storage/graph`. It uses bundled SQLite and keeps node metadata in zvec.
+The indexing pipeline does not use it yet; lifecycle and write coordination
+will be connected in a subsequent change.
 
 ## Structure
 
 ```text
-src/
-├── lib.rs
-└── persistence/
-    ├── mod.rs
-    ├── types.rs
-    ├── schema.rs
-    ├── writer.rs
-    ├── reader.rs
-    └── pending.rs
+storage/graph/
+├── mod.rs
+├── types.rs
+├── schema.rs
+├── writer.rs
+├── reader.rs
+├── pending.rs
+└── tests.rs
 ```
-
-Storage types are exposed under `zg_graph::persistence`.
 
 ## Ownership
 
@@ -66,7 +58,7 @@ All operations are synchronous. Writes require `&mut self` and use SQLite
 
 Transactions cover SQLite only. The indexer must coordinate graph writes with
 zvec's file-update journal/checkpoints and use the workspace write lock. Do not
-publish an index if only one store has committed. This crate deliberately does
+publish an index if only one store has committed. This module deliberately does
 not add another workspace recovery journal or a ready marker.
 
 ## Reference records
@@ -124,11 +116,11 @@ in the relationship pipeline.
 Run from `rust/`:
 
 ```sh
-cargo fmt -p zg-graph --check
-cargo check -p zg-graph --all-targets
-cargo clippy -p zg-graph --all-targets -- -D warnings
-cargo test -p zg-graph
-RUSTDOCFLAGS="-D warnings" cargo doc -p zg-graph --no-deps
+cargo fmt -p zg-engine --check
+cargo check -p zg-engine --all-targets
+cargo clippy -p zg-engine --all-targets -- -D warnings
+cargo test -p zg-engine --lib storage::graph::
+RUSTDOCFLAGS="-D warnings" cargo doc -p zg-engine --no-deps
 ```
 
 Tests exercise real SQLite connections: read-only opening, schema guards,

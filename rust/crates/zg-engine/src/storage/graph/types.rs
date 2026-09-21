@@ -2,12 +2,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Extensible evidence attached to edges and unresolved references.
-pub type Metadata = Map<String, Value>;
+pub(crate) type Metadata = Map<String, Value>;
 
 /// Direction of a one-hop query relative to its endpoint.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Direction {
+pub(crate) enum Direction {
     In,
     Out,
     #[default]
@@ -17,7 +17,7 @@ pub enum Direction {
 /// Kinds of directed graph edges.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EdgeKind {
+pub(crate) enum EdgeKind {
     Contains,
     Calls,
     Imports,
@@ -40,7 +40,7 @@ impl EdgeKind {
 /// Evidence used to select an edge endpoint.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Provenance {
+pub(crate) enum Provenance {
     FileLocal,
     ImportScoped,
     PreferredFile,
@@ -60,7 +60,7 @@ impl Provenance {
 
 /// A resolved directed edge. Entity/file identity is supplied by the indexer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Edge {
+pub(crate) struct Edge {
     pub kind: EdgeKind,
     pub source: String,
     pub target: String,
@@ -75,7 +75,7 @@ pub struct Edge {
 /// Extraction output that still requires name resolution.
 /// New snapshots insert unresolved references; the source is known and only the target requires resolution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PendingRef {
+pub(crate) struct PendingRef {
     /// Known source of the eventual edge, owned by the extraction file.
     pub from_node_id: String,
     pub reference_name: String,
@@ -96,7 +96,7 @@ pub struct PendingRef {
 
 /// A complete per-file snapshot. Node metadata is deliberately not stored here.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct FileGraph {
+pub(crate) struct FileGraph {
     /// Complete current entity IDs; the zvec file key `f{file_id}` is an implicit local endpoint.
     pub entity_ids: Vec<String>,
     pub edges: Vec<Edge>,
@@ -105,7 +105,7 @@ pub struct FileGraph {
 
 /// A pending reference with its database identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredPendingRef {
+pub(crate) struct StoredPendingRef {
     pub id: i64,
     pub file_id: u32,
     pub reference: PendingRef,
@@ -113,7 +113,7 @@ pub struct StoredPendingRef {
 
 /// Page over pending references. Restart pagination after file mutations.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PendingRefPage {
+pub(crate) struct PendingRefPage {
     pub refs: Vec<StoredPendingRef>,
     pub next_cursor: Option<i64>,
 }
@@ -121,7 +121,7 @@ pub struct PendingRefPage {
 /// A resolver's proposed edge. The caller must validate the target in zvec and
 /// serialize the entire read, resolution and writeback cycle with workspace writes/deletions.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Resolution {
+pub(crate) struct Resolution {
     /// ID of the pending row in `edges`.
     pub ref_id: i64,
     pub target_id: String,
@@ -131,7 +131,7 @@ pub struct Resolution {
 
 /// Applied proposals and missing/already resolved references in an atomic batch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ResolutionStats {
+pub(crate) struct ResolutionStats {
     pub resolved: usize,
     pub stale: usize,
 }

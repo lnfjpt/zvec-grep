@@ -8,6 +8,9 @@ mod backend;
 mod codec;
 mod directories;
 mod file_ids;
+// Graph persistence is exercised in tests; indexing integration follows separately.
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub(crate) mod graph;
 mod path;
 mod pending;
 pub(crate) mod spi;

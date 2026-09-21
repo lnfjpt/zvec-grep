@@ -7,14 +7,14 @@ impl SqliteGraphStorage {
     /// All incoming call edges, in insertion order; retains distinct call sites.
     /// # Errors
     /// Rejects blank IDs, invalid stored data, and SQLite errors.
-    pub fn get_callers(&self, target_id: &str) -> Result<Vec<Edge>> {
+    pub(crate) fn get_callers(&self, target_id: &str) -> Result<Vec<Edge>> {
         self.neighborhood(target_id, Direction::In, Some(&[EdgeKind::Calls]))
     }
 
     /// All outgoing call edges, in insertion order.
     /// # Errors
     /// Rejects blank IDs, invalid stored data, and SQLite errors.
-    pub fn get_callees(&self, source_id: &str) -> Result<Vec<Edge>> {
+    pub(crate) fn get_callees(&self, source_id: &str) -> Result<Vec<Edge>> {
         self.neighborhood(source_id, Direction::Out, Some(&[EdgeKind::Calls]))
     }
 
@@ -24,7 +24,7 @@ impl SqliteGraphStorage {
     ///
     /// # Errors
     /// Rejects blank IDs, invalid stored data, and SQLite errors.
-    pub fn neighborhood(
+    pub(crate) fn neighborhood(
         &self,
         id: &str,
         direction: Direction,
