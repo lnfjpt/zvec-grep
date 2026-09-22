@@ -1,9 +1,4 @@
 //! Cross-module graph extraction contracts.
-//!
-//! Mirrors the TypeScript `src/engine/graph/types.ts` contract: the
-//! extraction layer produces [`FileGraphResult`] per code file, the pipeline
-//! carries it to the graph persistence layer, and the resolver consumes the
-//! buffered pending references.
 
 use std::collections::BTreeMap;
 
