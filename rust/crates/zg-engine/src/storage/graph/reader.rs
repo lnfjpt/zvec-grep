@@ -4,20 +4,6 @@ use super::{
 use rusqlite::{Row, params_from_iter};
 
 impl SqliteGraphStorage {
-    /// All incoming call edges, in insertion order; retains distinct call sites.
-    /// # Errors
-    /// Rejects blank IDs, invalid stored data, and SQLite errors.
-    pub(crate) fn get_callers(&self, target_id: &str) -> Result<Vec<Edge>> {
-        self.neighborhood(target_id, Direction::In, Some(&[EdgeKind::Calls]))
-    }
-
-    /// All outgoing call edges, in insertion order.
-    /// # Errors
-    /// Rejects blank IDs, invalid stored data, and SQLite errors.
-    pub(crate) fn get_callees(&self, source_id: &str) -> Result<Vec<Edge>> {
-        self.neighborhood(source_id, Direction::Out, Some(&[EdgeKind::Calls]))
-    }
-
     /// All resolved one-hop edges in insertion order, with no result limit.
     /// `None` selects all kinds; `Some(&[])` selects none.
     /// Self-loops appear once; distinct stored call sites are preserved.

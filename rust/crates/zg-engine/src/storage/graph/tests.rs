@@ -75,11 +75,30 @@ fn local_queries_preserve_direction_kinds_order_metadata_and_call_sites() {
         &[],
     )
     .expect("write");
-    assert_eq!(db.get_callers("b").expect("callers"), edges[..3]);
-    assert_eq!(db.get_callees("a").expect("callees"), edges[..2]);
-    assert!(db.get_callers("a").expect("no incoming").is_empty());
-    assert!(db.get_callees("missing").expect("unknown").is_empty());
-    assert!(db.get_callers(" ").is_err());
+    assert_eq!(
+        db.neighborhood("b", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("callers"),
+        edges[..3]
+    );
+    assert_eq!(
+        db.neighborhood("a", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("callees"),
+        edges[..2]
+    );
+    assert!(
+        db.neighborhood("a", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("no incoming")
+            .is_empty()
+    );
+    assert!(
+        db.neighborhood("missing", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("unknown")
+            .is_empty()
+    );
+    assert!(
+        db.neighborhood(" ", Direction::In, Some(&[EdgeKind::Calls]))
+            .is_err()
+    );
 }
 
 #[test]
@@ -105,23 +124,36 @@ fn replacement_and_repeated_deletion_remove_only_owned_rows() {
         &["a".into(), "b".into()],
     )
     .expect("replace");
-    assert!(db.get_callers("b").expect("old edge gone").is_empty());
+    assert!(
+        db.neighborhood("b", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("old edge gone")
+            .is_empty()
+    );
     assert!(
         db.list_pending_refs(100, 0)
             .expect("old ref gone")
             .refs
             .is_empty()
     );
-    assert_eq!(db.get_callees("c").expect("new edge"), vec![new]);
+    assert_eq!(
+        db.neighborhood("c", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("new edge"),
+        vec![new]
+    );
     for _ in 0..2 {
         db.delete_file_graph(2, &["c".into(), "d".into(), "c".into()])
             .expect("delete");
     }
     assert_eq!(
-        db.get_callees("x").expect("other file unchanged"),
+        db.neighborhood("x", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("other file unchanged"),
         vec![other]
     );
-    assert!(db.get_callees("c").expect("deleted").is_empty());
+    assert!(
+        db.neighborhood("c", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("deleted")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -157,14 +189,24 @@ fn cross_file_resolution_is_idempotent_and_invalidation_requeues_refs() {
             stale: 1
         }
     );
-    let incoming = db.get_callers("remote").expect("cross edge");
+    let incoming = db
+        .neighborhood("remote", Direction::In, Some(&[EdgeKind::Calls]))
+        .expect("cross edge");
     assert_eq!(incoming.len(), 1);
     assert_eq!(incoming[0].metadata, reference("a", "remote").metadata);
     assert_eq!(incoming[0].line, Some(3));
     db.delete_file_graph(5, &["remote".into()])
         .expect("invalidate");
-    assert!(db.get_callers("remote").expect("removed").is_empty());
-    assert_eq!(db.get_callees("a").expect("local retained"), vec![local]);
+    assert!(
+        db.neighborhood("remote", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("removed")
+            .is_empty()
+    );
+    assert_eq!(
+        db.neighborhood("a", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("local retained"),
+        vec![local]
+    );
     let renewed = proposal(&db, "replacement");
     assert_eq!(renewed.ref_id, resolution.ref_id);
     assert_eq!(
@@ -175,7 +217,11 @@ fn cross_file_resolution_is_idempotent_and_invalidation_requeues_refs() {
     );
     db.delete_file_graph(4, &["a".into(), "b".into()])
         .expect("delete owner");
-    assert!(db.get_callers("replacement").expect("cascade").is_empty());
+    assert!(
+        db.neighborhood("replacement", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("cascade")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -189,7 +235,11 @@ fn replacing_a_target_with_the_same_id_invalidates_resolutions() {
     db.apply_resolutions(&[resolution]).expect("resolve");
     db.write_file_graph(5, &graph(&["b"], vec![], vec![]), &["b".into()])
         .expect("replace");
-    assert!(db.get_callers("b").expect("invalidated").is_empty());
+    assert!(
+        db.neighborhood("b", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("invalidated")
+            .is_empty()
+    );
     assert_eq!(
         db.list_pending_refs(100, 0)
             .expect("pending again")
@@ -236,7 +286,12 @@ fn pagination_is_pending_only_and_readers_do_not_truncate_edges() {
         .collect();
     db.write_file_graph(1, &graph(&["a", "b"], edges, refs), &[])
         .expect("large graph");
-    assert_eq!(db.get_callees("a").expect("all edges").len(), 1100);
+    assert_eq!(
+        db.neighborhood("a", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("all edges")
+            .len(),
+        1100
+    );
     let page = db.list_pending_refs(1000, 0).expect("page1");
     assert_eq!(page.refs.len(), 1000);
     let last = db
@@ -281,7 +336,7 @@ fn deletion_chunks_large_entity_lists() {
         .expect("resolve");
     db.delete_file_graph(5, &ids).expect("delete all chunks");
     assert!(
-        db.get_callers("entity-1599")
+        db.neighborhood("entity-1599", Direction::In, Some(&[EdgeKind::Calls]))
             .expect("last chunk removed")
             .is_empty()
     );
@@ -318,7 +373,8 @@ fn ownership_validation_prevents_cross_file_snapshot_writes() {
                 .is_err()
         );
         assert_eq!(
-            db.get_callees("a").expect("original intact"),
+            db.neighborhood("a", Direction::Out, Some(&[EdgeKind::Calls]))
+                .expect("original intact"),
             vec![original.clone()]
         );
     }
@@ -346,7 +402,12 @@ fn sql_failure_rolls_back_replacement_and_invalidation() {
         )
         .is_err()
     );
-    assert_eq!(db.get_callers("b").expect("incoming restored").len(), 1);
+    assert_eq!(
+        db.neighborhood("b", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("incoming restored")
+            .len(),
+        1
+    );
     assert!(
         db.list_pending_refs(100, 0)
             .expect("status restored")
@@ -384,7 +445,11 @@ fn sql_failure_rolls_back_an_entire_resolution_batch() {
         "CREATE TRIGGER fail_second BEFORE UPDATE OF target ON edges WHEN NEW.target = 'target-1' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
     ).expect("trigger");
     assert!(db.apply_resolutions(&proposals).is_err());
-    assert!(db.get_callees("a").expect("no partial edge").is_empty());
+    assert!(
+        db.neighborhood("a", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("no partial edge")
+            .is_empty()
+    );
     assert_eq!(
         db.list_pending_refs(100, 0).expect("pending retained").refs,
         refs
@@ -408,15 +473,26 @@ fn readonly_connections_reopen_data_and_never_create_or_write() {
     .expect("escaped ids");
     db.close().expect("close writer");
     let mut reader = SqliteGraphStorage::open(&path, OpenMode::ReadOnly).expect("read-only");
-    assert_eq!(reader.get_callers("b").expect("persisted"), vec![expected]);
+    assert_eq!(
+        reader
+            .neighborhood("b", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("persisted"),
+        vec![expected]
+    );
     assert!(
         reader
-            .get_callers("' OR 1=1 --")
+            .neighborhood("' OR 1=1 --", Direction::In, Some(&[EdgeKind::Calls]))
             .expect("bound parameter")
             .is_empty()
     );
     assert!(reader.delete_file_graph(1, &["b".into()]).is_err());
-    assert_eq!(reader.get_callers("b").expect("unchanged").len(), 1);
+    assert_eq!(
+        reader
+            .neighborhood("b", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("unchanged")
+            .len(),
+        1
+    );
     reader.close().expect("close reader");
 }
 
@@ -497,7 +573,11 @@ fn invalid_and_stale_resolution_proposals_do_not_mutate_pending_refs() {
                 .len(),
             1
         );
-        assert!(db.get_callees("a").expect("no edge").is_empty());
+        assert!(
+            db.neighborhood("a", Direction::Out, Some(&[EdgeKind::Calls]))
+                .expect("no edge")
+                .is_empty()
+        );
     }
     let stale = Resolution {
         ref_id: i64::MAX,
@@ -654,7 +734,7 @@ fn resolution_retains_reference_context_and_invalidation_resets_candidates() {
     let stored = db.list_pending_refs(100, 0).expect("refs").refs.remove(0);
     assert_eq!(stored.reference, original);
     assert!(
-        db.get_callees("source")
+        db.neighborhood("source", Direction::Out, Some(&[EdgeKind::Calls]))
             .expect("pending excluded")
             .is_empty()
     );
@@ -697,7 +777,11 @@ fn resolution_retains_reference_context_and_invalidation_resets_candidates() {
     original.candidates = None;
     assert_eq!(requeued.id, stored.id);
     assert_eq!(requeued.reference, original);
-    assert!(db.get_callees("source").expect("edge removed").is_empty());
+    assert!(
+        db.neighborhood("source", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("edge removed")
+            .is_empty()
+    );
     db.apply_resolutions(&[proposal(&db, "new-target")])
         .expect("resolve again");
     db.delete_file_graph(6, &["source".into()])
@@ -762,7 +846,11 @@ fn reference_schema_defaults_and_state_constraints() {
             .refs
             .is_empty()
     );
-    assert!(db.get_callees("a").expect("failed excluded").is_empty());
+    assert!(
+        db.neighborhood("a", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("failed excluded")
+            .is_empty()
+    );
     raw.execute("UPDATE edges SET status = 'pending'", [])
         .expect("retry");
     assert_eq!(db.list_pending_refs(100, 0).expect("pending").refs.len(), 1);
@@ -848,7 +936,11 @@ fn contains_references_use_the_same_kinds_as_resolved_edges() {
         .expect("contains edges");
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].target, "member");
-    assert!(db.get_callees("owner").expect("calls only").is_empty());
+    assert!(
+        db.neighborhood("owner", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("calls only")
+            .is_empty()
+    );
     db.delete_file_graph(2, &["member".into()])
         .expect("invalidate");
     assert_eq!(

@@ -108,7 +108,7 @@ pub(crate) struct FileGraph {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredPendingRef {
     pub id: i64,
-    /// Matches zvec's FileId; the resolver retrieves file paths from zvec.
+    /// Matches zvec's `FileId`; the resolver retrieves file paths from zvec.
     pub file_id: u32,
     pub reference: PendingRef,
 }
