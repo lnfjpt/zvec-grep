@@ -696,7 +696,7 @@ fn neighborhood_returns_all_edges_without_a_limit() {
 }
 
 #[test]
-fn neighborhood_cost_does_not_grow_with_unrelated_resolved_edges() {
+fn graph_queries_skip_unrelated_resolved_edges() {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -729,6 +729,24 @@ fn neighborhood_cost_does_not_grow_with_unrelated_resolved_edges() {
             )
             .expect("populate unrelated edges");
         previous = unrelated;
+        // Place the pending row after the unrelated resolved rows: a missing
+        // pending index would make even this one-row queue scan through them.
+        db.write_file_graph(
+            3,
+            &graph(&["waiting"], vec![], vec![reference("waiting", "external")]),
+            &[],
+        )
+        .expect("write pending reference");
+        steps.store(0, Ordering::Relaxed);
+        let pending = db.list_pending_refs(1, 0).expect("read pending queue");
+        assert_eq!(pending.refs.len(), 1);
+        assert_eq!(pending.refs[0].reference.reference_name, "external");
+        assert!(pending.next_cursor.is_none());
+        let executed = steps.load(Ordering::Relaxed);
+        assert!(
+            executed < 1_000,
+            "pending, unrelated={unrelated}: {executed} steps"
+        );
         for direction in [Direction::In, Direction::Out, Direction::Both] {
             for kinds in [
                 None,
