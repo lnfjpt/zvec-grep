@@ -21,7 +21,6 @@ fn entity(file_id: u32, metadata: bool) -> Entity {
                 scope: Some("module".into()),
                 signature: Some("fn symbol()".into()),
                 visibility: None,
-                parameter: None,
                 language: None,
                 documentation: Some("documentation".into()),
             })

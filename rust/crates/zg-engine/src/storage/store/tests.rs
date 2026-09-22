@@ -598,7 +598,6 @@ fn fixture(
                 scope: None,
                 signature: None,
                 visibility: None,
-                parameter: None,
                 language: None,
                 documentation: None,
             })),

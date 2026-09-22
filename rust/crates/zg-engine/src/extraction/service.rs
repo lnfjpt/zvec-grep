@@ -3,7 +3,7 @@
 #[cfg(test)]
 use super::TextSource;
 use super::{
-    ChunkOptions, ExtractedEntity, IndexingExtractionOutput, Source, SourceKind, code, image,
+    ChunkOptions, ExtractedEntity, ExtractionOutput, Source, SourceKind, code, image,
     markdown, text,
 };
 use crate::{
@@ -25,7 +25,7 @@ pub(super) fn extract<'source>(
 pub(super) fn extract_for_indexing<'source>(
     source: impl Into<Source<'source>>,
     options: ChunkOptions,
-) -> Result<IndexingExtractionOutput, EngineError> {
+) -> Result<ExtractionOutput, EngineError> {
     let source = source.into();
     let source_text = match &source {
         Source::Text(source) => Some(source.text.as_str()),
@@ -35,17 +35,17 @@ pub(super) fn extract_for_indexing<'source>(
         Source::Text(source) if is_code_source(&source.formats) => {
             code::extract_for_indexing(source, options)
         }
-        Source::Image(source) => Ok(IndexingExtractionOutput {
+        Source::Image(source) => Ok(ExtractionOutput {
             fragments: image::extract(source),
             graph: None,
         }),
         Source::Text(source) if source.formats.contains(&FileFormat::Markdown) => {
-            Ok(IndexingExtractionOutput {
+            Ok(ExtractionOutput {
                 fragments: markdown::extract(source, options)?,
                 graph: None,
             })
         }
-        Source::Text(source) => Ok(IndexingExtractionOutput {
+        Source::Text(source) => Ok(ExtractionOutput {
             fragments: text::extract(source, options)?,
             graph: None,
         }),

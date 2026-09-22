@@ -68,7 +68,7 @@ pub(crate) struct ExtractedEntityFragment {
 /// and file-local partition are implemented; every other source kind returns
 /// `None`.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct IndexingExtractionOutput {
+pub(crate) struct ExtractionOutput {
     pub fragments: Vec<ExtractedEntity>,
     pub graph: Option<FileGraphResult>,
 }

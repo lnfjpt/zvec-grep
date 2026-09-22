@@ -89,7 +89,6 @@ fn metadata_fragments(
             scope: Some("Garden".into()),
             signature: Some("pub async fn harvest() -> Crop".into()),
             visibility: None,
-            parameter: None,
             language: None,
             documentation: Some("Produces the seasonal crop.".into()),
         })),

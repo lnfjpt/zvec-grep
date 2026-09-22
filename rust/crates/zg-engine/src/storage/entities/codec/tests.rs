@@ -125,7 +125,6 @@ fn entity_records_preserve_structured_content_ranges_and_external_metadata() {
             scope: Some("module".into()),
             signature: Some("pub async fn symbol()".into()),
             visibility: None,
-            parameter: None,
             language: None,
             documentation: Some("documentation".into()),
         }));

@@ -10,7 +10,7 @@ use crate::{
 
 use self::adapter::{LanguageAdapter, named_children, resolve_adapter};
 use super::{
-    ChunkOptions, ExtractedEntity, IndexingExtractionOutput, TextRange, TextSource,
+    ChunkOptions, ExtractedEntity, ExtractionOutput, TextRange, TextSource,
     chunk_options_for_metadata, chunking::text_fragments, text::extract_plain_text_entities,
     validate_formats,
 };
@@ -22,7 +22,7 @@ const COMPONENT_CODE_FORMATS: [FileFormat; 2] = [FileFormat::Vue, FileFormat::Sv
 pub(super) fn extract_for_indexing(
     source: &TextSource,
     options: ChunkOptions,
-) -> Result<IndexingExtractionOutput, EngineError> {
+) -> Result<ExtractionOutput, EngineError> {
     let jsx = source
         .relative_path
         .extension()
@@ -34,9 +34,9 @@ fn extract_code(
     source: &TextSource,
     options: ChunkOptions,
     jsx: bool,
-) -> Result<IndexingExtractionOutput, EngineError> {
+) -> Result<ExtractionOutput, EngineError> {
     if !super::service::is_code_source(&source.formats) {
-        return Ok(IndexingExtractionOutput {
+        return Ok(ExtractionOutput {
             fragments: Vec::new(),
             graph: None,
         });
@@ -51,12 +51,12 @@ fn extract_code(
     {
         let fragments = extract_script_blocks(source, max_chars, overlap_chars)?;
         return if fragments.is_empty() {
-            Ok(IndexingExtractionOutput {
+            Ok(ExtractionOutput {
                 fragments: fallback(source, max_chars, overlap_chars),
                 graph: None,
             })
         } else {
-            Ok(IndexingExtractionOutput {
+            Ok(ExtractionOutput {
                 fragments,
                 graph: None,
             })
@@ -75,7 +75,7 @@ fn extract_code(
     let Some((adapter, language)) =
         format.and_then(|format| Some((resolve_adapter(format)?, grammar(format, jsx)?)))
     else {
-        return Ok(IndexingExtractionOutput {
+        return Ok(ExtractionOutput {
             fragments: fallback(source, max_chars, overlap_chars),
             graph: None,
         });
@@ -83,13 +83,13 @@ fn extract_code(
 
     let mut parser = Parser::new();
     if parser.set_language(&language).is_err() {
-        return Ok(IndexingExtractionOutput {
+        return Ok(ExtractionOutput {
             fragments: fallback(source, max_chars, overlap_chars),
             graph: None,
         });
     }
     let Some(tree) = parser.parse(&source.text, None) else {
-        return Ok(IndexingExtractionOutput {
+        return Ok(ExtractionOutput {
             fragments: fallback(source, max_chars, overlap_chars),
             graph: None,
         });
@@ -103,12 +103,12 @@ fn extract_code(
         append_entity(source, &entity, max_chars, overlap_chars, &mut output);
     }
     if output.is_empty() {
-        Ok(IndexingExtractionOutput {
+        Ok(ExtractionOutput {
             fragments: fallback(source, max_chars, overlap_chars),
             graph: None,
         })
     } else {
-        Ok(IndexingExtractionOutput {
+        Ok(ExtractionOutput {
             fragments: output,
             graph: None,
         })
@@ -249,7 +249,6 @@ fn code_entity_metadata(entity: &CodeEntity<'_>) -> EntityMetadata {
         signature: entity.signature.clone(),
         documentation: entity.documentation.clone(),
         visibility: None,
-        parameter: None,
         language: None,
     })
 }
@@ -523,7 +522,6 @@ mod tests {
                 scope: None,
                 signature: Some("async function add(value: number): Promise<number>".to_owned()),
                 visibility: None,
-                parameter: None,
                 language: None,
                 documentation: Some("Adds one.".to_owned()),
             }))
@@ -540,7 +538,6 @@ mod tests {
                 scope: Some("Box".to_owned()),
                 signature: Some("static create()".to_owned()),
                 visibility: None,
-                parameter: None,
                 language: None,
                 documentation: None,
             }))
@@ -585,7 +582,6 @@ mod tests {
                 scope: None,
                 signature: Some("typedef struct Widget {} Widget".to_owned()),
                 visibility: None,
-                parameter: None,
                 language: None,
                 documentation: None,
             }))
@@ -615,7 +611,6 @@ mod tests {
                 scope: Some("Widget".to_owned()),
                 signature: Some("func (w *Widget) Value() int".to_owned()),
                 visibility: None,
-                parameter: None,
                 language: None,
                 documentation: None,
             }))
@@ -646,7 +641,6 @@ mod tests {
                 scope: Some("Service".to_owned()),
                 signature: Some("@staticmethod\nasync def fetch(value: str) -> str:".to_owned()),
                 visibility: None,
-                parameter: None,
                 language: None,
                 documentation: None,
             }))

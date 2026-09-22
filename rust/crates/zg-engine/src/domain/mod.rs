@@ -17,6 +17,9 @@ pub use glob::GlobRule;
 // Metadata.
 pub(crate) use metadata::IndexField;
 pub use metadata::{CodeMetadata, EntityMetadata, MarkdownMetadata, SymbolType};
+// Language has no consumers yet.
+#[allow(unused_imports)]
+pub use metadata::Language;
 
 // Graph extraction contracts. The walk-time collectors and the persistence
 // layer are still pending, so most types have no consumers yet.

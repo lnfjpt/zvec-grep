@@ -1085,7 +1085,6 @@ mod output_tests {
                 scope: Some("app".into()),
                 signature: None,
                 visibility: None,
-                parameter: None,
                 language: None,
                 documentation: None,
             }));

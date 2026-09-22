@@ -52,8 +52,7 @@ pub struct CodeMetadata {
     pub signature: Option<String>,
     pub documentation: Option<String>,
     pub visibility: Option<String>,
-    pub parameter: Option<String>,
-    pub language: Option<String>,
+    pub language: Option<Language>,
 }
 
 impl CodeMetadata {
@@ -88,6 +87,36 @@ impl SymbolType {
             Self::Interface => "interface",
             Self::Module => "module",
             Self::Value => "value",
+        }
+    }
+}
+
+// Keep variants in alphabetical order.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    C,
+    Cpp,
+    Go,
+    Java,
+    JavaScript,
+    Python,
+    Rust,
+    TypeScript,
+}
+
+#[allow(dead_code)]
+impl Language {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::JavaScript => "javascript",
+            Self::Python => "python",
+            Self::Rust => "rust",
+            Self::TypeScript => "typescript",
         }
     }
 }
