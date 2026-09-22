@@ -79,5 +79,4 @@ CREATE INDEX edges_source_kind ON edges(source, kind);
 CREATE INDEX edges_target_kind ON edges(target, kind);
 -- Index only the pending queue so resolved queries use the endpoint indexes.
 CREATE INDEX edges_pending_id ON edges(id) WHERE status = 'pending';
-CREATE INDEX edges_name_tail ON edges(name_tail);
 ";
