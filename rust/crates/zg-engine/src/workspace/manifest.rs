@@ -689,7 +689,7 @@ mod tests {
                     .message()
                     .contains(&format!("unsupported index version {version}"))
             );
-            assert!(error.message().contains("expected 2"));
+            assert!(error.message().contains("expected 7"));
             assert!(error.message().contains("zg index --rebuild"));
             fs::write(workspace_manifest_path(&home), &bytes).expect("restore current manifest");
         }
