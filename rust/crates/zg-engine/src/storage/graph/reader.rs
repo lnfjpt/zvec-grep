@@ -17,15 +17,7 @@ impl SqliteGraphStorage {
         kinds: Option<&[EdgeKind]>,
     ) -> Result<Vec<Edge>> {
         nonempty(id)?;
-        let endpoint = match direction {
-            Direction::In => "target = ?1",
-            Direction::Out => "source = ?1",
-            Direction::Both => "(source = ?1 OR target = ?1)",
-        };
-        let mut sql = format!(
-            "SELECT kind, source, target, line, col, provenance, metadata
-             FROM edges WHERE {endpoint} AND status = 'resolved'"
-        );
+        let mut filter = String::from("status = 'resolved'");
         let mut values = vec![id];
         if let Some(kinds) = kinds {
             if kinds.is_empty() {
@@ -34,12 +26,30 @@ impl SqliteGraphStorage {
             let mut names: Vec<&str> = kinds.iter().map(|kind| kind.as_str()).collect();
             names.sort_unstable();
             names.dedup();
-            sql.push_str(" AND kind IN (");
-            sql.push_str(&vec!["?"; names.len()].join(", "));
-            sql.push(')');
+            let parameters = (2..names.len() + 2)
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            filter.push_str(" AND kind IN (");
+            filter.push_str(&parameters);
+            filter.push(')');
             values.extend(names);
         }
-        sql.push_str(" ORDER BY id");
+        let predicate = match direction {
+            Direction::In => format!("target = ?1 AND {filter}"),
+            Direction::Out => format!("source = ?1 AND {filter}"),
+            // Separate endpoint lookups avoid scanning all resolved rows to
+            // satisfy ORDER BY id. UNION deduplicates self-loops by row ID,
+            // preserving distinct stored edges even when their fields match.
+            Direction::Both => format!(
+                "id IN (SELECT id FROM edges WHERE source = ?1 AND {filter}
+                        UNION SELECT id FROM edges WHERE target = ?1 AND {filter})"
+            ),
+        };
+        let sql = format!(
+            "SELECT kind, source, target, line, col, provenance, metadata
+             FROM edges WHERE {predicate} ORDER BY id"
+        );
         let mut statement = self.connection.prepare(&sql)?;
         Ok(statement
             .query_map(params_from_iter(values), edge_from_row)?

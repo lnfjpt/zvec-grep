@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use super::{Error, Result};
 
 // Unsupported versions require an index rebuild; no schema migration is provided.
-pub(crate) const VERSION: i64 = 8;
+pub(crate) const VERSION: i64 = 9;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;
 
 pub(crate) fn validate(connection: &Connection) -> Result<()> {
@@ -75,8 +75,9 @@ CREATE TABLE edges (
     )
 ) STRICT;
 CREATE INDEX edges_file ON edges(file_id);
-CREATE INDEX edges_source_kind ON edges(source, kind);
-CREATE INDEX edges_target_kind ON edges(target, kind);
+-- Endpoint/status equality leaves the implicit rowid (id) in query order.
+CREATE INDEX edges_source_status ON edges(source, status);
+CREATE INDEX edges_target_status ON edges(target, status);
 CREATE INDEX edges_status_id ON edges(status, id);
 CREATE INDEX edges_name_tail ON edges(name_tail);
 ";

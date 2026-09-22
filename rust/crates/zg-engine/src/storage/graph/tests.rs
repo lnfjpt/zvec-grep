@@ -619,7 +619,8 @@ fn neighborhood_filters_direction_and_kinds() {
     let mut db = SqliteGraphStorage::in_memory().expect("open");
     let edges = vec![
         edge(EdgeKind::Calls, "a", "b", 1),
-        edge(EdgeKind::Calls, "a", "b", 2),
+        // Equal payloads are distinct rows; Both only deduplicates by row ID.
+        edge(EdgeKind::Calls, "a", "b", 1),
         edge(EdgeKind::Calls, "b", "b", 3),
         edge(EdgeKind::Imports, "b", "a", 4),
         edge(EdgeKind::Contains, "f1", "b", 5),
@@ -692,6 +693,64 @@ fn neighborhood_returns_all_edges_without_a_limit() {
             .expect("all edges"),
         edges
     );
+}
+
+#[test]
+fn neighborhood_cost_does_not_grow_with_unrelated_resolved_edges() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let mut db = SqliteGraphStorage::in_memory().expect("open");
+    let expected = edge(EdgeKind::Calls, "needle", "needle", 1);
+    db.write_file_graph(1, &graph(&["needle"], vec![expected.clone()], vec![]), &[])
+        .expect("write one relevant edge");
+    let steps = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&steps);
+    db.connection.progress_handler(
+        100,
+        Some(move || {
+            counter.fetch_add(100, Ordering::Relaxed);
+            false
+        }),
+    );
+    let mut previous = 0;
+    for unrelated in [10_000, 100_000] {
+        db.connection
+            .execute(
+                "WITH RECURSIVE n(x) AS (
+                    VALUES(?1) UNION ALL SELECT x + 1 FROM n WHERE x < ?2
+                 )
+                 INSERT INTO edges (file_id, source, target, kind, status, provenance)
+                 SELECT 2, 'source-' || x, 'target-' || x, 'calls', 'resolved', 'file_local'
+                 FROM n",
+                [previous + 1, unrelated],
+            )
+            .expect("populate unrelated edges");
+        previous = unrelated;
+        for direction in [Direction::In, Direction::Out, Direction::Both] {
+            for kinds in [
+                None,
+                Some([EdgeKind::Calls].as_slice()),
+                Some([EdgeKind::Calls, EdgeKind::Imports].as_slice()),
+            ] {
+                steps.store(0, Ordering::Relaxed);
+                assert_eq!(
+                    db.neighborhood("needle", direction, kinds)
+                        .expect("query sparse neighborhood"),
+                    std::slice::from_ref(&expected)
+                );
+                // Count VM instructions, not elapsed time. The old status-index
+                // scan needs over 50,000 steps even with only 10,000 unrelated edges.
+                let executed = steps.load(Ordering::Relaxed);
+                assert!(
+                    executed < 1_000,
+                    "{direction:?}, kinds={kinds:?}, unrelated={unrelated}: {executed} steps"
+                );
+            }
+        }
+    }
 }
 
 #[test]
