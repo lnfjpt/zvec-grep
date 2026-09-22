@@ -81,7 +81,7 @@ async fn assert_incompatible_operations(
             panic!("expected rebuild-required compatibility");
         };
         assert_eq!(actual, actual_version);
-        assert_eq!(expected_version, 2);
+        assert_eq!(expected_version, 7);
         assert!(!reason.is_empty());
         assert_manifest_unchanged(root, manifest)?;
     }
@@ -125,12 +125,12 @@ async fn assert_current_index(engine: &ZvecGrep, root: &Path) -> TestResult<Valu
     assert!(info.indexed);
     assert_eq!(
         info.compatibility,
-        IndexCompatibility::Compatible { version: 2 }
+        IndexCompatibility::Compatible { version: 7 }
     );
     assert_eq!(info.index_status(), IndexStatus::Ready);
     let manifest: Value =
         serde_json::from_slice(&fs::read(root.join(".zvec-grep/manifest.json"))?)?;
-    assert_eq!(manifest["indexVersion"], 2);
+    assert_eq!(manifest["indexVersion"], 7);
     assert!(manifest.get("manifestVersion").is_none());
     assert!(manifest["storageGeneration"].as_str().is_some());
     Ok(manifest)
