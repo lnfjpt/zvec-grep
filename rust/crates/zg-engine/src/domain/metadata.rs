@@ -51,7 +51,7 @@ pub struct CodeMetadata {
     pub scope: Option<String>,
     pub signature: Option<String>,
     pub documentation: Option<String>,
-    pub visibility: Option<String>,
+    pub visibility: Option<Visibility>,
     pub language: Option<Language>,
 }
 
@@ -117,6 +117,28 @@ impl Language {
             Self::Python => "python",
             Self::Rust => "rust",
             Self::TypeScript => "typescript",
+        }
+    }
+}
+
+// Keep variants in alphabetical order.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    Internal,
+    Private,
+    Protected,
+    Public,
+}
+
+#[allow(dead_code)]
+impl Visibility {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::Private => "private",
+            Self::Protected => "protected",
+            Self::Public => "public",
         }
     }
 }
