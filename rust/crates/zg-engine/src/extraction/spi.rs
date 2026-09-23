@@ -1,8 +1,10 @@
 //! Prepared inputs and indexing options for extraction.
 
 use crate::domain::{
-    Content, EntityMetadata, FileFormat, FileGraphResult, ImageContent, Range, SourcePath,
+    Content, EntityMetadata, FileFormat, ImageContent, Range, SourcePath,
 };
+
+use super::graph::PartitionedGraph;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TextSource {
@@ -68,9 +70,9 @@ pub(crate) struct ExtractedEntityFragment {
 /// and file-local partition are implemented; every other source kind returns
 /// `None`.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ExtractionOutput {
+pub(crate) struct IndexingExtractionOutput {
     pub fragments: Vec<ExtractedEntity>,
-    pub graph: Option<FileGraphResult>,
+    pub graph: Option<PartitionedGraph>,
 }
 
 #[cfg(test)]

@@ -10,9 +10,13 @@ use crate::{
 
 use self::adapter::{LanguageAdapter, named_children, resolve_adapter};
 use super::{
-    ChunkOptions, ExtractedEntity, ExtractionOutput, TextRange, TextSource,
+    ChunkOptions, ExtractedEntity, IndexingExtractionOutput, TextRange, TextSource,
     chunk_options_for_metadata, chunking::text_fragments, text::extract_plain_text_entities,
     validate_formats,
+};
+use super::graph::{
+    WalkContext, collect_import_edge, collect_inheritance_edges, is_import_node,
+    partition_walk, scan_call_edges,
 };
 
 const DEFAULT_CODE_CHUNK_CHARS: usize = 3_600;
@@ -22,7 +26,7 @@ const COMPONENT_CODE_FORMATS: [FileFormat; 2] = [FileFormat::Vue, FileFormat::Sv
 pub(super) fn extract_for_indexing(
     source: &TextSource,
     options: ChunkOptions,
-) -> Result<ExtractionOutput, EngineError> {
+) -> Result<IndexingExtractionOutput, EngineError> {
     let jsx = source
         .relative_path
         .extension()
@@ -34,9 +38,9 @@ fn extract_code(
     source: &TextSource,
     options: ChunkOptions,
     jsx: bool,
-) -> Result<ExtractionOutput, EngineError> {
+) -> Result<IndexingExtractionOutput, EngineError> {
     if !super::service::is_code_source(&source.formats) {
-        return Ok(ExtractionOutput {
+        return Ok(IndexingExtractionOutput {
             fragments: Vec::new(),
             graph: None,
         });
@@ -51,12 +55,12 @@ fn extract_code(
     {
         let fragments = extract_script_blocks(source, max_chars, overlap_chars)?;
         return if fragments.is_empty() {
-            Ok(ExtractionOutput {
+            Ok(IndexingExtractionOutput {
                 fragments: fallback(source, max_chars, overlap_chars),
                 graph: None,
             })
         } else {
-            Ok(ExtractionOutput {
+            Ok(IndexingExtractionOutput {
                 fragments,
                 graph: None,
             })
@@ -72,10 +76,11 @@ fn extract_code(
             .copied()
             .find(|format| resolve_adapter(*format).is_some())
     };
-    let Some((adapter, language)) =
-        format.and_then(|format| Some((resolve_adapter(format)?, grammar(format, jsx)?)))
+    let Some((adapter, language, code_format)) = format.and_then(|format| {
+        Some((resolve_adapter(format)?, grammar(format, jsx)?, format))
+    })
     else {
-        return Ok(ExtractionOutput {
+        return Ok(IndexingExtractionOutput {
             fragments: fallback(source, max_chars, overlap_chars),
             graph: None,
         });
@@ -83,34 +88,52 @@ fn extract_code(
 
     let mut parser = Parser::new();
     if parser.set_language(&language).is_err() {
-        return Ok(ExtractionOutput {
+        return Ok(IndexingExtractionOutput {
             fragments: fallback(source, max_chars, overlap_chars),
             graph: None,
         });
     }
     let Some(tree) = parser.parse(&source.text, None) else {
-        return Ok(ExtractionOutput {
+        return Ok(IndexingExtractionOutput {
             fragments: fallback(source, max_chars, overlap_chars),
             graph: None,
         });
     };
     let bytes = source.text.as_bytes();
     let mut entities = Vec::new();
-    walk_code_node(tree.root_node(), adapter, bytes, &[], &mut entities);
+    // The walk buffers containment edges and name references; the post-walk
+    // partition splits them into in-file resolved edges and pending refs.
+    let mut graph_context = WalkContext::new();
+    walk_code_node(
+        tree.root_node(),
+        adapter,
+        bytes,
+        &[],
+        &mut entities,
+        &mut graph_context,
+        code_format,
+    );
 
     let mut output = Vec::new();
+    let mut entity_heads = Vec::with_capacity(entities.len());
     for entity in entities {
+        // Fragments are appended contiguously in walk order, so the output
+        // length before each append is that entity's head fragment index.
+        entity_heads.push(output.len());
         append_entity(source, &entity, max_chars, overlap_chars, &mut output);
     }
     if output.is_empty() {
-        Ok(ExtractionOutput {
+        Ok(IndexingExtractionOutput {
             fragments: fallback(source, max_chars, overlap_chars),
             graph: None,
         })
     } else {
-        Ok(ExtractionOutput {
+        // The symbol table is complete now, so partitioning resolves forward
+        // references as readily as backward ones.
+        let graph = partition_walk(graph_context, entity_heads);
+        Ok(IndexingExtractionOutput {
             fragments: output,
-            graph: None,
+            graph: Some(graph),
         })
     }
 }
@@ -168,14 +191,29 @@ fn walk_code_node<'tree>(
     source: &[u8],
     breadcrumb: &[String],
     out: &mut Vec<CodeEntity<'tree>>,
+    graph_context: &mut WalkContext,
+    format: FileFormat,
 ) {
     for child in named_children(node) {
         let is_scope = adapter.is_scope(child);
         let is_entity = adapter.is_entity(child);
+        let mut first_entity_index = None;
+        let mut scope_entity_index = None;
+
         if is_entity {
+            let start_index = out.len();
             for entity in adapter.resolve_entities(child, source) {
+                let entity_index = graph_context.next_entity_index();
+                first_entity_index.get_or_insert(entity_index);
+                scope_entity_index = Some(entity_index);
                 let name = adapter.extract_name(entity, source);
                 let entity_breadcrumb = adapter.scope_breadcrumb(entity, source, breadcrumb);
+                graph_context.register_symbol(name.as_deref(), entity_index);
+                graph_context.add_contains_edge(
+                    entity_index,
+                    entity.start_position().row + 1,
+                    entity.start_position().column,
+                );
                 out.push(CodeEntity {
                     node: entity,
                     name,
@@ -185,6 +223,22 @@ fn walk_code_node<'tree>(
                     documentation: LanguageAdapter::extract_doc(entity, source),
                 });
             }
+            // Name-based references are collected from the first resolved
+            // entity's subtree: the walk does not descend into entity bodies,
+            // so this attributes call sites and inheritance clauses to their
+            // owning entity.
+            if let (Some(first_entity_index), Some(first_entity)) =
+                (first_entity_index, out.get(start_index))
+            {
+                scan_call_edges(first_entity.node, first_entity_index, source, graph_context);
+                collect_inheritance_edges(
+                    first_entity.node,
+                    source,
+                    format,
+                    first_entity_index,
+                    graph_context,
+                );
+            }
         }
 
         if is_scope {
@@ -193,15 +247,35 @@ fn walk_code_node<'tree>(
             if let Some(name) = name {
                 child_breadcrumb.push(name);
             }
-            walk_code_node(
-                adapter.enter_scope_node(child),
-                adapter,
-                source,
-                &child_breadcrumb,
-                out,
-            );
+            let scope_node = adapter.enter_scope_node(child);
+            if let Some(scope_entity_index) = scope_entity_index {
+                graph_context.push_scope(scope_entity_index);
+                walk_code_node(
+                    scope_node,
+                    adapter,
+                    source,
+                    &child_breadcrumb,
+                    out,
+                    graph_context,
+                    format,
+                );
+                graph_context.pop_scope();
+            } else {
+                walk_code_node(
+                    scope_node,
+                    adapter,
+                    source,
+                    &child_breadcrumb,
+                    out,
+                    graph_context,
+                    format,
+                );
+            }
         } else if !is_entity {
-            walk_code_node(child, adapter, source, breadcrumb, out);
+            if is_import_node(child, format) {
+                collect_import_edge(child, source, format, graph_context);
+            }
+            walk_code_node(child, adapter, source, breadcrumb, out, graph_context, format);
         }
     }
 }
@@ -225,13 +299,10 @@ fn append_entity(
         entity.node.end_position().column,
     )
     .expect("parser coordinates refer to source text");
-    let content = crate::utils::slice_text(
-        &source.text,
-        range.start_byte_offset(),
-        range.end_byte_offset(),
-    )
-    .expect("parser range is valid UTF-8")
-    .to_owned();
+    let content = range
+        .slice(&source.text)
+        .expect("parser range is valid UTF-8")
+        .to_owned();
     output.push(ExtractedEntity {
         index: output.len(),
         source_range: Range::Text(range),
@@ -249,6 +320,7 @@ fn code_entity_metadata(entity: &CodeEntity<'_>) -> EntityMetadata {
         signature: entity.signature.clone(),
         documentation: entity.documentation.clone(),
         visibility: None,
+        parameter: None,
         language: None,
     })
 }
@@ -266,7 +338,8 @@ fn extract_script_blocks(
     max_chars: usize,
     overlap_chars: usize,
 ) -> Result<Vec<ExtractedEntity>, EngineError> {
-    let line_offsets = line_byte_offsets(&source.text);
+    let lines = source.text.split('\n').collect::<Vec<_>>();
+    let line_offsets = line_byte_offsets(&lines);
     let mut fragments = Vec::new();
     for block in find_script_blocks(&source.text) {
         let mut block_source = source.clone();
@@ -386,7 +459,7 @@ fn remap_script_block_entities(
         .map(|mut entity| {
             entity.index += start_index;
             if let Range::Text(range) = &mut entity.source_range {
-                *range = crate::utils::text_range_from_offsets(
+                *range = TextRange::from_offsets(
                     &source.text,
                     line_offsets,
                     start_byte_offset + range.start_byte_offset(),
@@ -442,12 +515,7 @@ mod tests {
             panic!("text range expected");
         };
         assert_eq!(
-            crate::utils::slice_text(
-                &source.text,
-                range.start_byte_offset(),
-                range.end_byte_offset()
-            )
-            .expect("entity source range"),
+            range.slice(&source.text).expect("entity source range"),
             content
         );
         let mut covered = vec![false; content.len()];
@@ -455,8 +523,8 @@ mod tests {
             let (start, end) = match fragment.range {
                 Range::Full => (0, content.len()),
                 Range::Byte(local) => (
-                    usize::try_from(local.start_offset()).expect("fragment start"),
-                    usize::try_from(local.end_offset()).expect("fragment end"),
+                    usize::try_from(local.start_offset).expect("fragment start"),
+                    usize::try_from(local.end_offset).expect("fragment end"),
                 ),
                 Range::Text(_) => panic!("fragments store byte offsets without text coordinates"),
             };
@@ -468,6 +536,13 @@ mod tests {
             assert!(
                 !selected.trim().is_empty(),
                 "fragments contain searchable source"
+            );
+            assert_eq!(
+                fragment
+                    .range
+                    .extract(&entity.content)
+                    .expect("content slice"),
+                Content::Text(selected.to_owned())
             );
             covered[start..end].fill(true);
         }
@@ -522,6 +597,7 @@ mod tests {
                 scope: None,
                 signature: Some("async function add(value: number): Promise<number>".to_owned()),
                 visibility: None,
+                parameter: None,
                 language: None,
                 documentation: Some("Adds one.".to_owned()),
             }))
@@ -538,6 +614,7 @@ mod tests {
                 scope: Some("Box".to_owned()),
                 signature: Some("static create()".to_owned()),
                 visibility: None,
+                parameter: None,
                 language: None,
                 documentation: None,
             }))
@@ -582,6 +659,7 @@ mod tests {
                 scope: None,
                 signature: Some("typedef struct Widget {} Widget".to_owned()),
                 visibility: None,
+                parameter: None,
                 language: None,
                 documentation: None,
             }))
@@ -611,6 +689,7 @@ mod tests {
                 scope: Some("Widget".to_owned()),
                 signature: Some("func (w *Widget) Value() int".to_owned()),
                 visibility: None,
+                parameter: None,
                 language: None,
                 documentation: None,
             }))
@@ -641,6 +720,7 @@ mod tests {
                 scope: Some("Service".to_owned()),
                 signature: Some("@staticmethod\nasync def fetch(value: str) -> str:".to_owned()),
                 visibility: None,
+                parameter: None,
                 language: None,
                 documentation: None,
             }))
@@ -918,30 +998,14 @@ mod tests {
     }
 
     #[test]
-    fn cpp_namespaces_are_scopes_not_entities() {
-        let source = test_source(
-            FileFormat::Cpp,
-            "fixture.cpp",
-            "namespace api { int run() { return 1; } }",
-        );
-        let fragments = extract(&source, ChunkOptions::default()).expect("symbol extraction");
-        let names = fragments
-            .iter()
-            .filter_map(|fragment| match test_metadata(fragment) {
-                Some(EntityMetadata::Code(metadata)) => metadata.symbol_name.as_deref(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(names, ["run"]);
-        let Some(EntityMetadata::Code(metadata)) = test_metadata(named(&fragments, "run")) else {
-            panic!("expected code metadata for run");
-        };
-        assert_eq!(metadata.scope.as_deref(), Some("api"));
-    }
-
-    #[test]
     fn extracts_named_modules_and_values_without_local_variable_expansion() {
         let fixtures = [
+            (
+                FileFormat::Cpp,
+                "namespace api { int run() { return 1; } }",
+                "api",
+                SymbolType::Module,
+            ),
             (
                 FileFormat::Rust,
                 "mod api { pub fn run() {} }",
@@ -1204,15 +1268,10 @@ mod tests {
             let entity = &entities[0];
             assert_source_backed(&source, entity);
             for fragment in &entity.fragments {
-                let Content::Text(text) = &entity.content else {
-                    panic!("text entity expected");
-                };
-                let Range::Byte(range) = fragment.range else {
-                    panic!("chunked entity expected");
-                };
-                let start = usize::try_from(range.start_offset()).expect("fragment start");
-                let end = usize::try_from(range.end_offset()).expect("fragment end");
-                let content = Content::Text(text[start..end].to_owned());
+                let content = fragment
+                    .range
+                    .extract(&entity.content)
+                    .expect("source slice");
                 let vector =
                     vector_content_for_fragment(&content, entity.metadata.as_ref(), Some(120));
                 let [Content::Text(vector)] = vector.as_slice() else {
@@ -1359,15 +1418,14 @@ mod tests {
             assert!(entity.fragments.len() > 2);
             assert_source_backed(&source, entity);
             for fragment in &entity.fragments {
-                let Content::Text(text) = &entity.content else {
-                    panic!("text entity expected");
+                let Content::Text(content) = fragment
+                    .range
+                    .extract(&entity.content)
+                    .expect("fragment content")
+                else {
+                    panic!("text expected");
                 };
-                let Range::Byte(range) = fragment.range else {
-                    panic!("chunked entity expected");
-                };
-                let start = usize::try_from(range.start_offset()).expect("fragment start");
-                let end = usize::try_from(range.end_offset()).expect("fragment end");
-                assert!(text[start..end].chars().count() <= max_chars);
+                assert!(content.chars().count() <= max_chars);
             }
         }
     }
@@ -1413,5 +1471,299 @@ mod tests {
             );
             assert!(test_metadata(&fragments[0]).is_none());
         }
+    }
+
+    #[test]
+    fn walk_collects_contains_edges_and_pending_references() {
+        use super::super::graph::FILE_SCOPE_INDEX;
+        use super::{Parser, WalkContext, grammar, resolve_adapter};
+        use crate::domain::GraphRefKind;
+
+        let source = test_source(
+            FileFormat::TypeScript,
+            "fixture.ts",
+            concat!(
+                "import { helper } from \"./utils.js\";\n",
+                "\n",
+                "class Widget extends Base {\n",
+                "  constructor() {\n",
+                "    this.init(1, 2);\n",
+                "    this.init(3);\n",
+                "  }\n",
+                "}\n",
+                "\n",
+                "function main() {\n",
+                "  helper();\n",
+                "}\n",
+            ),
+        );
+        let adapter = resolve_adapter(FileFormat::TypeScript).expect("typescript adapter");
+        let language = grammar(FileFormat::TypeScript, false).expect("typescript grammar");
+        let mut parser = Parser::new();
+        parser.set_language(&language).expect("grammar loads");
+        let tree = parser.parse(&source.text, None).expect("source parses");
+
+        let mut entities = Vec::new();
+        let mut graph_context = WalkContext::new();
+        super::walk_code_node(
+            tree.root_node(),
+            adapter,
+            source.text.as_bytes(),
+            &[],
+            &mut entities,
+            &mut graph_context,
+            FileFormat::TypeScript,
+        );
+
+        // Walk order allocates entity ordinals: Widget = 0, constructor = 1,
+        // main = 2. `helper` is imported, never declared, so it has no entry.
+        assert_eq!(graph_context.lookup_symbol("Widget"), Some(&[0][..]));
+        assert!(graph_context.is_unique_symbol("Widget"));
+        assert_eq!(graph_context.lookup_symbol("helper"), None);
+
+        // The constructor is contained by the class; top-level entities are
+        // linked to the file node during assembly, not at walk time.
+        let contains = graph_context.resolved_edges();
+        assert_eq!(contains.len(), 1);
+        assert_eq!(
+            (
+                contains[0].source_index,
+                contains[0].target_index,
+                contains[0].line,
+                contains[0].column,
+            ),
+            (0, 1, 4, 2)
+        );
+
+        let names = graph_context.name_edges();
+        assert_eq!(names.len(), 5);
+        // Imports belong to the file scope.
+        assert_eq!(names[0].ref_kind, GraphRefKind::Imports);
+        assert_eq!(names[0].owner_index, FILE_SCOPE_INDEX);
+        assert_eq!(names[0].ref_name, "./utils.js");
+        assert_eq!((names[0].line, names[0].column), (1, 0));
+        // The class-level scan attributes method-body calls to the class.
+        assert_eq!(names[1].ref_kind, GraphRefKind::Calls);
+        assert_eq!(
+            (names[1].owner_index, names[1].ref_name.as_str()),
+            (0, "init")
+        );
+        assert_eq!(names[1].receiver_name.as_deref(), Some("this"));
+        assert_eq!(names[1].arity, Some(2));
+        assert_eq!((names[1].line, names[1].column), (5, 4));
+        // The extends clause is collected from the class node; positions
+        // point at the clause itself, not the inherited expression.
+        assert_eq!(names[2].ref_kind, GraphRefKind::Extends);
+        assert_eq!(
+            (names[2].owner_index, names[2].ref_name.as_str()),
+            (0, "Base")
+        );
+        assert_eq!(names[2].raw_text.as_deref(), Some("extends Base"));
+        assert_eq!((names[2].line, names[2].column), (3, 13));
+        // The constructor's own scan attributes the same call to itself and
+        // collapses the duplicate `this.init(3)` site into the first one.
+        assert_eq!(names[3].ref_kind, GraphRefKind::Calls);
+        assert_eq!(
+            (names[3].owner_index, names[3].ref_name.as_str()),
+            (1, "init")
+        );
+        assert_eq!(names[3].arity, Some(2));
+        assert_eq!((names[3].line, names[3].column), (5, 4));
+        // Top-level function scan.
+        assert_eq!(names[4].ref_kind, GraphRefKind::Calls);
+        assert_eq!(
+            (names[4].owner_index, names[4].ref_name.as_str()),
+            (2, "helper")
+        );
+        assert_eq!(names[4].arity, Some(0));
+    }
+
+    #[test]
+    fn walk_collects_rust_imports_and_calls() {
+        use super::super::graph::FILE_SCOPE_INDEX;
+        use super::{Parser, WalkContext, grammar, resolve_adapter};
+        use crate::domain::GraphRefKind;
+
+        let source = test_source(
+            FileFormat::Rust,
+            "fixture.rs",
+            concat!(
+                "use std::collections::HashMap;\n",
+                "\n",
+                "pub fn main() {\n",
+                "    let map = HashMap::new();\n",
+                "}\n",
+            ),
+        );
+        let adapter = resolve_adapter(FileFormat::Rust).expect("rust adapter");
+        let language = grammar(FileFormat::Rust, false).expect("rust grammar");
+        let mut parser = Parser::new();
+        parser.set_language(&language).expect("grammar loads");
+        let tree = parser.parse(&source.text, None).expect("source parses");
+
+        let mut entities = Vec::new();
+        let mut graph_context = WalkContext::new();
+        super::walk_code_node(
+            tree.root_node(),
+            adapter,
+            source.text.as_bytes(),
+            &[],
+            &mut entities,
+            &mut graph_context,
+            FileFormat::Rust,
+        );
+
+        // `use` declarations are not entities, so they take the import branch;
+        // `use a::b;` module paths come from the text fallback.
+        let names = graph_context.name_edges();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].ref_kind, GraphRefKind::Imports);
+        assert_eq!(names[0].owner_index, FILE_SCOPE_INDEX);
+        assert_eq!(names[0].ref_name, "std::collections::HashMap");
+        // Qualified callees split into receiver and member name.
+        assert_eq!(names[1].ref_kind, GraphRefKind::Calls);
+        assert_eq!(names[1].owner_index, 0);
+        assert_eq!(names[1].ref_name, "new");
+        assert_eq!(names[1].receiver_name.as_deref(), Some("HashMap"));
+    }
+
+    #[test]
+    fn partitions_in_file_references_after_the_walk() {
+        use super::super::graph::FILE_SCOPE_INDEX;
+        use crate::domain::{EdgeProvenance, GraphRefKind};
+
+        let source = test_source(
+            FileFormat::TypeScript,
+            "fixture.ts",
+            concat!(
+                "import { helper } from \"./utils.js\";\n",
+                "\n",
+                "class Widget extends Base {\n",
+                "  constructor() {\n",
+                "    this.init(1, 2);\n",
+                "  }\n",
+                "}\n",
+                "\n",
+                "function main() {\n",
+                "  helper();\n",
+                "  main();\n",
+                "}\n",
+            ),
+        );
+        let extracted =
+            extract_for_indexing(&source, ChunkOptions::default()).expect("extracts");
+        let graph = extracted.graph.expect("code walk produces a graph");
+
+        // Entities in walk order: Widget = 0, constructor = 1, main = 2. Head
+        // fragment indices strictly increase because every entity appends at
+        // least one fragment.
+        let heads = &graph.head_fragment_indices;
+        assert_eq!(heads.len(), 3);
+        assert!(heads.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // The constructor's containment under the class passes through.
+        assert_eq!(graph.contains.len(), 1);
+        assert_eq!(
+            (graph.contains[0].source_index, graph.contains[0].target_index),
+            (0, 1)
+        );
+
+        // `main` calls itself: the file declares `main` exactly once, so the
+        // post-walk partition resolves the reference as a file-local edge —
+        // even though the call site sits inside the declaration's own body.
+        assert_eq!(graph.resolved.len(), 1);
+        let resolved = &graph.resolved[0];
+        assert_eq!(resolved.ref_kind, GraphRefKind::Calls);
+        assert_eq!((resolved.source_index, resolved.target_index), (2, 2));
+        assert_eq!(resolved.provenance, EdgeProvenance::FileLocal);
+        assert_eq!(resolved.raw_text.as_deref(), Some("main"));
+        assert_eq!(resolved.arity, Some(0));
+
+        // Everything else stays pending in walk order: the import (file-owned),
+        // receiver-qualified calls, the undeclared extends target, and the
+        // imported-but-undeclared `helper`.
+        let pending = &graph.pending;
+        assert_eq!(pending.len(), 5);
+        assert_eq!(pending[0].ref_kind, GraphRefKind::Imports);
+        assert_eq!(pending[0].owner_index, FILE_SCOPE_INDEX);
+        assert_eq!(pending[0].ref_name, "./utils.js");
+        assert_eq!((pending[1].ref_kind, pending[1].ref_name.as_str()), (GraphRefKind::Calls, "init"));
+        assert_eq!(pending[1].owner_index, 0);
+        assert_eq!(pending[1].receiver_name.as_deref(), Some("this"));
+        assert_eq!((pending[2].ref_kind, pending[2].ref_name.as_str()), (GraphRefKind::Extends, "Base"));
+        assert_eq!((pending[3].owner_index, pending[3].ref_name.as_str()), (1, "init"));
+        assert_eq!((pending[4].owner_index, pending[4].ref_name.as_str()), (2, "helper"));
+    }
+
+    // Manual inspection harness, not part of CI: run with
+    // `cargo test -p zg-engine --lib dump_walk_graph -- --ignored --nocapture`
+    // to eyeball everything the walk collects over this crate's own graph.rs.
+    #[test]
+    #[ignore = "manual inspection dump"]
+    fn dump_walk_graph_over_graph_rs() {
+        use super::super::graph::FILE_SCOPE_INDEX;
+        use super::{Parser, WalkContext, grammar, resolve_adapter};
+        use crate::domain::GraphRefKind;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/extraction/graph.rs");
+        let text = std::fs::read_to_string(&path).expect("graph.rs is readable");
+        let adapter = resolve_adapter(FileFormat::Rust).expect("rust adapter");
+        let language = grammar(FileFormat::Rust, false).expect("rust grammar");
+        let mut parser = Parser::new();
+        parser.set_language(&language).expect("grammar loads");
+        let tree = parser.parse(&text, None).expect("graph.rs parses");
+
+        let mut entities = Vec::new();
+        let mut context = WalkContext::new();
+        super::walk_code_node(
+            tree.root_node(),
+            adapter,
+            text.as_bytes(),
+            &[],
+            &mut entities,
+            &mut context,
+            FileFormat::Rust,
+        );
+
+        println!("=== {} entities ===", entities.len());
+        for (index, entity) in entities.iter().enumerate() {
+            println!(
+                "[{index}] {:?} {} L{}",
+                entity.symbol_type,
+                entity.name.as_deref().unwrap_or("<anon>"),
+                entity.node.start_position().row + 1,
+            );
+        }
+
+        let contains = context.resolved_edges();
+        println!("=== {} contains edges ===", contains.len());
+        for edge in contains {
+            println!("{} -> {} (L{})", edge.source_index, edge.target_index, edge.line);
+        }
+
+        let names = context.name_edges();
+        println!("=== {} name references ===", names.len());
+        for edge in names {
+            let owner = if edge.owner_index == FILE_SCOPE_INDEX {
+                "FILE".to_owned()
+            } else {
+                edge.owner_index.to_string()
+            };
+            println!(
+                "{:?} owner={} name={:?} recv={:?} arity={:?} L{}:{}",
+                edge.ref_kind,
+                owner,
+                edge.ref_name,
+                edge.receiver_name,
+                edge.arity,
+                edge.line,
+                edge.column
+            );
+        }
+
+        assert!(!entities.is_empty());
+        assert!(contains.len() >= 10);
+        assert!(names.iter().any(|edge| edge.ref_kind == GraphRefKind::Imports));
     }
 }

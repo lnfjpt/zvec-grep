@@ -85,7 +85,6 @@ impl ZvecGrep {
                 include_status: false,
             })
             .await?;
-        info.compatibility.ensure_compatible()?;
         if !info.indexed {
             return Err(EngineError::invalid_argument(
                 "workspace must have an index before it can be watched",
@@ -94,6 +93,11 @@ impl ZvecGrep {
         let workspace = info
             .workspace_index
             .ok_or_else(|| EngineError::invalid_argument("workspace configuration is missing"))?;
+        if workspace.index_version != Some(crate::workspace::CURRENT_INDEX_VERSION) {
+            return Err(EngineError::storage_failure(
+                "workspace index version is incompatible; rebuild it with `zg index --rebuild`",
+            ));
+        }
         let root = file_selection::ScanPolicy::root_spec(&workspace.root, &workspace.scan)?;
         zg_host_native::NativeWatcherFactory::default()
             .watch(&zg_host_native::WatchRequest { root }, control)
@@ -110,19 +114,6 @@ impl ZvecGrep {
 
     pub fn close(&self) {
         self.service.close();
-    }
-
-    /// Reuses index read handles between requests, closing them after 60 idle seconds.
-    /// Workspace writes retire cached handles before opening writable storage.
-    /// Repeated calls are idempotent; ordinary engine instances remain uncached.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the engine is closed or cache maintenance cannot start.
-    pub fn enable_read_session_cache(&self) -> EngineResult<()> {
-        self.service
-            .enable_read_session_cache()
-            .map_err(|error| error.report_here())
     }
 
     #[must_use]

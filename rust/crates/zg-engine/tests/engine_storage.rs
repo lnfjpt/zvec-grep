@@ -9,7 +9,7 @@ use std::{
 
 use support::{
     EmbeddingServer, configure_remote_model, index_options, info_options, native_documents,
-    native_file_records, set_native_file_status,
+    native_file_records,
 };
 
 use serde_json::{Value, json};
@@ -70,7 +70,7 @@ async fn one_text_model_indexes_text_and_skips_images_without_embedding_them() -
             .as_ref()
             .expect("workspace")
             .index_version,
-        Some(2)
+        Some(7)
     );
     let collections = model_collections(&info.index_path)?;
     assert_eq!(collections.len(), 1);
@@ -81,8 +81,8 @@ async fn one_text_model_indexes_text_and_skips_images_without_embedding_them() -
     );
     let manifest: Value =
         serde_json::from_slice(&fs::read(root.join(".zvec-grep/manifest.json"))?)?;
-    assert!(manifest.get("manifestVersion").is_none());
-    assert_eq!(manifest["indexVersion"], 2);
+    assert_eq!(manifest["manifestVersion"], 5);
+    assert_eq!(manifest["indexVersion"], 7);
     assert_eq!(manifest["embeddings"].as_array().expect("models").len(), 1);
     assert_eq!(
         manifest["embeddingRoutes"],
@@ -149,6 +149,7 @@ async fn whitespace_only_ranges_do_not_fail_complete_file_indexing() -> TestResu
         .collect::<Result<Vec<_>, _>>()?;
     let entity = payloads
         .iter()
+        .map(|payload| &payload["value"])
         .find(|entity| entity["content"]["value"] == preamble)
         .expect("canonical content preserves every whitespace byte");
     let mut covered = vec![false; preamble.len()];
@@ -208,14 +209,7 @@ async fn long_entities_store_original_content_once_and_project_fragment_metadata
             .get_string("payload")?
             .expect("canonical entity"),
     )?;
-    let entity = &payload;
-    let entity_id = entity["id"].as_str().expect("entity ID");
-    assert_eq!(entity_id.len(), 32);
-    assert_eq!(entities[0].get_pk(), Some(entity_id));
-    assert_eq!(
-        entities[0].get_string("entity_id")?.as_deref(),
-        Some(entity_id)
-    );
+    let entity = &payload["value"];
     assert_eq!(entity["content"], json!({"kind": "text", "value": source}));
     assert_eq!(entity["source_range"]["kind"], "text");
     assert!(entity.get("range").is_none());
@@ -231,11 +225,10 @@ async fn long_entities_store_original_content_once_and_project_fragment_metadata
     assert!(fragments.len() > 1);
     let mut coverage = vec![false; source.len()];
     let mut ids = BTreeSet::new();
-    for (ordinal, fragment) in fragments.iter().enumerate() {
+    for fragment in fragments {
         let id = fragment["id"].as_str().expect("fragment ID");
-        assert_eq!(id, format!("{entity_id}{ordinal:08x}"));
-        assert_eq!(id.len(), 40);
-        assert!(ids.insert(id.to_owned()));
+        assert_ne!(Some(id), entity["id"].as_str());
+        assert!(ids.insert(hex::encode(id)));
         assert!(fragment.get("content").is_none());
         assert!(fragment.get("metadata").is_none());
         assert_eq!(fragment.as_object().expect("fragment object").len(), 2);
@@ -256,10 +249,7 @@ async fn long_entities_store_original_content_once_and_project_fragment_metadata
     assert_eq!(projected.len(), fragments.len());
     let mut projected_ids = BTreeSet::new();
     for doc in projected {
-        let document_id = doc.get_string("document_id")?.expect("fragment ID");
-        assert_eq!(doc.get_pk(), Some(document_id.as_str()));
-        assert_eq!(doc.get_string("entity_id")?.as_deref(), Some(entity_id));
-        projected_ids.insert(document_id);
+        projected_ids.insert(doc.get_string("document_id")?.expect("fragment ID"));
         assert_eq!(doc.get_string("symbol_type")?.as_deref(), Some("function"));
         assert!(doc.get_string("symbol_name")?.is_some());
         assert!(
@@ -304,7 +294,6 @@ async fn long_entities_store_original_content_once_and_project_fragment_metadata
         else {
             panic!("text source excerpt");
         };
-        assert_eq!(Some(&item.content_range), item.excerpt_range.as_ref());
         assert_eq!(
             source.get(*start_byte_offset..*end_byte_offset),
             Some(item.content.as_str())
@@ -464,13 +453,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
 
     let engine = ZvecGrep::new();
     let initial = engine.index(index_options(root)).await?;
-    assert_eq!(initial.files_added, 2, "{initial:?}");
-    assert!(
-        initial
-            .skipped
-            .iter()
-            .any(|file| file.path == root.join("tmp"))
-    );
+    assert_eq!(initial.files_added, 3, "{initial:?}");
     assert_eq!(initial.files_failed, 0);
     let info = engine.info(info_options(root)).await?;
     assert!(info.indexed);
@@ -484,7 +467,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
         .expect("FTS info");
     assert_eq!(fts.tokenizer, "jieba");
     assert_eq!(fts.filters, ["lowercase"]);
-    assert_eq!(info.status.as_ref().expect("status").files_indexed, 2);
+    assert_eq!(info.status.as_ref().expect("status").files_indexed, 3);
     assert_eq!(
         fts_paths(&engine, root, "orchard").await?,
         [PathBuf::from("auth.rs")]
@@ -511,7 +494,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
     );
     let calls = server.requests.load(Ordering::Acquire);
     let unchanged = engine.index(index_options(root)).await?;
-    assert_eq!(unchanged.files_unchanged, 2);
+    assert_eq!(unchanged.files_unchanged, 3);
     assert_eq!(server.requests.load(Ordering::Acquire), calls);
     engine.close();
     assert_eq!(
@@ -585,7 +568,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
             ..index_options(root)
         })
         .await?;
-    assert_eq!(rebuilt.files_added, 2);
+    assert_eq!(rebuilt.files_added, 3);
     let after_rebuild = engine.info(info_options(root)).await?;
     assert_eq!(
         after_rebuild
@@ -692,7 +675,7 @@ async fn initial_build_publishes_successes_and_incrementally_retries_failed_file
     assert!(
         records
             .iter()
-            .all(|record| record["index_status"]["kind"] == "indexed")
+            .all(|record| record["value"]["index_status"]["kind"] == "indexed")
     );
     assert_eq!(
         fts_paths(&engine, root, "nebula").await?,
@@ -840,11 +823,19 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
         assert_eq!(files.len(), 1);
         files[0].get_string("payload")?.expect("source payload")
     };
-    // Simulate interruption after recording NotIndexed. Opening the store must
-    // preserve this state and any remaining search documents until indexing retries.
-    let original: Value = serde_json::from_str(&source)?;
-    let id = u32::try_from(original["id"].as_u64().expect("file ID"))?;
-    set_native_file_status(&index_path, id, "not_indexed")?;
+    // A completed file can still have a pending marker after a crash before marker removal.
+    // The actual journal stores reindex intent, never a claim that the batch is complete.
+    let mut pending_source: Value = serde_json::from_str(&source)?;
+    pending_source["value"]["index_status"] = json!({"kind": "not_indexed"});
+    // Preserve its full snapshot so recovery must override the ordinary unchanged-file fast path.
+    let pending_path = index_path.join("pending.json");
+    fs::write(
+        &pending_path,
+        serde_json::to_vec(&json!({
+            "version": 2,
+            "files": [{ "kind": "reindex", "source": serde_json::to_string(&pending_source)? }],
+        }))?,
+    )?;
 
     let engine = ZvecGrep::new();
     let status = engine
@@ -860,11 +851,11 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
         ),
         (1, 0, 0)
     );
-    assert!(!index_path.join("pending.json").exists());
-    assert_eq!(
-        fts_paths(&engine, root, "orchard").await?,
-        [PathBuf::from("note.txt")]
+    assert!(
+        !pending_path.exists(),
+        "recovery flushes and clears the marker"
     );
+    assert!(fts_paths(&engine, root, "orchard").await?.is_empty());
     assert_eq!(server.requests.load(Ordering::Acquire), requests);
     engine.close();
     drop(engine);
@@ -876,20 +867,24 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
         "recovery preserves the source for reindexing"
     );
     let original: Value = serde_json::from_str(&source)?;
-    assert_eq!(original["index_status"]["kind"], "indexed");
+    assert_eq!(original["value"]["index_status"]["kind"], "indexed");
     let recovered: Value = serde_json::from_str(
         &files[0]
             .get_string("payload")?
             .expect("recovered file payload"),
     )?;
-    assert!(recovered.get("formats").is_none());
+    assert_eq!(recovered["version"], original["version"]);
+    assert!(recovered["value"].get("formats").is_none());
     for field in ["id", "relative_path", "snapshot"] {
         assert_eq!(
-            recovered[field], original[field],
+            recovered["value"][field], original["value"][field],
             "recovery preserves {field}"
         );
     }
-    assert_eq!(recovered["index_status"], json!({"kind": "not_indexed"}));
+    assert_eq!(
+        recovered["value"]["index_status"],
+        json!({"kind": "not_indexed"})
+    );
     let collections = fs::read_dir(&index_path)?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -904,8 +899,8 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
     assert_eq!(collections.len(), 2);
     for collection in collections {
         assert!(
-            !native_documents(&collection)?.is_empty(),
-            "opening storage preserves intermediate records in {}",
+            native_documents(&collection)?.is_empty(),
+            "recovery clears searchable records in {}",
             collection.display()
         );
     }
@@ -1024,14 +1019,7 @@ async fn public_engine_reuses_relative_files_after_moving_workspace() -> TestRes
     assert_eq!(updated.files_modified, 1);
     let result = engine.context(query(&relocated_root, "vineyard")).await?;
     assert_eq!(result.items.len(), 1);
-    assert_ne!(result.items[0].entity_id, entity_id);
-    assert!(
-        engine
-            .context(query(&relocated_root, "orchard"))
-            .await?
-            .items
-            .is_empty()
-    );
+    assert_eq!(result.items[0].entity_id, entity_id);
     engine.drop_index(info_options(&relocated_root)).await?;
     engine.close();
     Ok(())

@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, ffi::OsStr};
 
 use crate::{
-    api::context::options::QueryFilter, domain::FileFormat, storage::types::StoragePathFilter,
+    api::context::options::QueryFilter, domain::FileFormat, storage::spi::StoragePathFilter,
 };
 
 use super::path_filter::{all, any, negate};
@@ -243,9 +243,9 @@ mod tests {
                 vec![false, true, true],
             ),
             (
-                FileFormat::TypeScript,
-                vec!["module.ts", "module.d.ts", "video.mpeg", "video.m2ts"],
-                vec![true, true, false, false],
+                FileFormat::Mpeg,
+                vec!["module.ts", "module.d.ts", ".d.ts"],
+                vec![true, false, true],
             ),
             (
                 FileFormat::Text,

@@ -79,9 +79,6 @@ pub mod options {
         pub max_file_size_bytes: Option<u64>,
         pub follow: bool,
         pub embedding_concurrency: Option<usize>,
-        /// Maximum time to wait for workspace admission, in milliseconds (default: 30 seconds).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub lock_timeout_ms: Option<u64>,
         /// Allows remote embedding for this operation without persisting a grant.
         #[serde(default)]
         pub allow_remote: bool,
@@ -165,7 +162,6 @@ pub mod options {
                 max_file_size_bytes: None,
                 follow: false,
                 embedding_concurrency: None,
-                lock_timeout_ms: None,
                 allow_remote: false,
                 authorized_remote: Vec::new(),
                 api_key: None,
@@ -417,12 +413,7 @@ pub mod result {
         pub relative_path: PathBuf,
         pub range: ContentRange,
         pub excerpt_range: Option<ContentRange>,
-        /// Exact source coordinates of `content`, independent of the entity and matched ranges.
-        pub content_range: ContentRange,
         pub content: String,
-        /// Optional structural context supplied with the retrieved source.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub outline: Option<String>,
         pub content_role: Option<ContextContentRole>,
         pub status: ContextItemStatus,
         pub score: Option<f64>,
@@ -444,8 +435,7 @@ pub mod result {
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub struct ContextContainer {
-        /// Present when the container is associated with a stored entity.
-        pub entity_id: Option<String>,
+        pub entity_id: String,
         pub range: ContentRange,
         pub metadata: Option<EntityMetadata>,
     }
@@ -554,45 +544,6 @@ pub mod result {
             end_offset: u64,
         },
     }
-
-    impl ContentRange {
-        /// Returns the one-based starting line when source line coordinates are available.
-        #[must_use]
-        pub fn start_line(&self) -> Option<usize> {
-            match self {
-                Self::Text { start_line, .. } => Some(*start_line),
-                Self::File | Self::Byte { .. } => None,
-            }
-        }
-
-        /// Returns the last covered line of a half-open text range.
-        /// Empty ranges retain their source position, including positions at EOF.
-        #[must_use]
-        pub fn last_line(&self) -> Option<usize> {
-            match self {
-                Self::Text {
-                    end_line,
-                    start_byte_offset,
-                    end_byte_offset,
-                    end_byte_column,
-                    ..
-                } => Some(end_line.saturating_sub(usize::from(
-                    *end_byte_column == 0 && start_byte_offset < end_byte_offset,
-                ))),
-                Self::File | Self::Byte { .. } => None,
-            }
-        }
-
-        /// Returns the number of covered source lines, or one for an empty text position.
-        #[must_use]
-        pub fn line_count(&self) -> Option<usize> {
-            Some(
-                self.last_line()?
-                    .saturating_sub(self.start_line()?)
-                    .saturating_add(1),
-            )
-        }
-    }
 }
 
 impl From<crate::domain::Range> for result::ContentRange {
@@ -609,8 +560,8 @@ impl From<crate::domain::Range> for result::ContentRange {
                 end_byte_column: range.end_byte_column(),
             },
             Range::Byte(range) => Self::Byte {
-                start_offset: range.start_offset(),
-                end_offset: range.end_offset(),
+                start_offset: range.start_offset,
+                end_offset: range.end_offset,
             },
         }
     }
@@ -643,44 +594,17 @@ mod tests {
     use super::result;
 
     #[test]
-    fn source_line_bounds_respect_half_open_and_empty_ranges() {
-        for (coordinates, expected) in [
-            ((6, 13, 2, 3, 0, 0), (2, 2, 1)),
-            ((6, 14, 2, 3, 0, 1), (2, 3, 2)),
-            ((13, 13, 3, 3, 0, 0), (3, 3, 1)),
-            ((9, 12, 2, 2, 3, 6), (2, 2, 1)),
-        ] {
-            let (start, end, first, last, start_column, end_column) = coordinates;
-            let range: result::ContentRange =
-                TextRange::from_coordinates(start, end, first, last, start_column, end_column)
-                    .expect("source coordinates")
-                    .into();
-            assert_eq!(range.start_line(), Some(expected.0));
-            assert_eq!(range.last_line(), Some(expected.1));
-            assert_eq!(range.line_count(), Some(expected.2));
-        }
-        for range in [
-            result::ContentRange::File,
-            result::ContentRange::Byte {
-                start_offset: 3,
-                end_offset: 8,
-            },
-        ] {
-            assert_eq!(range.start_line(), None);
-            assert_eq!(range.last_line(), None);
-            assert_eq!(range.line_count(), None);
-        }
-    }
-
-    #[test]
     fn domain_ranges_preserve_public_wire_coordinates() {
         let file: result::ContentRange = Range::Full.into();
         assert_eq!(
             serde_json::to_value(file).expect("file range"),
             json!({ "kind": "file" })
         );
-        let bytes: result::ContentRange =
-            Range::Byte(ByteRange::new(12, 24).expect("ordered byte offsets")).into();
+        let bytes: result::ContentRange = Range::Byte(ByteRange {
+            start_offset: 12,
+            end_offset: 24,
+        })
+        .into();
         assert_eq!(
             serde_json::to_value(bytes).expect("byte range"),
             json!({ "kind": "byte", "start_offset": 12, "end_offset": 24 })

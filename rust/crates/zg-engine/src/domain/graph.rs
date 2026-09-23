@@ -1,4 +1,9 @@
 //! Cross-module graph extraction contracts.
+//!
+//! Mirrors the TypeScript `src/engine/graph/types.ts` contract: the
+//! extraction layer produces [`FileGraphResult`] per code file, the pipeline
+//! carries it to the graph persistence layer, and the resolver consumes the
+//! buffered pending references.
 
 use std::collections::BTreeMap;
 
@@ -26,6 +31,17 @@ pub(crate) enum GraphRefKind {
     Imports,
     Extends,
     Implements,
+}
+
+impl From<GraphRefKind> for GraphEdgeKind {
+    fn from(kind: GraphRefKind) -> Self {
+        match kind {
+            GraphRefKind::Calls => Self::Calls,
+            GraphRefKind::Imports => Self::Imports,
+            GraphRefKind::Extends => Self::Extends,
+            GraphRefKind::Implements => Self::Implements,
+        }
+    }
 }
 
 /// Evidence provenance recorded on persisted edges.

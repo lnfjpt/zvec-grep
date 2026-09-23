@@ -52,6 +52,7 @@ pub struct CodeMetadata {
     pub signature: Option<String>,
     pub documentation: Option<String>,
     pub visibility: Option<Visibility>,
+    pub parameter: Option<String>,
     pub language: Option<Language>,
 }
 

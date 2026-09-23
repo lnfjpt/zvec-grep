@@ -1,5 +1,3 @@
-use super::storage::SearchStorage;
-
 use std::{collections::HashSet, fs, path::Path};
 
 use crate::{
@@ -15,7 +13,8 @@ use crate::{
             IndexRouteDiagnostics, MatchedBy,
         },
     },
-    domain::{Content, FileRecord, Range, Workspace},
+    domain::{Content, FileRecord, Workspace},
+    storage::spi::WorkspaceIndexStorage,
     utils::sha256_hex,
 };
 
@@ -133,7 +132,7 @@ pub(crate) async fn context_from_index(
     root: &Path,
     workspace: &Workspace,
     workspace_home: &Path,
-    storage: &dyn SearchStorage,
+    storage: &dyn WorkspaceIndexStorage,
     embedding_models: &[&dyn SearchEmbeddingRuntime],
     options: &ContextOptions,
     request: &NormalizedContextRequest,
@@ -286,9 +285,7 @@ fn search_plan_to_context_items(
                 relative_path: hit.file.relative_path.to_path_buf(),
                 range: hit.entity.source_range.into(),
                 excerpt_range: target.excerpt_range,
-                content_range: target.content_range,
                 content: target.content,
-                outline: None,
                 content_role: Some(target.content_role),
                 status: file_freshness_status(workspace_root, &hit.file),
                 score: Some(hit.score),
@@ -468,7 +465,6 @@ fn context_item_dedupe_key(item: &ContextItem) -> String {
 
 struct ContextItemTarget {
     content: String,
-    content_range: ContentRange,
     content_role: ContextContentRole,
     excerpt_range: Option<ContentRange>,
 }
@@ -477,59 +473,37 @@ fn context_item_target(hit: &SearchHit) -> Result<ContextItemTarget, EngineError
     let Some(evidence) = hit.evidence.first() else {
         return Ok(ContextItemTarget {
             content: content_to_text(&hit.entity.content),
-            content_range: hit.entity.source_range.into(),
             content_role: ContextContentRole::Source,
             excerpt_range: None,
         });
     };
     let fragment = &evidence.fragment;
-    let invalid_fragment = |error| {
-        EngineError::storage_failure(format!(
-            "invalid search fragment {}: {error}",
-            fragment.id.as_str()
-        ))
-    };
-    let (content, excerpt_range) = match (fragment.range, &hit.entity.content) {
-        (Range::Full, content) => (content_to_text(content), None),
-        (Range::Byte(range), Content::Text(text)) => {
-            let start = usize::try_from(range.start_offset()).map_err(|_| {
-                invalid_fragment(EngineError::invalid_argument(
-                    "fragment start offset exceeds platform limits",
-                ))
-            })?;
-            let end = usize::try_from(range.end_offset()).map_err(|_| {
-                invalid_fragment(EngineError::invalid_argument(
-                    "fragment end offset exceeds platform limits",
-                ))
-            })?;
-            let content = crate::utils::slice_text(text, start, end).map_err(invalid_fragment)?;
-            let lines = crate::utils::line_byte_offsets(text);
-            let local = crate::utils::text_range_from_offsets(text, &lines, start, end)
-                .map_err(invalid_fragment)?;
-            let source = match hit.entity.source_range {
-                Range::Full => local,
-                Range::Text(origin) => {
-                    crate::utils::map_text_range(local, origin).map_err(invalid_fragment)?
-                }
-                Range::Byte(_) => {
-                    return Err(invalid_fragment(EngineError::invalid_argument(
-                        "fragment content coordinates cannot be mapped to this entity source",
-                    )));
-                }
-            };
-            (content.to_owned(), Some(Range::Text(source).into()))
-        }
-        _ => {
-            return Err(invalid_fragment(EngineError::invalid_argument(
-                "fragments use Full or entity-relative byte ranges for text; images and tables require Full",
-            )));
-        }
+    let content = fragment
+        .range
+        .extract(&hit.entity.content)
+        .map_err(|error| {
+            EngineError::storage_failure(format!(
+                "invalid search fragment {}: {error}",
+                fragment.id.as_str()
+            ))
+        })?;
+    let excerpt_range = if fragment.range == crate::domain::Range::Full {
+        None
+    } else {
+        Some(
+            hit.entity
+                .fragment_source_range(fragment)
+                .map_err(|error| {
+                    EngineError::storage_failure(format!(
+                        "invalid search fragment source range {}: {error}",
+                        fragment.id.as_str()
+                    ))
+                })?
+                .into(),
+        )
     };
     Ok(ContextItemTarget {
-        content,
-        content_range: excerpt_range
-            .clone()
-            .unwrap_or_else(|| hit.entity.source_range.into()),
+        content: content_to_text(&content),
         content_role: ContextContentRole::Source,
         excerpt_range,
     })
@@ -675,26 +649,27 @@ mod tests {
         let source_range = Range::Text(
             TextRange::from_coordinates(9, 9 + source.len(), 2, 4, 2, 3).expect("range"),
         );
-        let fragment_range = Range::Byte(ByteRange::new(1, 12).expect("ordered byte offsets"));
+        let fragment_range = Range::Byte(ByteRange {
+            start_offset: 1,
+            end_offset: 12,
+        });
         let fragment_source_range = Range::Text(
             TextRange::from_coordinates(10, 21, 2, 3, 3, 2).expect("fragment source range"),
         );
-        let content = Content::Text(source.into());
-        let entity_id = EntityId::new(file_id, &content, source_range).expect("entity id");
         let fragment = EntityFragment {
-            id: FragmentId::new(&entity_id, 0),
+            id: FragmentId::new("fragment").expect("fragment id"),
             range: fragment_range,
         };
         let full = EntityFragment {
-            id: FragmentId::new(&entity_id, 1),
+            id: FragmentId::new("full").expect("fragment id"),
             range: Range::Full,
         };
         let mut hit = SearchHit {
             entity: Entity {
-                id: entity_id,
+                id: EntityId::new("entity").expect("entity id"),
                 file_id,
                 source_range,
-                content,
+                content: Content::Text(source.into()),
                 metadata: None,
                 fragments: vec![fragment.clone(), full.clone()],
             },
@@ -725,7 +700,6 @@ mod tests {
         assert_eq!(target.content_role, ContextContentRole::Source);
         assert_eq!(target.content, "中😀\r\nβ");
         assert_eq!(target.excerpt_range, Some(fragment_source_range.into()));
-        assert_eq!(target.content_range, fragment_source_range.into());
         assert_eq!(hit.entity.content, Content::Text(source.into()));
         let search = SearchPlanResult {
             routes: Vec::new(),
@@ -745,91 +719,22 @@ mod tests {
         .expect("context items");
         assert_eq!(items[0].range, source_range.into());
         assert_eq!(items[0].excerpt_range, Some(fragment_source_range.into()));
-        assert_eq!(items[0].content_range, fragment_source_range.into());
         assert_eq!(items[0].content, "中😀\r\nβ");
         hit.evidence.reverse();
         let target = super::context_item_target(&hit).expect("full content");
         assert_eq!(target.content, source);
-        assert_eq!(target.content_range, source_range.into());
         assert_eq!(
             target.excerpt_range, None,
             "full fragments do not create an excerpt range"
         );
-        hit.evidence[0].fragment.range =
-            Range::Byte(ByteRange::new(0, 999).expect("ordered byte offsets"));
+        hit.evidence[0].fragment.range = Range::Byte(ByteRange {
+            start_offset: 0,
+            end_offset: 999,
+        });
         let error = super::context_item_target(&hit)
             .err()
             .expect("invalid fragment must fail");
         assert_eq!(error.code(), crate::EngineError::STORAGE_FAILURE);
-    }
-
-    #[test]
-    fn markdown_eof_fragments_keep_their_own_source_coordinates() {
-        use crate::{
-            domain::{
-                Content, Entity, EntityFragment, EntityId, FileFormat, FileId, FileIndexStatus,
-                FileRecord, FileSnapshot, FragmentId, Range, SourcePath,
-            },
-            extraction::{ChunkOptions, TextSource, extract_for_indexing},
-            pipelines::indexed_search::pipeline::{SearchEvidence, SearchHit},
-        };
-        for newline in ["", "\n", "\r\n"] {
-            let source = format!("# Heading\nprefix {} needle{newline}", "x".repeat(5_000));
-            let input = TextSource {
-                relative_path: SourcePath::new("sample.md").expect("source path"),
-                formats: vec![FileFormat::Markdown],
-                text: source.clone(),
-            };
-            let extracted = extract_for_indexing(&input, ChunkOptions::default())
-                .expect("default Markdown extraction")
-                .fragments
-                .remove(0);
-            let file_id = FileId::new(1);
-            let id = EntityId::new(file_id, &extracted.content, extracted.source_range)
-                .expect("entity ID");
-            let fragment = EntityFragment {
-                id: FragmentId::new(&id, 0),
-                range: extracted.fragments.last().expect("EOF fragment").range,
-            };
-            let Range::Byte(bytes) = fragment.range else {
-                panic!("chunked source")
-            };
-            let hit = SearchHit {
-                entity: Entity {
-                    id,
-                    file_id,
-                    source_range: extracted.source_range,
-                    content: extracted.content,
-                    metadata: extracted.metadata,
-                    fragments: vec![fragment.clone()],
-                },
-                file: FileRecord {
-                    id: file_id,
-                    relative_path: input.relative_path,
-                    snapshot: FileSnapshot {
-                        size_bytes: source.len() as u64,
-                        modified_epoch_ms: None,
-                        content_hash: None,
-                    },
-                    index_status: FileIndexStatus::NotIndexed,
-                },
-                evidence: vec![SearchEvidence { fragment }],
-                rank: 1,
-                score: 1.0,
-                matched_by: MatchedBy::Fts,
-                trace: None,
-            };
-            let target = super::context_item_target(&hit).expect("source fragment");
-            let start = usize::try_from(bytes.start_offset()).expect("start");
-            let end = usize::try_from(bytes.end_offset()).expect("end");
-            assert!(start > "# Heading\nprefix ".len());
-            assert_eq!(target.content, source[start..end]);
-            assert_eq!(target.content_range.start_line(), Some(2));
-            assert_eq!(target.content_range.last_line(), Some(2));
-            assert_eq!(target.excerpt_range, Some(target.content_range));
-            assert_eq!(target.content.ends_with('\n'), !newline.is_empty());
-            assert!(matches!(hit.entity.content, Content::Text(_)));
-        }
     }
 
     #[test]
@@ -871,18 +776,17 @@ mod tests {
             },
             ..source.clone()
         };
-        let source_range = Range::Text(
-            TextRange::from_coordinates(0, content.len(), 1, 1, 0, content.len()).expect("range"),
-        );
-        let content = Content::Text(content.to_owned());
         let search = SearchPlanResult {
             routes: Vec::new(),
             hits: vec![SearchHit {
                 entity: Entity {
-                    id: EntityId::new(source.id, &content, source_range).expect("entity id"),
+                    id: EntityId::new("entity").expect("entity id"),
                     file_id: source.id,
-                    source_range,
-                    content,
+                    source_range: Range::Text(
+                        TextRange::from_coordinates(0, content.len(), 1, 1, 0, content.len())
+                            .expect("range"),
+                    ),
+                    content: Content::Text(content.to_owned()),
                     metadata: None,
                     fragments: Vec::new(),
                 },
@@ -1039,17 +943,8 @@ mod tests {
                 start_byte_column: 0,
                 end_byte_column: 1,
             },
-            content_range: ContentRange::Text {
-                start_line: 1,
-                end_line: 1,
-                start_byte_offset: 0,
-                end_byte_offset: 1,
-                start_byte_column: 0,
-                end_byte_column: 1,
-            },
             excerpt_range: None,
             content: id.to_owned(),
-            outline: None,
             content_role: Some(ContextContentRole::Source),
             status: ContextItemStatus::Fresh,
             score: Some(1.0),

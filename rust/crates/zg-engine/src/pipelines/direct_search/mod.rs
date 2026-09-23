@@ -196,9 +196,7 @@ fn context_from_lexical(
                     relative_path: item.relative_path,
                     range: item.range.into(),
                     excerpt_range: item.excerpt_range.map(Into::into),
-                    content_range: item.content_range.into(),
                     content: item.content,
-                    outline: None,
                     content_role: Some(ContextContentRole::Source),
                     status: ContextItemStatus::Fresh,
                     score: None,
@@ -209,7 +207,7 @@ fn context_from_lexical(
                         .cloned(),
                     entity_id: None,
                     container: container.map(|value| ContextContainer {
-                        entity_id: None,
+                        entity_id: value.entity_id.as_str().to_owned(),
                         range: value.range.into(),
                         metadata: value.metadata,
                     }),
@@ -245,62 +243,6 @@ mod tests {
     use crate::api::context::options::{ContextRoute, ContextRouteMode, RgOptions};
 
     use super::{ContextOptions, normalize_request};
-
-    #[tokio::test]
-    async fn direct_search_returns_structure_without_index_identity() {
-        use crate::api::context::result::{ContentRange, EntityMetadata};
-
-        let directory = tempfile::tempdir().expect("source directory");
-        let source = "pub fn orchard() {\n    let fruit = \"needle\";\n}\n";
-        std::fs::write(directory.path().join("source.rs"), source).expect("source file");
-        let engine = crate::ZvecGrep::new();
-        let result = engine
-            .context(ContextOptions {
-                root: Some(directory.path().to_path_buf()),
-                rg: true,
-                query: Some("needle".into()),
-                ..ContextOptions::default()
-            })
-            .await
-            .expect("direct search without an index");
-
-        assert!(result.workspace_index.is_none());
-        assert_eq!(result.items.len(), 1);
-        let item = &result.items[0];
-        assert_eq!(item.content_range.start_line(), Some(2));
-        let ContentRange::Text {
-            start_byte_offset,
-            end_byte_offset,
-            ..
-        } = item.content_range
-        else {
-            panic!("source coordinates")
-        };
-        assert_eq!(&source[start_byte_offset..end_byte_offset], item.content);
-        assert!(item.entity_id.is_none());
-        assert!(item.content.contains("needle"));
-        let container = item.container.as_ref().expect("function container");
-        assert!(container.entity_id.is_none());
-        assert!(matches!(
-            &container.metadata,
-            Some(EntityMetadata::Code(metadata))
-                if metadata.symbol_name.as_deref() == Some("orchard")
-        ));
-        assert!(matches!(
-            container.range,
-            ContentRange::Text {
-                start_line: 1,
-                end_line: 3,
-                start_byte_offset: 0,
-                end_byte_offset,
-                ..
-            } if end_byte_offset == source.trim_end().len()
-        ));
-        let serialized = serde_json::to_value(container).expect("serialize container");
-        assert_eq!(serialized.get("entity_id"), Some(&serde_json::Value::Null));
-        assert!(!directory.path().join(".zvec-grep").exists());
-        engine.close();
-    }
 
     #[test]
     fn preserves_primary_patterns_and_normalizes_supplemental_routes() {
