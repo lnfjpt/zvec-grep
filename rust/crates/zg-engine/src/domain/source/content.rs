@@ -23,8 +23,7 @@ impl ContentKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Content {
     Text(String),
     Image(ImageContent),
@@ -44,7 +43,7 @@ impl Content {
 // --- Image ---
 
 /// Stores a complete encoded image resource and its format.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ImageContent {
     data: Vec<u8>,
     format: FileFormat,
@@ -79,7 +78,7 @@ impl ImageContent {
 // --- Table ---
 
 /// A logical table, independent of its source format.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TableContent {
     pub row_count: usize,
     pub column_count: usize,
@@ -90,7 +89,7 @@ pub(crate) struct TableContent {
 
 /// Table-local, zero-based coordinates with positive spans.
 /// Cells must stay within the table bounds and must not overlap.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TableCell {
     pub row: usize,
     pub column: usize,
@@ -101,8 +100,7 @@ pub(crate) struct TableCell {
     pub kind: TableCellRole,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TableCellRole {
     Unknown,
     Data,

@@ -42,44 +42,9 @@ Request and reply types are grouped under the matching method name in
 The engine owns a private process-level model runtime manager. Workspaces using
 the same model configuration share one runtime and its loaded weights/tokenizer;
 embedding calls may execute concurrently against those shared resources.
-Idle model runtimes expire 15 minutes after their final lease is released, even
-without another request. The cache has a soft capacity of one runtime: it evicts
-the least recently used idle models on acquisition and final release, while
-active models may temporarily exceed the limit. Reacquiring a model resets its
-idle period. Maintenance stops when the engine is closed or its last owner is
-dropped, and native model destruction runs outside the cache lock.
-
 `IndexOptions::on_progress` accepts an in-process `IndexProgressReporter` and
 surfaces model downloads through `IndexProgress::embedding`. The reporter is
 runtime-only and is omitted from serialized daemon requests.
-
-The daemon enables an index read-session cache with a 60-second idle timeout.
-Sequential and concurrent queries reuse the same generation's native storage
-handles. Each request still reads current workspace metadata and resolves its
-own model settings. Standalone engine instances can opt in with
-`ZvecGrep::enable_read_session_cache()`; `close()` retires the cache while
-in-flight queries retain their handles until completion.
-
-Native open and close run under a per-workspace slot; the cache map lock only
-manages entries, so a cold open or retirement cannot block another workspace's
-cache hit.
-
-Workspace reads and writes queue asynchronously. A cross-process writer-intent
-lock prevents new reads from overtaking waiting writers while active readers
-drain. Writers then retire cached handles before opening writable storage.
-`ContextOptions::lock_timeout_ms` and `IndexOptions::lock_timeout_ms` bound lock
-waits (30 seconds by default), including idle-cache draining; their cancellation
-tokens interrupt waiting. Cache maintenance checks for writers every 50 milliseconds,
-independently of the async executor. Cancelled, timed-out and aborted waiters
-release admission without leaving pending writer markers.
-
-Within one engine, queries using `Off` or `Background` refresh may borrow an active
-incremental writer when the effective model configuration matches (including
-credentials, endpoint, device and model cache). Borrowed queries keep storage,
-models and the home lock alive; publication waits for them to finish. `Wait` and
-legacy synchronous auto-update queries never borrow partial writer state. A
-rebuild's unpublished generation remains private. The daemon preserves the refresh
-policy when invoking the engine and also bounds cancellable waits for scheduled jobs.
 
 The native engine supports indexing, indexed FTS and vector search, `zg query
 --rg`, workspace discovery, `info`, and idempotent `drop_index`.
@@ -169,30 +134,6 @@ Cancelling the originating request also sends a cancellation notification for it
 pending consent form; clients control how that notification is presented.
 
 ## MCP request lifecycle
-
-Search accepts `preview: "short"` (the default) or `preview: "full"` in both
-toolsets. Short preview shows up to ten source lines around the matched range
-and seven available outline lines. Full preview preserves all available source
-and outline content of each retrieved item; it neither reads whole files nor
-changes retrieval or ranking. Responses include query groups, selection reasons,
-matched ranges, source line numbers, and available code or Markdown metadata.
-The current engine supplies source snapshots without generated outlines; the
-optional outline is displayed only when provided with a result.
-
-The engine provides `content_range` for the exact source coordinates of returned
-content, independently of the entity `range` and matched `excerpt_range`. CLI and
-MCP use these coordinates for source numbering; preview never infers a range from
-the number of content lines. The engine also interprets half-open line bounds.
-The required field changes the internal daemon reply contract (version 12).
-Restart older resident daemons when updating the CLI; replies without
-`content_range` are rejected during deserialization. Direct and server rendering
-consume the same engine contract.
-
-Public search reports `freshness: fresh` or `freshness: possibly_stale`.
-`results: served_from_current_index` describes where results came from, with
-`background_refresh` reported separately. A provider that only reports current
-index provenance without verified freshness is conservatively shown as
-`possibly_stale`; a successful waited refresh reports `fresh`.
 
 Both HTTP and stdio expose the same tools. Search accepts `device`; index accepts
 `debug: true` to return completed statistics, timings and at most 100 skipped files.

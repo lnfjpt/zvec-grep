@@ -11,15 +11,13 @@ use crate::{
     domain::{IndexState, model::ModelConfig},
     models::{ModelError, ModelRuntimeLease, ModelRuntimeManager, ModelRuntimeRequest},
     pipelines::indexing::service::{
-        WorkspaceIndexService, assert_embedding_compatible, environment_api_key, is_indexed,
+        WorkspaceIndexService, assert_embedding_compatible, assert_index_version,
+        environment_api_key, is_indexed,
     },
-    storage::{
-        IndexStore,
-        read_session::{ReadSessionCache, ReadSessionLease},
-    },
+    storage::spi::WorkspaceIndexStorageOptions,
     workspace::{
         layout::find_nearest_workspace,
-        lock::{LockWait, try_home_read},
+        lock::{LockMode, acquire_home_lock},
         manifest::{WorkspaceManifest, read_workspace_manifest},
     },
 };
@@ -33,10 +31,7 @@ pub(crate) async fn context(
     indexing: &WorkspaceIndexService,
     models: &ModelRuntimeManager,
     options: &ContextOptions,
-    read_sessions: Option<&ReadSessionCache>,
 ) -> Result<ContextResult, EngineError> {
-    let wait = LockWait::new(options.signal.as_ref(), options.lock_timeout_ms)?;
-    wait.check_cancelled()?;
     let requested_root =
         std::path::absolute(options.root.as_deref().unwrap_or_else(|| Path::new(".")))
             .map_err(|error| EngineError::from_io("failed to resolve workspace root", &error))?;
@@ -47,10 +42,11 @@ pub(crate) async fn context(
             "no workspace manifest was found",
         ));
     };
+    let factory = indexing.storage_factory();
     let initial_manifest = read_workspace_manifest(&location.home)?;
     if !initial_manifest
         .as_ref()
-        .map(|manifest| IndexStore::exists(&manifest.storage_home()))
+        .map(|manifest| factory.exists(&manifest.storage_home()))
         .transpose()?
         .unwrap_or(false)
     {
@@ -61,28 +57,13 @@ pub(crate) async fn context(
     }
     if options.refresh.map_or(options.auto_update, |policy| {
         policy == crate::api::context::options::RefreshPolicy::Wait
-    }) && indexing.workspace_needs_refresh(&location, &wait).await?
+    }) && indexing.workspace_needs_refresh(&location, factory).await?
     {
         indexing
             .index(models, refresh_options(options, location.root.clone()))
             .await?;
     }
-    let allows_writer = options.refresh.map_or(!options.auto_update, |policy| {
-        policy != crate::api::context::options::RefreshPolicy::Wait
-    });
-    let _lock = loop {
-        wait.check_cancelled()?;
-        if allows_writer
-            && let Some(result) =
-                try_writer_context(indexing, models, &location, options, &request).await?
-        {
-            return Ok(result);
-        }
-        if let Some(lock) = try_home_read(&location.home, "context")? {
-            break lock;
-        }
-        wait.retry(&location.home, "context").await?;
-    };
+    let _lock = acquire_home_lock(&location.home, LockMode::Read, "context")?;
     let mut manifest = read_workspace_manifest(&location.home)?.ok_or_else(|| {
         workspace_index_unavailable(&location.root, "workspace manifest disappeared")
     })?;
@@ -99,124 +80,23 @@ pub(crate) async fn context(
             "workspace index has not been built",
         ));
     }
-    let acquired = query_models(models, &manifest, options, &location.root, &request)?;
-    let storage = match read_sessions {
-        Some(cache) => cache.acquire(&location.home, &manifest.storage_home())?,
-        None => ReadSessionLease::open(&manifest.storage_home())?,
-    };
-    let result = query_storage(
-        &acquired,
-        &location.root,
-        &manifest,
-        storage.storage(),
-        options,
-        &request,
-    )
-    .await;
-    let close = storage.close();
-    let result = result?;
-    close?;
-    Ok(result)
-}
-
-async fn try_writer_context(
-    indexing: &WorkspaceIndexService,
-    models: &ModelRuntimeManager,
-    location: &crate::workspace::layout::WorkspaceIndexLocation,
-    options: &ContextOptions,
-    request: &super::context::NormalizedContextRequest,
-) -> Result<Option<ContextResult>, EngineError> {
-    let Some(active) = read_workspace_manifest(&location.home)? else {
-        return Ok(None);
-    };
-    if !is_indexed(&active) {
-        return Ok(None);
-    }
-    let Some(writer) = indexing
-        .writers
-        .borrow(&location.home, &active.storage_home())
-    else {
-        return Ok(None);
-    };
-    let manifest = &writer.session.manifest;
-    let schema = manifest.embedding().ok_or_else(|| {
-        workspace_index_unavailable(&location.root, "writer model information is missing")
-    })?;
-    let model_request = search_model_request(
-        manifest,
-        schema,
-        options.embedding_concurrency,
-        options,
-        &location.root,
-        uses_vectors(request),
-    )?;
-    if !writer
-        .session
-        .models
-        .first()
-        .is_some_and(|model| model.matches_request(&model_request))
-    {
-        return Ok(None);
-    }
-    // Use the exact configuration that passed the writer-key check, including
-    // authorization, rather than resolving mutable configuration a second time.
-    let acquired = if uses_vectors(request) {
-        let model = models
-            .acquire(model_request)
-            .map_err(ModelError::into_engine_error)?;
-        assert_embedding_compatible(Some(manifest), &model)?;
-        vec![model]
-    } else {
-        Vec::new()
-    };
-    query_storage(
-        &acquired,
-        &location.root,
-        manifest,
-        &writer.session.storage,
-        options,
-        request,
-    )
-    .await
-    .map(Some)
-}
-
-fn uses_vectors(request: &super::context::NormalizedContextRequest) -> bool {
-    request
+    assert_index_version(manifest.index_version)?;
+    let mut acquired = Vec::new();
+    if request
         .routes
         .iter()
         .any(|route| route.mode == crate::api::context::options::ContextRouteMode::Vector)
-}
-
-fn query_models(
-    models: &ModelRuntimeManager,
-    manifest: &WorkspaceManifest,
-    options: &ContextOptions,
-    root: &Path,
-    request: &super::context::NormalizedContextRequest,
-) -> Result<Vec<ModelRuntimeLease>, EngineError> {
-    if !uses_vectors(request) {
-        return Ok(Vec::new());
+    {
+        let model = acquire_search_model(
+            models,
+            &manifest,
+            options.embedding_concurrency,
+            options,
+            &location.root,
+        )?;
+        assert_embedding_compatible(Some(&manifest), &model)?;
+        acquired.push(model);
     }
-    let model = acquire_search_model(
-        models,
-        manifest,
-        options.embedding_concurrency,
-        options,
-        root,
-    )?;
-    assert_embedding_compatible(Some(manifest), &model)?;
-    Ok(vec![model])
-}
-
-async fn query_storage(
-    acquired: &[ModelRuntimeLease],
-    root: &Path,
-    manifest: &WorkspaceManifest,
-    storage: &IndexStore,
-    options: &ContextOptions,
-    request: &super::context::NormalizedContextRequest,
-) -> Result<ContextResult, EngineError> {
     let runtimes = acquired
         .iter()
         .map(|model| RequestEmbeddingRuntime {
@@ -228,16 +108,23 @@ async fn query_storage(
         .iter()
         .map(|runtime| runtime as &dyn SearchEmbeddingRuntime)
         .collect::<Vec<_>>();
-    context_from_index(
-        root,
+    let storage = factory.open(WorkspaceIndexStorageOptions::ReadOnly {
+        storage_path: manifest.storage_home(),
+    })?;
+    let result = context_from_index(
+        &location.root,
         &manifest.workspace,
         &manifest.path,
-        storage,
+        storage.as_ref(),
         &embedding_models,
         options,
-        request,
+        &request,
     )
-    .await
+    .await;
+    let close = storage.close();
+    let result = result?;
+    close?;
+    Ok(result)
 }
 
 pub(in crate::pipelines) fn refresh_options(
@@ -255,7 +142,6 @@ pub(in crate::pipelines) fn refresh_options(
         api_key: options.api_key.clone(),
         endpoint: options.endpoint.clone(),
         embedding_concurrency: options.embedding_concurrency,
-        lock_timeout_ms: options.lock_timeout_ms,
         device: options.device,
         model_cache: options.model_cache.clone(),
         ..IndexOptions::default()
@@ -290,26 +176,6 @@ fn acquire_search_model_for(
     options: &ContextOptions,
     root: &Path,
 ) -> Result<ModelRuntimeLease, EngineError> {
-    models
-        .acquire(search_model_request(
-            manifest,
-            schema,
-            embedding_concurrency,
-            options,
-            root,
-            true,
-        )?)
-        .map_err(ModelError::into_engine_error)
-}
-
-fn search_model_request(
-    manifest: &WorkspaceManifest,
-    schema: &crate::domain::EmbeddingModelInfo,
-    embedding_concurrency: Option<usize>,
-    options: &ContextOptions,
-    root: &Path,
-    authorize: bool,
-) -> Result<ModelRuntimeRequest, EngineError> {
     let reference = schema.model.reference();
     if options
         .authorization_model
@@ -339,49 +205,54 @@ fn search_model_request(
             &reference,
             options.endpoint.as_deref().or(runtime.endpoint.as_deref()),
         )?;
-        if authorize {
-            crate::authorization::require_with_targets(
-                root,
-                &reference,
-                &endpoint,
-                options.allow_remote,
-                &options.authorized_remote,
-            )?;
-        }
+        crate::authorization::require_with_targets(
+            root,
+            &reference,
+            &endpoint,
+            options.allow_remote,
+            &options.authorized_remote,
+        )?;
         Some(endpoint)
     };
-    Ok(ModelRuntimeRequest::new(
-        reference.clone(),
-        ModelConfig {
-            api_key: (!local)
-                .then(|| {
-                    options
-                        .api_key
-                        .clone()
-                        .or_else(|| runtime.api_key.clone())
-                        .or_else(|| {
-                            crate::config::string(
-                                &config,
-                                &["providers", &schema.model.provider, "apiKey"],
-                            )
-                        })
-                        .or_else(environment_api_key)
-                })
-                .flatten(),
-            endpoint,
-            device: if local {
-                crate::config::runtime_device(&config, &reference, options.device, runtime.device)?
-            } else {
-                None
+    models
+        .acquire(ModelRuntimeRequest::new(
+            reference.clone(),
+            ModelConfig {
+                api_key: (!local)
+                    .then(|| {
+                        options
+                            .api_key
+                            .clone()
+                            .or_else(|| runtime.api_key.clone())
+                            .or_else(|| {
+                                crate::config::string(
+                                    &config,
+                                    &["providers", &schema.model.provider, "apiKey"],
+                                )
+                            })
+                            .or_else(environment_api_key)
+                    })
+                    .flatten(),
+                endpoint,
+                device: if local {
+                    crate::config::runtime_device(
+                        &config,
+                        &reference,
+                        options.device,
+                        runtime.device,
+                    )?
+                } else {
+                    None
+                },
+                cache_dir: crate::config::model_cache(
+                    &config,
+                    options.model_cache.clone(),
+                    runtime.cache_dir.clone(),
+                ),
             },
-            cache_dir: crate::config::model_cache(
-                &config,
-                options.model_cache.clone(),
-                runtime.cache_dir.clone(),
-            ),
-        },
-        embedding_concurrency,
-    ))
+            embedding_concurrency,
+        ))
+        .map_err(ModelError::into_engine_error)
 }
 
 #[track_caller]

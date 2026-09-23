@@ -9,7 +9,7 @@ mod source;
 mod workspace;
 
 // Entities.
-pub(crate) use entity::{Entity, EntityFragment, EntityId, FragmentId};
+pub(crate) use entity::{Entity, EntityFragment, EntityId, FragmentId, validate_entities};
 
 // Glob rules.
 pub use glob::GlobRule;
@@ -17,9 +17,6 @@ pub use glob::GlobRule;
 // Metadata.
 pub(crate) use metadata::IndexField;
 pub use metadata::{CodeMetadata, EntityMetadata, MarkdownMetadata, SymbolType};
-// Language and Visibility have no consumers yet.
-#[allow(unused_imports)]
-pub use metadata::{Language, Visibility};
 
 // Graph extraction contracts. The walk-time collectors and the persistence
 // layer are still pending, so most types have no consumers yet.

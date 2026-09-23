@@ -8,7 +8,6 @@ mod resolution;
 mod spi;
 
 // Runtime and artifact management.
-mod artifact_downloader;
 mod artifacts;
 mod compute;
 mod download_progress;
@@ -72,10 +71,6 @@ impl runtime::ModelRuntimeRequest {
 }
 
 impl runtime::ModelRuntimeLease {
-    pub(crate) fn matches_request(&self, request: &ModelRuntimeRequest) -> bool {
-        self.matches_request_impl(request)
-    }
-
     pub(crate) fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
         self.concurrency_defaults_impl()
     }

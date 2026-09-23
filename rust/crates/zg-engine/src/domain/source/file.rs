@@ -30,7 +30,6 @@ pub(crate) enum FileIndexStatus {
         indexed_epoch_ms: u64,
         entity_count: u64,
     },
-    Deleting,
     Failed {
         error: String,
     },
@@ -46,21 +45,21 @@ impl FileIndexStatus {
             Self::Indexed {
                 indexed_epoch_ms, ..
             } => Some(*indexed_epoch_ms),
-            Self::NotIndexed | Self::Deleting | Self::Failed { .. } => None,
+            Self::NotIndexed | Self::Failed { .. } => None,
         }
     }
 
     pub(crate) const fn entity_count(&self) -> u64 {
         match self {
             Self::Indexed { entity_count, .. } => *entity_count,
-            Self::NotIndexed | Self::Deleting | Self::Failed { .. } => 0,
+            Self::NotIndexed | Self::Failed { .. } => 0,
         }
     }
 
     pub(crate) fn error(&self) -> Option<&str> {
         match self {
             Self::Failed { error } => Some(error),
-            Self::NotIndexed | Self::Indexed { .. } | Self::Deleting => None,
+            Self::NotIndexed | Self::Indexed { .. } => None,
         }
     }
 }

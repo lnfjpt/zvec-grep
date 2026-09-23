@@ -89,7 +89,6 @@ Important inputs:
 | `vector` | Semantic-only query groups |
 | `fuse` | Combine every group into one ranked plan |
 | `limit` | Maximum items per group, up to 50 |
-| `preview` | `short` (default) for bounded snippets, or `full` for all available retrieved-item content; affects display only |
 | `globs` / `insensitiveGlobs` | Ordered path rules |
 | `fileTypes` / `excludedFileTypes` | ripgrep file-type filters |
 | `symbolTypes` / `preferSymbol` | Indexed symbol controls |
@@ -97,13 +96,7 @@ Important inputs:
 | `freshness` | `eventual` or `wait_for_fresh` |
 | `autoUpdate` | Allow an eventual search to schedule a background update |
 
-`preview: "full"` preserves all available source lines and line lengths of each
-retrieved item, plus its available outline. It does not read the entire file,
-change retrieval or ranking, or recover content omitted during extraction.
-Both the default `agent` and compatibility `full` toolsets accept this parameter;
-the preview value is independent of the toolset name.
-
-The response is text designed for agent context. It begins with index
+The response is compact text designed for agent context. It begins with index
 state and then groups ranked results by file:
 
 ```text

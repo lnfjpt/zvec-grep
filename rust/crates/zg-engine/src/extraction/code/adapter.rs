@@ -44,6 +44,7 @@ const CPP: LanguageAdapter = LanguageAdapter {
         "function_definition",
         "macro_type_specifier",
         "class_specifier",
+        "namespace_definition",
         "struct_specifier",
         "union_specifier",
         "enum_specifier",

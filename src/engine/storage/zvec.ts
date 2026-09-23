@@ -108,34 +108,24 @@ class ZvecWorkspaceIndexStorage implements WorkspaceIndexStorage {
     }
 
     this.files = new ZvecFileMetaStore(paths.filesPath, readOnly);
-    try {
-      for (const file of this.files.list()) {
-        this.rememberFile(file);
-      }
+    for (const file of this.files.list()) {
+      this.rememberFile(file);
+    }
 
-      const zvecPath = paths.indexPath;
-      if (existsSync(zvecPath)) {
-        this.collection = openZvecCollection(zvecPath, readOnly, "open", () =>
-          ZVecOpen(zvecPath, { readOnly }),
-        );
-      } else if (readOnly) {
-        throw new EngineError("zvec collection storage does not exist", {
-          code: "ZVEC_GREP.ENGINE.STORAGE.ZVEC_COLLECTION_MISSING",
-          context: `path=${zvecPath}`,
-        });
-      } else {
-        this.collection = openZvecCollection(zvecPath, readOnly, "create", () =>
-          ZVecCreateAndOpen(zvecPath, createSchema(options.embedding)),
-        );
-      }
-    } catch (error) {
-      // Opening the entity collection can fail after metadata acquired its lock.
-      try {
-        this.files.close();
-      } catch {
-        // Preserve the initialization error after attempting cleanup.
-      }
-      throw error;
+    const zvecPath = paths.indexPath;
+    if (existsSync(zvecPath)) {
+      this.collection = openZvecCollection(zvecPath, readOnly, "open", () =>
+        ZVecOpen(zvecPath, { readOnly }),
+      );
+    } else if (readOnly) {
+      throw new EngineError("zvec collection storage does not exist", {
+        code: "ZVEC_GREP.ENGINE.STORAGE.ZVEC_COLLECTION_MISSING",
+        context: `path=${zvecPath}`,
+      });
+    } else {
+      this.collection = openZvecCollection(zvecPath, readOnly, "create", () =>
+        ZVecCreateAndOpen(zvecPath, createSchema(options.embedding)),
+      );
     }
   }
 
@@ -340,16 +330,16 @@ class ZvecWorkspaceIndexStorage implements WorkspaceIndexStorage {
       await this.collection.optimize();
       this.needsOptimize = false;
     }
-    await this.files.finalizeWrites();
   }
 
   close(): void {
-    // Cleanup must release both stores without retrying a failed optimization.
-    try {
-      this.files.close();
-    } finally {
-      this.collection.closeSync();
+    if (this.needsOptimize) {
+      this.collection.optimizeSync();
+      this.needsOptimize = false;
     }
+
+    this.files.close();
+    this.collection.closeSync();
   }
 
   private fetchStoredEntities(ids: readonly string[]): StoredEntity[] {
@@ -529,15 +519,12 @@ class ZvecFileMetaStore {
     this.needsOptimize = true;
   }
 
-  async finalizeWrites(): Promise<void> {
-    this.assertWritable("finalizeWrites");
+  close(): void {
     if (this.needsOptimize) {
-      await this.collection.optimize();
+      this.collection.optimizeSync();
       this.needsOptimize = false;
     }
-  }
 
-  close(): void {
     this.collection.closeSync();
   }
 

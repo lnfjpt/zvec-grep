@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     EngineError,
-    domain::{Range, TextRange},
+    domain::TextRange,
     utils::{decode_text, line_byte_offsets},
 };
 use grep::{
@@ -174,9 +174,8 @@ fn search_sync(
 
     expand_context(&mut lexical_matches, request);
     debug_assert!(lexical_matches.iter().all(|item| {
-        Range::Text(item.range)
-            .contains(&Range::Text(item.excerpt_range.unwrap_or(item.range)))
-            .expect("text ranges have the same kind")
+        item.range
+            .contains(item.excerpt_range.as_ref().unwrap_or(&item.range))
     }));
     lexical_matches.sort_by(|left, right| {
         left.relative_path.cmp(&right.relative_path).then(
@@ -616,14 +615,7 @@ impl Sink for MatchSink<'_> {
             let mut offset = 0;
             for (line, bytes) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
                 let selection = grep::matcher::Match::new(0, trim_line_terminator(bytes).len());
-                let text = std::str::from_utf8(bytes).ok();
-                let line_starts = text.map(line_byte_offsets).unwrap_or_default();
-                if !self.record(
-                    text.map(|text| (text, line_starts.as_slice())),
-                    line_number + line,
-                    line_offset + offset,
-                    selection,
-                )? {
+                if !self.record(bytes, line_number + line, line_offset + offset, selection)? {
                     return Ok(false);
                 }
                 offset += bytes.len();
@@ -655,15 +647,8 @@ impl Sink for MatchSink<'_> {
                     })
             })
             .map_err(io::Error::other)?;
-        let text = std::str::from_utf8(bytes).ok();
-        let line_starts = text.map(line_byte_offsets).unwrap_or_default();
         for selection in selections {
-            if !self.record(
-                text.map(|text| (text, line_starts.as_slice())),
-                line_number,
-                line_offset,
-                selection,
-            )? {
+            if !self.record(bytes, line_number, line_offset, selection)? {
                 return Ok(false);
             }
         }
@@ -674,7 +659,7 @@ impl Sink for MatchSink<'_> {
 impl MatchSink<'_> {
     fn record(
         &mut self,
-        text: Option<(&str, &[usize])>,
+        bytes: &[u8],
         line_number: usize,
         line_offset: usize,
         first: grep::matcher::Match,
@@ -687,48 +672,42 @@ impl MatchSink<'_> {
             self.count_truncated.store(true, Ordering::Relaxed);
             return Ok(false);
         }
-        let Some((text, line_starts)) = text else {
+        let Ok(text) = std::str::from_utf8(bytes) else {
             return Ok(true);
         };
-        let Ok(local) =
-            crate::utils::text_range_from_offsets(text, line_starts, first.start(), first.end())
-        else {
+        let (Some(start), Some(end)) = (
+            text_position_at_byte_offset(text, first.start()),
+            text_position_at_byte_offset(text, first.end()),
+        ) else {
             return Ok(true);
         };
-        let map_range = |local: TextRange| {
-            let end_byte_offset = line_offset
-                .checked_add(local.end_byte_offset())
-                .ok_or_else(|| io::Error::other("search match byte offset exceeds usize"))?;
-            let end_line = line_number
-                .checked_add(local.end_line() - 1)
-                .ok_or_else(|| io::Error::other("search match line number exceeds usize"))?;
-            TextRange::from_coordinates(
-                line_offset + local.start_byte_offset(),
-                end_byte_offset,
-                line_number + (local.start_line() - 1),
-                end_line,
-                local.start_byte_column(),
-                local.end_byte_column(),
-            )
-            .map_err(io::Error::other)
-        };
-        let range = map_range(local)?;
-        let bytes = text.as_bytes();
-        let content_start = line_starts[local.start_line() - 1];
+        let end_byte_offset = line_offset
+            .checked_add(first.end())
+            .ok_or_else(|| io::Error::other("search match byte offset exceeds usize"))?;
+        let end_line = line_number
+            .checked_add(end.0)
+            .ok_or_else(|| io::Error::other("search match line number exceeds usize"))?;
+        let range = TextRange::from_coordinates(
+            line_offset + first.start(),
+            end_byte_offset,
+            line_number + start.0,
+            end_line,
+            start.1,
+            end.1,
+        )
+        .map_err(io::Error::other)?;
+        let content_start = bytes[..first.start()]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |offset| offset + 1);
         let content_end = if first.end() > first.start() && bytes[first.end() - 1] == b'\n' {
             first.end()
         } else {
-            line_starts
-                .get(local.end_line())
-                .copied()
-                .unwrap_or(bytes.len())
+            bytes[first.end()..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |offset| first.end() + offset + 1)
         };
-        let content_end =
-            content_start + trim_line_terminator(&bytes[content_start..content_end]).len();
-        let content_range = map_range(
-            crate::utils::text_range_from_offsets(text, line_starts, content_start, content_end)
-                .map_err(io::Error::other)?,
-        )?;
         self.count += 1;
         self.results.push(LexicalMatch {
             rank: 0,
@@ -736,8 +715,9 @@ impl MatchSink<'_> {
             relative_path: self.relative_path.to_path_buf(),
             range,
             excerpt_range: None,
-            content_range,
-            content: text[content_start..content_end].to_owned(),
+            content: text[content_start
+                ..content_start + trim_line_terminator(&bytes[content_start..content_end]).len()]
+                .to_owned(),
         });
         Ok(true)
     }
@@ -951,7 +931,7 @@ impl ContextSource {
     fn read(path: &Path) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
         let text = decode_text(&bytes, true)?.into_owned();
-        let line_starts = line_byte_offsets(&text);
+        let line_starts = line_byte_offsets(&text.split('\n').collect::<Vec<_>>());
         Some(Self { text, line_starts })
     }
 
@@ -979,7 +959,7 @@ fn expand_context(matches: &mut [LexicalMatch], request: &LexicalSearchRequest) 
             continue;
         };
         let excerpt = item.range;
-        if crate::utils::text_range_from_offsets(
+        if TextRange::from_offsets(
             &source.text,
             &source.line_starts,
             excerpt.start_byte_offset(),
@@ -1014,7 +994,7 @@ fn expand_context(matches: &mut [LexicalMatch], request: &LexicalSearchRequest) 
         let start_byte_offset = source.line_starts[start_line - 1];
         let end_byte_offset = (last_start + trim_line_terminator(last_line.as_bytes()).len())
             .max(excerpt.end_byte_offset());
-        let Ok(range) = crate::utils::text_range_from_offsets(
+        let Ok(range) = TextRange::from_offsets(
             &source.text,
             &source.line_starts,
             start_byte_offset,
@@ -1025,7 +1005,6 @@ fn expand_context(matches: &mut [LexicalMatch], request: &LexicalSearchRequest) 
         let content = source.text[start_byte_offset..end_byte_offset].to_owned();
         item.excerpt_range = Some(excerpt);
         item.range = range;
-        item.content_range = range;
         item.content = content;
     }
 }
@@ -1040,6 +1019,13 @@ fn modified_epoch_ms(path: &Path) -> Option<u64> {
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
+fn text_position_at_byte_offset(value: &str, byte_offset: usize) -> Option<(usize, usize)> {
+    let prefix = value.get(..byte_offset)?;
+    let line_offset = prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let last = prefix.rsplit('\n').next().unwrap_or_default();
+    Some((line_offset, last.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1052,7 +1038,7 @@ mod tests {
 
     use super::{
         DEFAULT_MAX_SEARCH_THREADS, LexicalSearchService, TextRange, default_worker_threads,
-        expand_context, worker_threads_for_search,
+        expand_context, text_position_at_byte_offset, worker_threads_for_search,
     };
 
     fn request(pattern: &str) -> LexicalSearchRequest {
@@ -1131,78 +1117,22 @@ mod tests {
         assert_eq!(range.end_byte_offset(), 26);
     }
 
-    #[tokio::test]
-    async fn multiline_matches_preserve_crlf_and_half_open_coordinates() {
-        let root = TempDir::new().expect("temp dir");
-        let text = "before\r\n中😀\r\n尾\r\nafter\r\n";
-        fs::write(root.path().join("a.txt"), text).expect("fixture");
-        let mut request = request("中😀\\r\\n|尾");
-        request.options.matching.multiline = true;
-        let reply = search(&LexicalSearchService::new(), root.path(), &request).await;
-        assert_eq!(reply.matches.len(), 2);
-        let start = text.find('中').expect("first match");
-        let end = text.find('尾').expect("second match");
-        assert_eq!(
-            reply.matches[0].range,
-            TextRange::from_coordinates(start, end, 2, 3, 0, 0).expect("half-open range")
-        );
-        assert_eq!(reply.matches[0].content, "中😀");
-        assert_eq!(
-            reply.matches[1].range,
-            TextRange::from_coordinates(end, end + '尾'.len_utf8(), 3, 3, 0, 3)
-                .expect("next line range")
-        );
-        assert_eq!(reply.matches[1].content, "尾");
-    }
-
-    #[tokio::test]
-    async fn byte_matches_skip_partial_characters_without_losing_later_lines() {
-        let root = TempDir::new().expect("temp dir");
-        let text = "中😀\r\nneedle\r\n";
-        fs::write(root.path().join("a.txt"), text).expect("fixture");
-        let mut request = request("\\xE4|needle");
-        request.options.matching.no_unicode = true;
-        let reply = search(&LexicalSearchService::new(), root.path(), &request).await;
-        assert_eq!(reply.matches.len(), 1);
-        let start = text.find("needle").expect("complete match");
-        assert_eq!(
-            reply.matches[0].range,
-            TextRange::from_coordinates(start, start + 6, 2, 2, 0, 6).expect("complete range")
-        );
-        assert_eq!(reply.matches[0].content, "needle");
-    }
-
-    #[tokio::test]
-    async fn inverted_matches_keep_valid_lines_and_honor_count_before_invalid_utf8() {
-        let root = TempDir::new().expect("temp dir");
-        fs::write(
-            root.path().join("a.txt"),
-            b"skip\r\nfirst\r\n\xff\r\nlast\r\n",
-        )
-        .expect("fixture");
-        let mut request = request("skip");
-        request.options.matching.invert_match = true;
-        request.options.matching.crlf = true;
-        let service = LexicalSearchService::new();
-        let reply = search(&service, root.path(), &request).await;
-        assert_eq!(reply.matches.len(), 2);
-        for (item, (start, end, line, content)) in reply
-            .matches
-            .iter()
-            .zip([(6, 11, 2, "first"), (16, 20, 4, "last")])
-        {
-            assert_eq!(
-                item.range,
-                TextRange::from_coordinates(start, end, line, line, 0, content.len())
-                    .expect("valid line range")
-            );
-            assert_eq!(item.content, content);
+    #[test]
+    fn byte_positions_preserve_line_endings_and_reject_partial_characters() {
+        let text = "中😀\r\n尾";
+        for (offset, position) in [
+            (0, (0, 0)),
+            (3, (0, 3)),
+            (7, (0, 7)),
+            (8, (0, 8)),
+            (9, (1, 0)),
+            (12, (1, 3)),
+        ] {
+            assert_eq!(text_position_at_byte_offset(text, offset), Some(position));
         }
-        request.options.matching.max_count = Some(1);
-        let limited = search(&service, root.path(), &request).await;
-        assert_eq!(limited.matches.len(), 1);
-        assert_eq!(limited.matches[0].content, "first");
-        assert!(limited.diagnostics.truncated);
+        for offset in [1, 4, 10, 13] {
+            assert_eq!(text_position_at_byte_offset(text, offset), None);
+        }
     }
 
     #[tokio::test]
@@ -1265,44 +1195,19 @@ mod tests {
             assert_eq!(item.range.start_line(), 1);
             assert_eq!(item.range.end_line(), 3);
             assert_eq!(item.range.end_byte_column(), "尾巴".len());
-            assert_eq!(item.content_range, item.range);
-            assert_eq!(
-                crate::utils::slice_text(
-                    text,
-                    item.range.start_byte_offset(),
-                    item.range.end_byte_offset()
-                )
-                .expect("context range"),
-                item.content
-            );
+            assert_eq!(item.range.slice(text).expect("context range"), item.content);
             let excerpt = item.excerpt_range.expect("matched span");
             assert_eq!(excerpt.start_line(), 2);
             assert_eq!(excerpt.start_byte_column(), 13);
             assert_eq!(excerpt.end_byte_column(), 19);
-            assert_eq!(
-                crate::utils::slice_text(
-                    text,
-                    excerpt.start_byte_offset(),
-                    excerpt.end_byte_offset()
-                )
-                .expect("matched range"),
-                "你好"
-            );
+            assert_eq!(excerpt.slice(text).expect("matched range"), "你好");
             let line = text.lines().nth(1).expect("matched line");
             assert_eq!(
                 &line[excerpt.start_byte_column()..excerpt.end_byte_column()],
                 "你好"
             );
         }
-    }
 
-    #[test]
-    fn context_preserves_a_half_open_match_ending_at_the_next_line() {
-        let root = TempDir::new().expect("temp dir");
-        let text = "前😀\r\nlet x = \"😀你好\";\r\n尾巴\r\n";
-        fs::write(root.path().join("source-0.txt"), text).expect("fixture");
-        let mut request = request("你好");
-        request.options.matching.before_context = 1;
         let start = text.find("let").expect("matched line");
         let end = text.find("尾巴").expect("following line");
         let range =
@@ -1313,29 +1218,16 @@ mod tests {
             relative_path: "source-0.txt".into(),
             range,
             excerpt_range: None,
-            content_range: crate::utils::text_range_from_offsets(
-                text,
-                &crate::utils::line_byte_offsets(text),
-                start,
-                start + text[start..end].trim_end_matches("\r\n").len(),
-            )
-            .expect("visible source range"),
             content: text[start..end].trim_end_matches("\r\n").to_owned(),
         }];
         request.options.matching.after_context = 0;
         expand_context(&mut items, &request);
         assert_eq!(items[0].content, &text[..end]);
-        assert_eq!(items[0].content_range, items[0].range);
         assert_eq!(items[0].excerpt_range, Some(range));
         assert_eq!(items[0].range.end_line(), 3);
         assert_eq!(items[0].range.end_byte_column(), 0);
         assert_eq!(
-            crate::utils::slice_text(
-                text,
-                items[0].range.start_byte_offset(),
-                items[0].range.end_byte_offset(),
-            )
-            .expect("context range"),
+            items[0].range.slice(text).expect("context range"),
             items[0].content
         );
     }

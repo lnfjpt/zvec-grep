@@ -4,8 +4,6 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - "rust/**"
-      - ".github/workflows/rust-ci.yml"
       - "**/*.md"
       - ".github/assets/**"
       - "LICENSE"
@@ -13,8 +11,6 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
     paths-ignore:
-      - "rust/**"
-      - ".github/workflows/rust-ci.yml"
       - "**/*.md"
       - ".github/assets/**"
       - "LICENSE"

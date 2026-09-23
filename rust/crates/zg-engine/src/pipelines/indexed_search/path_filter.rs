@@ -1,20 +1,18 @@
 //! Compile path globs into storage predicates only when they preserve file-selection semantics.
 
-use super::storage::SearchStorage;
-
 use std::path::Path;
 
 use crate::{
     EngineError,
     domain::{GlobRule, SourcePath},
-    storage::types::StoragePathFilter,
+    storage::spi::{StoragePathFilter, WorkspaceIndexStorage},
 };
 
 pub(super) fn compile_path_filter(
     rules: &[GlobRule],
-    storage: &dyn SearchStorage,
+    storage: &dyn WorkspaceIndexStorage,
 ) -> Result<Option<StoragePathFilter>, EngineError> {
-    if rules.iter().any(|rule| rule.case_insensitive) {
+    if !storage.supports_path_filters() || rules.iter().any(|rule| rule.case_insensitive) {
         return Ok(None);
     }
     let mut includes = Vec::new();
