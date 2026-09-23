@@ -3,8 +3,8 @@
 #[cfg(test)]
 use super::TextSource;
 use super::{
-    ChunkOptions, ExtractedEntity, ExtractionOutput, Source, SourceKind, code, image,
-    markdown, text,
+    ChunkOptions, ExtractedEntity, ExtractionOutput, Source, SourceKind, code, image, markdown,
+    text,
 };
 use crate::{
     EngineError,
