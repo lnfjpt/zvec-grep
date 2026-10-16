@@ -315,6 +315,13 @@ impl WorkspaceIndexService {
             changes: &options.changes,
         })
         .await;
+        let result = result.and_then(|indexed| {
+            writer
+                .session
+                .storage
+                .with_resolution_session(super::graph_resolver::resolve_pending)?;
+            Ok(indexed)
+        });
         #[cfg(test)]
         let result = result.and_then(|indexed| {
             // Exercise service cleanup when the indexing pipeline reports a failed checkpoint.

@@ -53,7 +53,9 @@ impl IndexStore {
         );
         let shared = self.shared()?;
         validate_batch(file, entities, entries, &shared.schema)?;
-        self.write(|state| super::replace_file(state, file, entities, entries))
+        self.write(|state| {
+            super::replace_file(state, file, entities, entries, &FileGraph::default())
+        })
     }
 }
 
@@ -385,6 +387,7 @@ fn missing_or_invalid_graph_does_not_create_a_database_or_break_search() {
         .expect("write fixture");
     store.close().expect("close writer");
     let graph_path = temporary.path().join("graph/graph.sqlite");
+    fs::remove_file(&graph_path).expect("simulate legacy graph-less index");
     let reader = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
         storage_path: temporary.path().to_owned(),
     })
@@ -440,17 +443,22 @@ fn store_graph_reads_preserve_call_sites_and_share_the_storage_lifetime() {
     use crate::storage::graph::{EdgeKind, FileGraph, Metadata, Provenance};
 
     let temporary = tempfile::tempdir().expect("temporary storage");
-    metadata_store(temporary.path())
-        .close()
-        .expect("initialize index");
+    let store = metadata_store(temporary.path());
+    let (file, entities, entries) = metadata_fragments(0, "owner");
+    store
+        .apply_fixture_records(&file, &entities, &entries)
+        .expect("canonical endpoints");
+    let caller = format!("f{}", file.id.get());
+    let callee = entities[0].id.as_str().to_owned();
+    store.close().expect("initialize index");
     let graph_path = temporary.path().join("graph/graph.sqlite");
     let mut graph =
         SqliteGraphStorage::open(&graph_path, OpenMode::ReadWrite).expect("graph fixture");
     let edges = (1..=25)
         .map(|line| Edge {
             kind: EdgeKind::Calls,
-            source: "caller".into(),
-            target: "callee".into(),
+            source: caller.clone(),
+            target: callee.clone(),
             line: Some(line),
             column: Some(0),
             provenance: Provenance::FileLocal,
@@ -468,7 +476,7 @@ fn store_graph_reads_preserve_call_sites_and_share_the_storage_lifetime() {
             "fixture.rs",
             &FileGraph {
                 entities: Vec::new(),
-                entity_ids: vec!["caller".into(), "callee".into()],
+                entity_ids: vec![callee.clone()],
                 edges: persisted,
                 pending_refs: Vec::new(),
             },
@@ -484,19 +492,19 @@ fn store_graph_reads_preserve_call_sites_and_share_the_storage_lifetime() {
     reader.ensure_graph_available().expect("existing graph");
     assert_eq!(
         reader
-            .neighborhood("callee", Direction::In, Some(&[EdgeKind::Calls]))
+            .neighborhood(&callee, Direction::In, Some(&[EdgeKind::Calls]))
             .expect("all callers"),
         edges
     );
     assert_eq!(
         reader
-            .neighborhood("caller", Direction::Out, Some(&[EdgeKind::Calls]))
+            .neighborhood(&caller, Direction::Out, Some(&[EdgeKind::Calls]))
             .expect("all callees"),
         edges
     );
     assert!(
         reader
-            .neighborhood("caller", Direction::In, Some(&[EdgeKind::Calls]))
+            .neighborhood(&caller, Direction::In, Some(&[EdgeKind::Calls]))
             .expect("direction")
             .is_empty()
     );
@@ -523,14 +531,14 @@ fn store_graph_reads_preserve_call_sites_and_share_the_storage_lifetime() {
     );
     assert_eq!(
         reader
-            .neighborhood("caller", Direction::Out, Some(&[EdgeKind::Calls]))
+            .neighborhood(&caller, Direction::Out, Some(&[EdgeKind::Calls]))
             .expect_err("closed graph query")
             .code(),
         EngineError::RESOURCE_CLOSED
     );
     assert_eq!(
         second
-            .neighborhood("callee", Direction::In, Some(&[EdgeKind::Calls]))
+            .neighborhood(&callee, Direction::In, Some(&[EdgeKind::Calls]))
             .expect("remaining lease"),
         edges
     );

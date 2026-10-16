@@ -90,6 +90,7 @@ impl SqliteGraphStorage {
             OpenMode::ReadWrite => {
                 schema::initialize(&mut connection)?;
                 connection.pragma_update(None, "journal_mode", "WAL")?;
+                connection.pragma_update(None, "synchronous", "FULL")?;
             }
         }
         Ok(Self { connection })
@@ -126,3 +127,9 @@ fn decode_metadata(value: &str) -> rusqlite::Result<Metadata> {
 
 #[cfg(test)]
 mod tests;
+
+impl FileGraph {
+    pub(crate) fn validate(&self, file_id: u32) -> Result<()> {
+        writer::validate(&format!("f{file_id}"), self, &[])
+    }
+}

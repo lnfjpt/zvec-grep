@@ -385,7 +385,7 @@ async fn exact_definitions_keep_scopes_order_and_per_symbol_limits() {
 }
 
 #[tokio::test]
-async fn callees_keep_repeated_sites_cross_file_edges_and_missing_descriptions() {
+async fn callees_keep_repeated_sites_and_cross_file_edges_but_omit_missing_endpoints() {
     let fixture = Fixture::new();
     let engine = ZvecGrep::new();
     let groups = engine
@@ -398,10 +398,10 @@ async fn callees_keep_repeated_sites_cross_file_edges_and_missing_descriptions()
     assert_eq!(groups.len(), 1);
     let group = &groups[0];
     assert_eq!(
-        group.total_edges, 50,
+        group.total_edges, 49,
         "pending and non-call edges are omitted"
     );
-    assert_eq!(group.edges.len(), 50);
+    assert_eq!(group.edges.len(), 49);
     assert_eq!(
         group
             .edges
@@ -424,13 +424,7 @@ async fn callees_keep_repeated_sites_cross_file_edges_and_missing_descriptions()
             .count(),
         23
     );
-    let missing = group
-        .edges
-        .iter()
-        .find(|edge| edge.line == Some(99))
-        .expect("missing endpoint retains its callsite");
-    assert!(missing.symbol.is_none());
-    assert!(serde_json::to_value(missing).expect("serialize edge")["symbol"].is_null());
+    assert!(group.edges.iter().all(|edge| edge.line != Some(99)));
     let remote = group
         .edges
         .iter()
@@ -602,4 +596,72 @@ async fn invalid_queries_fail_before_opening_a_workspace() {
     }
     assert!(!directory.path().join(".zvec-grep").exists());
     engine.close();
+}
+
+#[tokio::test]
+async fn unfinished_cross_file_endpoints_are_filtered_before_count_and_limit() {
+    for deleting in [false, true] {
+        let fixture = Fixture::new();
+        let home = fixture.graph_path.parent().unwrap().parent().unwrap();
+        let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+            storage_path: home.to_owned(),
+            embeddings: vec![schema()],
+        })
+        .expect("open writer");
+        let remote = store
+            .list_files()
+            .expect("files")
+            .into_iter()
+            .find(|file| file.relative_path.to_path_buf() == PathBuf::from("z.rs"))
+            .unwrap();
+        let database = rusqlite::Connection::open(&fixture.graph_path).expect("fault connection");
+        database.execute_batch("CREATE TRIGGER reject_graph_update BEFORE UPDATE ON edges BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").expect("inject failure");
+        let result = if deleting {
+            store.delete_file(remote.id)
+        } else {
+            store.replace_file(&remote, &[], &[])
+        };
+        assert!(result.is_err());
+        store.close().expect("retain unfinished state");
+        drop(database);
+        let groups = ZvecGrep::new()
+            .callees(RelationshipOptions {
+                limit: Some(100),
+                ..fixture.options("invoke")
+            })
+            .await
+            .expect("query surviving edges");
+        assert_eq!(groups[0].total_edges, 48);
+        assert_eq!(groups[0].edges.len(), 48);
+        assert!(
+            groups[0]
+                .edges
+                .iter()
+                .all(|edge| edge.line != Some(101) && edge.line != Some(99))
+        );
+        let groups = ZvecGrep::new()
+            .callers(fixture.options("run"))
+            .await
+            .expect("query visible definitions");
+        assert_eq!(
+            groups.len(),
+            2,
+            "unfinished definition must not become a query root"
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_endpoint_does_not_consume_the_last_result_slot() {
+    let fixture = Fixture::new();
+    let groups = ZvecGrep::new()
+        .callees(RelationshipOptions {
+            limit: Some(49),
+            ..fixture.options("invoke")
+        })
+        .await
+        .expect("limit after visibility filtering");
+    assert_eq!(groups[0].total_edges, 49);
+    assert_eq!(groups[0].edges.len(), 49);
+    assert!(groups[0].edges.iter().any(|edge| edge.line == Some(101)));
 }

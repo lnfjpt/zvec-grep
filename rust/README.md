@@ -224,6 +224,9 @@ Indexing persists relationships in `graph/graph.sqlite` under the active index
 generation. An older index without graph data must be rebuilt explicitly before
 relationship queries are available.
 
+After an indexing failure, run indexing again to retry unfinished files.
+Missing graph data does not prevent full-text or vector search.
+
 This version indexes text and code with one embedding model per workspace. Choose
 it with `zg --index --embedding <model>` or set a default with
 `zg --config model set <model> --default`. Code, documents and structured text use
