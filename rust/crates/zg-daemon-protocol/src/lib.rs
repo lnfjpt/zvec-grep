@@ -10,6 +10,7 @@ use zg_engine::api::{
     context::{ContextOptions, ContextResult},
     index::{IndexOptions, IndexResult, progress::IndexProgress},
     info::{InfoOptions, InfoResult},
+    relationships::{RelationshipOptions, SymbolRelationships},
 };
 
 pub const CURRENT_DAEMON_PROTOCOL_VERSION: u32 = 16;
@@ -77,6 +78,8 @@ pub struct ExecuteRequest {
 pub enum DaemonCommand {
     IndexSetup(zg_engine::api::index::setup::IndexSetupOptions),
     Context(ContextOptions),
+    Callers(RelationshipOptions),
+    Callees(RelationshipOptions),
     Index(IndexOptions),
     IndexAuthorization(IndexOptions),
     QueryAuthorization(ContextOptions),
@@ -189,6 +192,8 @@ pub enum IndexStreamEvent {
 pub enum DaemonReply {
     IndexSetup(zg_engine::api::index::setup::IndexSetup),
     Context(Box<ContextResult>),
+    Callers(Vec<SymbolRelationships>),
+    Callees(Vec<SymbolRelationships>),
     Index(Box<IndexResult>),
     IndexAuthorization(Vec<zg_engine::authorization::IndexAuthorization>),
     QueryAuthorization(Vec<zg_engine::authorization::QueryAuthorization>),
@@ -219,6 +224,59 @@ mod tests {
         DaemonResponse, DaemonResponseKind, ErrorReply, ExecuteRequest, ExecutionResult,
         HelloRequest, Principal, RequestEvent, RequestEventKind, RequestId, TraceContext,
     };
+
+    #[test]
+    fn relationship_commands_and_replies_preserve_compact_payloads() {
+        use zg_engine::api::relationships::{
+            RelationshipEdge, RelationshipOptions, RelationshipSymbol, SymbolRelationships,
+        };
+        let options = RelationshipOptions {
+            root: Some("/workspace".into()),
+            symbol: "Module::run".into(),
+            limit: Some(2),
+            ..RelationshipOptions::default()
+        };
+        for command in [
+            DaemonCommand::Callers(options.clone()),
+            DaemonCommand::Callees(options),
+        ] {
+            let encoded = serde_json::to_value(&command).expect("relationship command");
+            assert!(encoded["request"].get("signal").is_none());
+            assert_eq!(encoded["request"]["symbol"], "Module::run");
+            assert_eq!(
+                serde_json::from_value::<DaemonCommand>(encoded).expect("decode command"),
+                command
+            );
+        }
+        let matches = vec![SymbolRelationships {
+            symbol: RelationshipSymbol {
+                name: "Module::run".into(),
+                file_path: "src/main.rs".into(),
+                start_line: 3,
+                end_line: 8,
+            },
+            total_edges: 7,
+            edges: vec![RelationshipEdge {
+                symbol: None,
+                line: Some(5),
+                column: Some(0),
+            }],
+        }];
+        for reply in [
+            super::DaemonReply::Callers(matches.clone()),
+            super::DaemonReply::Callees(matches),
+        ] {
+            let encoded = serde_json::to_value(&reply).expect("relationship reply");
+            assert_eq!(encoded["reply"][0]["name"], "Module::run");
+            assert_eq!(encoded["reply"][0]["filePath"], "src/main.rs");
+            assert_eq!(encoded["reply"][0]["totalEdges"], 7);
+            assert!(encoded["reply"][0]["edges"][0]["symbol"].is_null());
+            assert_eq!(
+                serde_json::from_value::<super::DaemonReply>(encoded).expect("decode reply"),
+                reply
+            );
+        }
+    }
 
     #[test]
     fn hello_uses_current_protocol_version() {

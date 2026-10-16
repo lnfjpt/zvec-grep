@@ -313,6 +313,30 @@ async fn execute_command(
                     .map(|reply| DaemonReply::Context(Box::new(reply))),
             )
         }
+        DaemonCommand::Callers(mut request) => {
+            let signal = state.shutdown.child_token();
+            let _guard = signal.clone().drop_guard();
+            request.signal = Some(signal);
+            engine_execution(
+                state
+                    .engine
+                    .callers(request)
+                    .await
+                    .map(DaemonReply::Callers),
+            )
+        }
+        DaemonCommand::Callees(mut request) => {
+            let signal = state.shutdown.child_token();
+            let _guard = signal.clone().drop_guard();
+            request.signal = Some(signal);
+            engine_execution(
+                state
+                    .engine
+                    .callees(request)
+                    .await
+                    .map(DaemonReply::Callees),
+            )
+        }
         DaemonCommand::Index(request) => match state.runtimes.submit_index(request, true).await {
             Ok(submitted) if submitted.job.state == JobState::Succeeded => {
                 submitted.result.map_or_else(

@@ -17,11 +17,14 @@ use tracing::debug;
 use tracing_subscriber::EnvFilter;
 use zg_cli::{
     Cli, CliPlan, ClientMode, IndexOperation, InstallOutcome, McpInstallTransport, McpToolset,
-    ServerPlan, ServerStartArgs,
+    RelationshipDirection, ServerPlan, ServerStartArgs,
 };
 use zg_daemon::{DaemonStatus, ListenAddress, McpToolset as DaemonMcpToolset, ServerConfig};
 use zg_daemon_protocol::{DaemonCommand, DaemonReply};
-use zg_engine::{EngineError, ZvecGrep, api::context::ContextOptions};
+use zg_engine::{
+    EngineError, ZvecGrep,
+    api::{context::ContextOptions, relationships::RelationshipOptions},
+};
 
 static DAEMON_LOGGING: AtomicBool = AtomicBool::new(false);
 
@@ -121,6 +124,12 @@ fn install_darwin_metal_residency_mitigation() -> io::Result<()> {
 async fn execute_plan(plan: CliPlan) -> Result<ExitCode, Box<dyn Error>> {
     match plan {
         CliPlan::Files { request, null } => return Ok(execute_files(*request, null).await),
+        CliPlan::Relationships {
+            direction,
+            mode,
+            home,
+            request,
+        } => execute_relationships(direction, mode, home.as_deref(), request).await,
         CliPlan::Query {
             mode,
             home,
@@ -308,6 +317,36 @@ async fn start_installed_server(outcome: &InstallOutcome) -> Result<DaemonStatus
     };
     let executable = std::env::current_exe()?;
     Ok(zg_daemon::start_server(&executable, &config).await?)
+}
+
+async fn execute_relationships(
+    direction: RelationshipDirection,
+    mode: ClientMode,
+    home: Option<&Path>,
+    request: RelationshipOptions,
+) -> Result<(), Box<dyn Error>> {
+    let matches = if use_server(mode, home).await? {
+        let home = zg_daemon::resolve_home(home.map(Path::to_owned))?;
+        let command = match direction {
+            RelationshipDirection::Callers => DaemonCommand::Callers(request),
+            RelationshipDirection::Callees => DaemonCommand::Callees(request),
+        };
+        match (direction, zg_daemon::execute_command(&home, command).await?) {
+            (RelationshipDirection::Callers, DaemonReply::Callers(matches))
+            | (RelationshipDirection::Callees, DaemonReply::Callees(matches)) => matches,
+            _ => return Err(protocol_mismatch("relationships")),
+        }
+    } else {
+        let engine = ZvecGrep::new();
+        let result = match direction {
+            RelationshipDirection::Callers => engine.callers(request).await,
+            RelationshipDirection::Callees => engine.callees(request).await,
+        };
+        engine.close();
+        result?
+    };
+    println!("{}", serde_json::to_string(&matches)?);
+    Ok(())
 }
 
 async fn execute_request(

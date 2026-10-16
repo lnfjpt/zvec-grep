@@ -11,6 +11,9 @@ mod setup;
 
 pub use search_format::SearchPreview;
 
+#[cfg(test)]
+mod relationships_tests;
+
 use std::{
     fmt,
     path::{Component, Path, PathBuf},
@@ -54,11 +57,15 @@ use zg_engine::{
             InfoOptions, InfoResult,
             result::{IndexCompatibility, InfoSource, WorkspaceIndexPolicy},
         },
+        relationships::{RelationshipOptions, RelationshipSymbol, SymbolRelationships},
     },
 };
 
 pub const AGENT_TOOL_NAME: &str = "zvec_grep_search";
-pub const FULL_TOOL_NAMES: [&str; 6] = [
+pub const AGENT_TOOL_NAMES: [&str; 3] = ["callees", "callers", AGENT_TOOL_NAME];
+pub const FULL_TOOL_NAMES: [&str; 8] = [
+    "callees",
+    "callers",
     "zvec_grep_index",
     "zvec_grep_index_drop",
     "zvec_grep_index_status",
@@ -95,6 +102,7 @@ pub const AGENT_INSTRUCTIONS: &str = concat!(
     "Use zvec-grep with these workspace retrieval rules:\n",
     workspace_evidence_rules!(),
     search_routing_rules!("native Grep or rg", "Read, Grep, or rg"),
+    "- For known symbol names, use callers or callees for persisted call relationships. Same-name definitions are returned as separate matches. Unresolved references are excluded, so empty results do not prove a relationship is absent.\n",
     "- Every workspace operation requires an absolute root path visible to the daemon.\n",
     "- Respect declined or cancelled index setup; do not repeat it without a renewed user request.\n",
     "- Read freshness and background_refresh directly from zvec_grep_search responses without a status preflight.\n",
@@ -106,6 +114,7 @@ pub const FULL_INSTRUCTIONS: &str = concat!(
     "Use zvec-grep with these workspace retrieval and lifecycle rules:\n",
     workspace_evidence_rules!(),
     search_routing_rules!("zvec_grep_rg", "Read or zvec_grep_rg"),
+    "- For known symbol names, use callers or callees for persisted call relationships. Same-name definitions are returned as separate matches. Unresolved references are excluded, so empty results do not prove a relationship is absent.\n",
     "- Every workspace operation requires an absolute root path visible to the daemon.\n",
     "- Respect declined or cancelled index setup; do not repeat it without a renewed user request.\n",
     "- Use the zvec_grep_* tools directly for workspace search, status, indexing, deletion, and exhaustive lexical search.\n",
@@ -224,6 +233,22 @@ pub trait IndexOperationProvider: Send + Sync {
         engine.context(request).await
     }
 
+    async fn callers(
+        &self,
+        engine: &ZvecGrep,
+        request: RelationshipOptions,
+    ) -> Result<Vec<SymbolRelationships>, EngineError> {
+        engine.callers(request).await
+    }
+
+    async fn callees(
+        &self,
+        engine: &ZvecGrep,
+        request: RelationshipOptions,
+    ) -> Result<Vec<SymbolRelationships>, EngineError> {
+        engine.callees(request).await
+    }
+
     fn runtime_snapshot(&self, _root: &Path) -> Option<IndexRuntimeSnapshot> {
         None
     }
@@ -331,7 +356,7 @@ impl ZvecGrepMcpServer {
         }
         if toolset == McpToolset::Agent {
             for name in FULL_TOOL_NAMES {
-                if name != AGENT_TOOL_NAME {
+                if !AGENT_TOOL_NAMES.contains(&name) {
                     router.disable_route(name);
                 }
             }
@@ -347,6 +372,30 @@ impl ZvecGrepMcpServer {
         }
     }
 
+    async fn relationship_query(
+        &self,
+        input: RelationshipInput,
+        context: RequestContext<RoleServer>,
+        incoming: bool,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut request = input
+            .into_request()
+            .map_err(|message| ErrorData::invalid_params(message, None))?;
+        let result = request::run(&context, |_, signal| async move {
+            request.signal = Some(signal);
+            if incoming {
+                self.index_operations.callers(&self.engine, request).await
+            } else {
+                self.index_operations.callees(&self.engine, request).await
+            }
+        })
+        .await;
+        Ok(match result {
+            Ok(matches) => relationship_result_to_tool_result(&matches),
+            Err(error) => error_result(&error),
+        })
+    }
+
     #[must_use]
     pub fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
         self.router.list_all()
@@ -355,6 +404,46 @@ impl ZvecGrepMcpServer {
 
 #[tool_router]
 impl ZvecGrepMcpServer {
+    #[tool(
+        name = "callers",
+        description = "Incoming persisted call sites for an exact or scope-qualified symbol name (Class::method), with full-text fallback when no exact definition exists. Same-name definitions remain separate matches. Each edge describes the caller symbol or null if unavailable; line/column locate the call in the caller file. limit caps edges per match (default 20), and totalEdges reports the untruncated count. Unresolved references are excluded, so empty results do not prove absence. Requires an existing graph index; does not refresh or build it.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<RelationshipOutput>(),
+        annotations(
+            title = "Incoming call sites for a symbol",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn callers(
+        &self,
+        Parameters(input): Parameters<RelationshipInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.relationship_query(input, context, true).await
+    }
+
+    #[tool(
+        name = "callees",
+        description = "Outgoing persisted call sites for an exact or scope-qualified symbol name (Class::method), with full-text fallback when no exact definition exists. Same-name definitions remain separate matches. Each edge describes the callee symbol or null if unavailable; line/column locate the call in the caller file. limit caps edges per match (default 20), and totalEdges reports the untruncated count. Unresolved references are excluded, so empty results do not prove absence. Requires an existing graph index; does not refresh or build it.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<RelationshipOutput>(),
+        annotations(
+            title = "Outgoing call sites for a symbol",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn callees(
+        &self,
+        Parameters(input): Parameters<RelationshipInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.relationship_query(input, context, false).await
+    }
+
     #[tool(
         name = "zvec_grep_search",
         description = "Search a workspace index for semantic, relational, cross-file, or multi-hop evidence such as architecture, call chains, dependencies, lifecycle, data or control flow, design rationale, and comparisons. Use it when exact lookup alone cannot answer a workspace-grounded question. Results include bounded source snippets by default and query-group metadata; set preview: \"full\" to return all available content of each retrieved item without changing retrieval or ranking. Treat sufficient returned content as already-read evidence. Use native Grep or rg instead when exact lookup alone is sufficient. Read freshness and background_refresh from the response without a status preflight; when results are served_from_current_index, use them if sufficient. A missing index can request user model selection and authorization; accepted setup starts a background build and returns indexing status. Retry after completion.",
@@ -740,6 +829,63 @@ pub enum GlobListInput {
 // return strings for schemars' nullable type arrays. These schema-only overrides
 // preserve strict serde types and acceptance of null as absence. Do not apply
 // them to fields where null clears a saved setting (Option<Option<T>>).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RelationshipInput {
+    /// Absolute workspace root visible to the daemon.
+    #[schemars(length(min = 1, max = 1024))]
+    pub root: String,
+    /// Symbol name or scope-qualified name, such as `Class::method`.
+    #[schemars(length(min = 1, max = 1024))]
+    pub symbol: String,
+    /// Maximum edges per matching symbol; defaults to 20.
+    #[schemars(range(min = 1))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RelationshipOutput {
+    matches: Vec<RelationshipMatchOutput>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RelationshipMatchOutput {
+    #[serde(flatten)]
+    symbol: RelationshipSymbolOutput,
+    total_edges: usize,
+    edges: Vec<RelationshipEdgeOutput>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RelationshipSymbolOutput {
+    name: String,
+    file_path: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RelationshipEdgeOutput {
+    symbol: Option<RelationshipSymbolOutput>,
+    line: Option<u32>,
+    column: Option<u32>,
+}
+
+impl From<&RelationshipSymbol> for RelationshipSymbolOutput {
+    fn from(symbol: &RelationshipSymbol) -> Self {
+        Self {
+            name: symbol.name.clone(),
+            file_path: symbol.file_path.to_string_lossy().into_owned(),
+            start_line: symbol.start_line,
+            end_line: symbol.end_line,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchInput {
@@ -1524,6 +1670,23 @@ fn normalize_filter_names<T>(
         .transpose()
 }
 
+impl RelationshipInput {
+    fn into_request(self) -> Result<RelationshipOptions, String> {
+        let root = absolute_root(&self.root)?;
+        let symbol = self.symbol.trim();
+        validate_text("symbol", symbol, 1, 1024)?;
+        if self.limit == Some(0) {
+            return Err("limit must be greater than zero".to_owned());
+        }
+        Ok(RelationshipOptions {
+            root: Some(root),
+            symbol: symbol.to_owned(),
+            limit: Some(self.limit.unwrap_or(20)),
+            ..RelationshipOptions::default()
+        })
+    }
+}
+
 impl SearchInput {
     fn into_request(self) -> Result<ContextOptions, String> {
         let root = absolute_root(&self.root)?;
@@ -2033,6 +2196,32 @@ fn error_result(error: &EngineError) -> CallToolResult {
         error.report(),
         error.is_retryable()
     ))])
+}
+
+fn relationship_result_to_tool_result(matches: &[SymbolRelationships]) -> CallToolResult {
+    let output = RelationshipOutput {
+        matches: matches
+            .iter()
+            .map(|matched| RelationshipMatchOutput {
+                symbol: (&matched.symbol).into(),
+                total_edges: matched.total_edges,
+                edges: matched
+                    .edges
+                    .iter()
+                    .map(|edge| RelationshipEdgeOutput {
+                        symbol: edge.symbol.as_ref().map(Into::into),
+                        line: edge.line,
+                        column: edge.column,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    let value = serde_json::json!(output);
+    let text = value["matches"].to_string();
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(value);
+    result
 }
 
 fn structured_result(value: impl Serialize) -> CallToolResult {
@@ -2742,7 +2931,7 @@ mod tests {
     }
 
     #[test]
-    fn toolset_metadata_preserves_node_contract_with_interactive_setup_guidance() {
+    fn toolset_metadata_preserves_node_guidance_with_relationship_extension() {
         let expected: serde_json::Value =
             serde_json::from_str(include_str!("../../../compat/mcp/toolsets.json"))
                 .expect("Node.js toolset metadata");
@@ -2762,7 +2951,16 @@ mod tests {
                 .replace("- Respect declined or cancelled index setup; do not repeat it without a renewed user request.\n", "")
                 .replace("When an index is missing, search can ask the user to choose an embedding model and approve a background build. Only explicit user confirmation creates an index. Read the returned indexing state and retry search after completion; use native Grep or rg only when literal lookup answers the task.", "When an index is missing and literal or regex search can answer the task, use native Grep or rg. Creating or rebuilding a persistent index requires explicit user authorization.");
             assert_eq!(
-                Some(legacy_instructions.as_str()),
+                server
+                    .get_info()
+                    .instructions
+                    .map(|text| text
+                        .lines()
+                        .filter(|line| !line
+                            .starts_with("- For known symbol names, use callers or callees"))
+                        .collect::<Vec<_>>()
+                        .join("\n"))
+                    .as_deref(),
                 expected[profile]["instructions"].as_str()
             );
             let search = server
@@ -2783,16 +2981,19 @@ mod tests {
     }
 
     #[test]
-    fn agent_server_exposes_only_search() {
+    fn agent_server_exposes_search_and_relationships() {
         let server = ZvecGrepMcpServer::agent_direct(Arc::new(ZvecGrep::new()));
         let tools = server.listed_tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, AGENT_TOOL_NAME);
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, super::AGENT_TOOL_NAMES);
         assert!(server.get_info().instructions.is_some());
     }
 
     #[test]
-    fn full_server_exposes_all_six_tools() {
+    fn full_server_exposes_all_eight_tools() {
         let server =
             ZvecGrepMcpServer::full_direct(Arc::new(ZvecGrep::new()), Arc::new(FixedStatus));
         let names = server

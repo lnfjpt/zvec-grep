@@ -229,6 +229,29 @@ impl Fragments {
         Ok(hits)
     }
 
+    /// Bound candidate records across all model tables before entity deduplication.
+    /// The existing hashed symbol-name projection preserves exact case and literals.
+    pub(super) fn find_symbol_entity_ids(&self, name: &str) -> EngineResult<Vec<EntityId>> {
+        const CANDIDATE_LIMIT: usize = 100;
+        let filter = metadata_in_filter(CodeMetadata::SYMBOL_NAME, std::iter::once(name));
+        let mut ids = Vec::new();
+        for index in self.indexes.values() {
+            let remaining = CANDIDATE_LIMIT - ids.len();
+            if remaining == 0 {
+                break;
+            }
+            let mut query = native(
+                SearchQuery::scalar(top_k(remaining)?),
+                "create symbol-name query",
+            )?;
+            configure_query(&mut query, Some(&filter), &["entity_id"])?;
+            for doc in native(index.query(&query), "find indexed symbols")? {
+                ids.push(EntityId::from_string(string_field(&doc, "entity_id")?));
+            }
+        }
+        Ok(ids)
+    }
+
     pub(super) fn search_vector(
         &self,
         model: &str,

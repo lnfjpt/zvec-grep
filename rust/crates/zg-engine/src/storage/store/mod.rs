@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EngineError, EngineResult,
-    domain::{Entity, FileId, FileIndexStatus, FileRecord},
+    domain::{Entity, EntityId, EntityMetadata, FileId, FileIndexStatus, FileRecord},
     utils::{atomic_write as write_record, sync_directory},
 };
 
@@ -21,6 +21,7 @@ use super::{
     entities::Entities,
     files::Files,
     fragments::{self, Fragments},
+    graph::{self, Direction, Edge, EdgeKind, OpenMode, SqliteGraphStorage},
     types::{
         IndexedFragment, StorageSearchFilter, StorageSearchHit, StoredEntity, StoredFileAttributes,
         StoredSearchData, WorkspaceIndexStorageOptions,
@@ -46,6 +47,8 @@ struct StoreState {
     entities: Entities,
     fragments: Fragments,
     needs_optimize: bool,
+    graph_path: PathBuf,
+    graph: Option<SqliteGraphStorage>,
     closed: bool,
 }
 
@@ -168,6 +171,8 @@ impl IndexStore {
                 entities,
                 fragments,
                 needs_optimize: false,
+                graph_path: home.join("graph").join("graph.sqlite"),
+                graph: None,
                 closed: false,
             }),
             schema,
@@ -270,6 +275,94 @@ impl IndexStore {
         hits: &[StorageSearchHit],
     ) -> EngineResult<StoredSearchData> {
         self.read(|state| load_search_hits(state, hits))
+    }
+
+    /// Resolve at most 100 matching fragment records to indexed code definitions.
+    /// Scope is checked against canonical metadata because existing projection
+    /// schemas index symbol names but do not contain a scope field.
+    pub(crate) fn find_symbols(
+        &self,
+        name: &str,
+        scope: Option<&str>,
+    ) -> EngineResult<Vec<StoredEntity>> {
+        if name.is_empty() {
+            return Err(EngineError::invalid_argument(
+                "symbol name must not be empty",
+            ));
+        }
+        self.read(|state| {
+            let ids = state.fragments.find_symbol_entity_ids(name)?;
+            let mut entities = get_entities(state, &ids)?;
+            Ok(ids
+                .into_iter()
+                .filter_map(|id| entities.remove(&id))
+                .filter(|stored| {
+                    matches!(
+                        &stored.entity.metadata,
+                        Some(EntityMetadata::Code(metadata))
+                            if metadata.symbol_name.as_deref() == Some(name)
+                                && scope.is_none_or(|scope| metadata.scope.as_deref() == Some(scope))
+                    )
+                })
+                .collect())
+        })
+    }
+
+    /// Fetch canonical entities and their indexed files without scanning either table.
+    pub(crate) fn get_entities(
+        &self,
+        ids: &[EntityId],
+    ) -> EngineResult<HashMap<EntityId, StoredEntity>> {
+        self.read(|state| get_entities(state, ids))
+    }
+
+    /// Validate the existing graph even when symbol lookup finds no definitions.
+    pub(crate) fn ensure_graph_available(&self) -> EngineResult<()> {
+        self.read_graph(|_| Ok(()))
+    }
+
+    pub(crate) fn neighborhood(
+        &self,
+        id: &str,
+        direction: Direction,
+        kinds: Option<&[EdgeKind]>,
+    ) -> EngineResult<Vec<Edge>> {
+        self.read_graph(|graph| graph.neighborhood(id, direction, kinds))
+    }
+
+    fn read_graph<T>(
+        &self,
+        operation: impl FnOnce(&SqliteGraphStorage) -> graph::Result<T>,
+    ) -> EngineResult<T> {
+        let shared = self.shared()?;
+        let mut state = lock_state(&shared)?;
+        assert_usable(&state)?;
+        if state.graph.is_none() {
+            match fs::metadata(&state.graph_path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(EngineError::not_found(
+                        "workspace graph is missing; this index has no persisted relationship data",
+                    ));
+                }
+                Err(error) => {
+                    return Err(io_error(
+                        "inspect workspace graph",
+                        &state.graph_path,
+                        &error,
+                    ));
+                }
+            }
+            state.graph = Some(
+                SqliteGraphStorage::open(&state.graph_path, OpenMode::ReadOnly)
+                    .map_err(graph_error)?,
+            );
+        }
+        let graph = state
+            .graph
+            .as_ref()
+            .ok_or_else(|| EngineError::internal("workspace graph was not opened"))?;
+        operation(graph).map_err(graph_error)
     }
 
     pub(crate) fn search_fts(
@@ -388,6 +481,43 @@ impl IndexStore {
         state.closed = true;
         flush(&state)
     }
+}
+
+fn graph_error(error: graph::Error) -> EngineError {
+    match error {
+        graph::Error::InvalidInput(message) => EngineError::invalid_argument(message),
+        error => EngineError::storage_failure(format!("cannot read workspace graph: {error}")),
+    }
+}
+
+fn get_entities(
+    state: &StoreState,
+    ids: &[EntityId],
+) -> EngineResult<HashMap<EntityId, StoredEntity>> {
+    let entities = state.entities.fetch(ids)?;
+    let file_ids = entities
+        .values()
+        .map(|entity| entity.file_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let files = state.files.fetch(&file_ids)?;
+    Ok(entities
+        .into_iter()
+        .filter_map(|(id, entity)| {
+            let file = files.get(&entity.file_id)?;
+            if !matches!(file.index_status, FileIndexStatus::Indexed { .. }) {
+                return None;
+            }
+            Some((
+                id,
+                StoredEntity {
+                    entity,
+                    file: file.clone(),
+                },
+            ))
+        })
+        .collect())
 }
 
 // Cross-table writes stay under the store's single writer lock.

@@ -184,6 +184,363 @@ fn assert_projection(store: &IndexStore, entry: &IndexedFragment) {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Exercises canonical metadata and source readiness transitions in one index fixture."
+)]
+fn symbol_lookup_returns_canonical_definitions_with_exact_names_and_scopes() {
+    let temporary = tempfile::tempdir().expect("temporary storage");
+    let store = metadata_store(temporary.path());
+    let (mut source, mut entities, mut entries) = metadata_fragments(0, "first owner");
+    let (_, mut other_entities, other_entries) = metadata_fragments(0, "second owner");
+    if let Some(EntityMetadata::Code(metadata)) = &mut other_entities[0].metadata {
+        metadata.scope = Some("Meadow".into());
+    }
+    entities.extend(other_entities);
+    entries.extend(other_entries);
+    source.index_status = FileIndexStatus::Indexed {
+        indexed_epoch_ms: 1,
+        entity_count: 2,
+    };
+    store
+        .apply_fixture_records(&source, &entities, &entries)
+        .expect("write definitions");
+    let name = "harvest 春'\\crop";
+    let mut matches = store.find_symbols(name, None).expect("exact symbols");
+    matches.sort_by(|a, b| a.entity.id.cmp(&b.entity.id));
+    let mut expected = entities.clone();
+    expected.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(
+        matches
+            .iter()
+            .map(|stored| stored.entity.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(matches.iter().all(|stored| stored.file == source));
+    assert_eq!(
+        store.find_symbols(name, Some("Garden")).expect("scope")[0].entity,
+        entities[0]
+    );
+    for (name, scope) in [
+        ("HARVEST 春'\\crop", None),
+        ("orchard", None),
+        (name, Some("garden")),
+        (name, Some("missing")),
+    ] {
+        assert!(
+            store
+                .find_symbols(name, scope)
+                .expect("no match")
+                .is_empty()
+        );
+    }
+    let ids = entities
+        .iter()
+        .map(|entity| entity.id.clone())
+        .collect::<Vec<_>>();
+    let requested = [
+        ids[0].clone(),
+        ids[0].clone(),
+        EntityId::from_string("missing".into()),
+    ];
+    let fetched = store.get_entities(&requested).expect("canonical fetch");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[&ids[0]].entity, entities[0]);
+
+    // Projection fields are only candidate hints; canonical metadata decides membership.
+    let mut changed = entities.clone();
+    if let Some(EntityMetadata::Code(metadata)) = &mut changed[0].metadata {
+        metadata.symbol_name = Some("renamed".into());
+    }
+    changed[1].metadata = None;
+    store
+        .write(|state| state.entities.write(&Entities::prepare(&changed)?))
+        .expect("change canonical metadata only");
+    assert!(
+        store
+            .find_symbols(name, None)
+            .expect("canonical recheck")
+            .is_empty()
+    );
+    store
+        .write(|state| state.entities.write(&Entities::prepare(&entities)?))
+        .expect("restore canonical names");
+
+    for status in [
+        FileIndexStatus::NotIndexed,
+        FileIndexStatus::Deleting,
+        FileIndexStatus::Failed {
+            error: "interrupted".into(),
+        },
+    ] {
+        source.index_status = status;
+        store
+            .write(|state| {
+                let directories = state.directories.ensure(&source.relative_path)?;
+                state.files.put(&source, &directories)
+            })
+            .expect("mark source unavailable");
+        assert!(
+            store
+                .get_entities(&ids)
+                .expect("skip unindexed entities")
+                .is_empty()
+        );
+        assert!(
+            store
+                .find_symbols(name, None)
+                .expect("skip unindexed definitions")
+                .is_empty()
+        );
+    }
+    store
+        .write(|state| state.files.delete(source.id))
+        .expect("remove source record");
+    assert!(
+        store
+            .get_entities(&ids)
+            .expect("skip missing source")
+            .is_empty()
+    );
+    store.close().expect("close");
+    assert_eq!(
+        store
+            .get_entities(&ids)
+            .expect_err("closed entity fetch")
+            .code(),
+        EngineError::RESOURCE_CLOSED
+    );
+    assert_eq!(
+        store
+            .find_symbols(name, None)
+            .expect_err("closed lookup")
+            .code(),
+        EngineError::RESOURCE_CLOSED
+    );
+}
+
+#[test]
+fn symbol_candidates_are_bounded_before_deduplication_across_model_tables() {
+    let temporary = tempfile::tempdir().expect("temporary storage");
+    let first = model();
+    let mut second = model();
+    second.model.name = "later".into();
+    let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        storage_path: temporary.path().to_owned(),
+        embeddings: vec![first.clone(), second.clone()],
+    })
+    .expect("multiple model tables");
+    for (file_id, model, count) in [(0, first, 2), (1, second, 60)] {
+        let (mut source, _, _) = metadata_fragments(file_id, "unused");
+        source.relative_path = SourcePath::new(format!("source-{file_id}.rs")).expect("path");
+        source.index_status = FileIndexStatus::Indexed {
+            indexed_epoch_ms: 1,
+            entity_count: count,
+        };
+        let mut entities = Vec::new();
+        let mut entries = Vec::new();
+        for index in 0..count {
+            let (_, owners, mut projections) =
+                metadata_fragments(file_id, &format!("owner {index}"));
+            for entry in &mut projections {
+                entry.model = model.model.reference();
+            }
+            entities.extend(owners);
+            entries.extend(projections);
+        }
+        store
+            .apply_fixture_records(&source, &entities, &entries)
+            .expect("write symbols");
+    }
+    let name = "harvest 春'\\crop";
+    let ids = store
+        .read(|state| state.fragments.find_symbol_entity_ids(name))
+        .expect("bounded records");
+    assert_eq!(ids.len(), 100);
+    let expected = ids.into_iter().collect::<HashSet<_>>();
+    let matches = store
+        .find_symbols(name, None)
+        .expect("deduplicated definitions");
+    assert_eq!(
+        matches
+            .into_iter()
+            .map(|stored| stored.entity.id)
+            .collect::<HashSet<_>>(),
+        expected
+    );
+    assert!(
+        expected.len() < 100,
+        "multiple fragments resolve to one definition"
+    );
+}
+
+#[test]
+fn missing_or_invalid_graph_does_not_create_a_database_or_break_search() {
+    let temporary = tempfile::tempdir().expect("temporary storage");
+    let store = metadata_store(temporary.path());
+    let (source, entities, entries) = metadata_fragments(0, "owner");
+    store
+        .apply_fixture_records(&source, &entities, &entries)
+        .expect("write fixture");
+    store.close().expect("close writer");
+    let graph_path = temporary.path().join("graph/graph.sqlite");
+    let reader = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
+        storage_path: temporary.path().to_owned(),
+    })
+    .expect("open existing graph-less index");
+    assert_eq!(
+        reader
+            .ensure_graph_available()
+            .expect_err("missing graph")
+            .code(),
+        EngineError::NOT_FOUND
+    );
+    assert!(
+        reader
+            .neighborhood("missing", Direction::In, Some(&[EdgeKind::Calls]))
+            .is_err()
+    );
+    assert!(
+        reader
+            .neighborhood("missing", Direction::Out, Some(&[EdgeKind::Calls]))
+            .is_err()
+    );
+    assert!(!graph_path.exists());
+    assert!(
+        !reader
+            .search_fts("orchard", 10, None)
+            .expect("ordinary search")
+            .is_empty()
+    );
+    fs::create_dir_all(graph_path.parent().expect("graph directory")).expect("create directory");
+    fs::write(&graph_path, b"invalid SQLite graph").expect("broken existing graph");
+    assert_eq!(
+        reader
+            .ensure_graph_available()
+            .expect_err("invalid graph")
+            .code(),
+        EngineError::STORAGE_FAILURE
+    );
+    assert!(
+        !reader
+            .search_fts("orchard", 10, None)
+            .expect("search ignores graph")
+            .is_empty()
+    );
+    reader.close().expect("close reader");
+    assert_eq!(
+        fs::read(&graph_path).expect("graph unchanged"),
+        b"invalid SQLite graph"
+    );
+}
+
+#[test]
+fn store_graph_reads_preserve_call_sites_and_share_the_storage_lifetime() {
+    use crate::storage::graph::{EdgeKind, FileGraph, Metadata, Provenance};
+
+    let temporary = tempfile::tempdir().expect("temporary storage");
+    metadata_store(temporary.path())
+        .close()
+        .expect("initialize index");
+    let graph_path = temporary.path().join("graph/graph.sqlite");
+    let mut graph =
+        SqliteGraphStorage::open(&graph_path, OpenMode::ReadWrite).expect("graph fixture");
+    let edges = (1..=25)
+        .map(|line| Edge {
+            kind: EdgeKind::Calls,
+            source: "caller".into(),
+            target: "callee".into(),
+            line: Some(line),
+            column: Some(0),
+            provenance: Provenance::FileLocal,
+            metadata: Metadata::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut persisted = edges.clone();
+    persisted.push(Edge {
+        kind: EdgeKind::Contains,
+        ..edges[0].clone()
+    });
+    graph
+        .write_file_graph(
+            0,
+            "fixture.rs",
+            &FileGraph {
+                entities: Vec::new(),
+                entity_ids: vec!["caller".into(), "callee".into()],
+                edges: persisted,
+                pending_refs: Vec::new(),
+            },
+            &[],
+        )
+        .expect("write graph");
+    graph.close().expect("close graph fixture");
+    let options = WorkspaceIndexStorageOptions::ReadOnly {
+        storage_path: temporary.path().to_owned(),
+    };
+    let reader = IndexStore::open(options.clone()).expect("reader");
+    let second = IndexStore::open(options).expect("shared reader");
+    reader.ensure_graph_available().expect("existing graph");
+    assert_eq!(
+        reader
+            .neighborhood("callee", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("all callers"),
+        edges
+    );
+    assert_eq!(
+        reader
+            .neighborhood("caller", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("all callees"),
+        edges
+    );
+    assert!(
+        reader
+            .neighborhood("caller", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("direction")
+            .is_empty()
+    );
+    assert!(
+        reader
+            .neighborhood("missing", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect("unknown endpoint")
+            .is_empty()
+    );
+    assert_eq!(
+        reader
+            .neighborhood(" ", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect_err("blank endpoint")
+            .code(),
+        EngineError::INVALID_ARGUMENT
+    );
+    reader.close().expect("close one lease");
+    assert_eq!(
+        reader
+            .ensure_graph_available()
+            .expect_err("closed graph read")
+            .code(),
+        EngineError::RESOURCE_CLOSED
+    );
+    assert_eq!(
+        reader
+            .neighborhood("caller", Direction::Out, Some(&[EdgeKind::Calls]))
+            .expect_err("closed graph query")
+            .code(),
+        EngineError::RESOURCE_CLOSED
+    );
+    assert_eq!(
+        second
+            .neighborhood("callee", Direction::In, Some(&[EdgeKind::Calls]))
+            .expect("remaining lease"),
+        edges
+    );
+    second.close().expect("close last reader");
+    metadata_store(temporary.path())
+        .close()
+        .expect("storage lock released");
+}
+
+#[test]
 fn stores_shared_metadata_once_and_filters_windows_by_owner_fields() {
     let temporary = tempfile::tempdir().expect("temporary storage");
     let store = metadata_store(temporary.path());
