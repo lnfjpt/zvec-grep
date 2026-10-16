@@ -1,6 +1,8 @@
 //! Source-to-call-hierarchy acceptance tests adapted from upstream LSP cases.
 //! These exercise production indexing and expose unsupported resolution cases.
 //! Do not seed entities/edges, ignore cases, or treat missing graph data as success.
+//! Expected edges contain each source-definition endpoint once. A line array allows
+//! any listed call site; definition startLine still distinguishes same-name definitions.
 
 #[allow(dead_code)] // Reuse the existing embedding stub; other storage helpers are unused here.
 mod support;
@@ -32,7 +34,7 @@ struct SourceFile {
 }
 
 struct Query {
-    direction: &'static str,
+    operation: &'static str,
     symbol: &'static str,
     // Key response fields only. startLine distinguishes overloads in the same file.
     expected: Value,
@@ -59,18 +61,86 @@ fn retain_expected_fields(actual: &mut Value, expected: &Value) {
 }
 
 fn normalize_calls(groups: &mut Value) {
-    // Ignore edge order and column conventions from upstream LSP fixtures.
-    // Preserve line numbers, endpoints, definition groups and duplicate edges.
+    // Ignore column conventions from upstream LSP fixtures, but check call lines.
+    // Preserve definition coordinates, endpoints, groups and duplicate edges.
     for group in groups.as_array_mut().expect("relationship matches array") {
         let edges = group["edges"]
             .as_array_mut()
             .expect("relationship edges array");
         for edge in edges.iter_mut() {
-            edge.as_object_mut()
-                .expect("relationship edge")
-                .remove("column");
+            let edge = edge.as_object_mut().expect("relationship edge");
+            edge.remove("column");
         }
         edges.sort_by_cached_key(Value::to_string);
+    }
+}
+
+fn accept_expected_line_choices(actual: &Value, expected: &mut Value) {
+    // Match definitions and endpoints before allowing alternate call lines.
+    // Never relax identity checks or remove duplicate actual relationships.
+    let same_definition = |a: &Value, b: &Value| {
+        ["name", "filePath", "startLine"]
+            .iter()
+            .all(|key| a[*key] == b[*key])
+    };
+    for group in expected.as_array_mut().expect("expected groups") {
+        let Some(actual_group) = actual
+            .as_array()
+            .expect("actual groups")
+            .iter()
+            .find(|candidate| same_definition(candidate, group))
+        else {
+            continue;
+        };
+        for edge in group["edges"].as_array_mut().expect("expected edges") {
+            let Some(lines) = edge["line"].as_array() else {
+                continue;
+            };
+            if let Some(actual_edge) = actual_group["edges"]
+                .as_array()
+                .expect("actual edges")
+                .iter()
+                .find(|candidate| same_definition(&candidate["symbol"], &edge["symbol"]))
+                && lines.contains(&actual_edge["line"])
+            {
+                edge["line"] = actual_edge["line"].clone();
+            }
+        }
+    }
+}
+
+#[test]
+fn line_choices_preserve_identity_single_sites_and_edge_counts() {
+    let expected = json!([{
+        "name": "caller", "filePath": "a.cc", "startLine": 1,
+        "edges": [
+            {"symbol": {"name": "work", "filePath": "a.cc", "startLine": 2}, "line": [7, 8]},
+            {"symbol": {"name": "work", "filePath": "b.cc", "startLine": 2}, "line": 10}
+        ]
+    }]);
+    for line in [json!(7), json!(8), json!(9), Value::Null] {
+        let mut actual = expected.clone();
+        actual[0]["edges"][0]["line"] = line.clone();
+        let mut selected = expected.clone();
+        accept_expected_line_choices(&actual, &mut selected);
+        assert_eq!(actual == selected, line == 7 || line == 8);
+    }
+    for mutation in 0..5 {
+        let mut actual = expected.clone();
+        actual[0]["edges"][0]["line"] = json!(8);
+        match mutation {
+            0 => actual[0]["edges"][1]["line"] = json!(11),
+            1 => actual[0]["edges"][0]["symbol"]["filePath"] = json!("b.cc"),
+            2 => actual[0]["edges"][0]["symbol"]["startLine"] = json!(3),
+            3 => actual[0]["startLine"] = json!(3),
+            _ => {
+                let duplicate = actual[0]["edges"][0].clone();
+                actual[0]["edges"].as_array_mut().unwrap().push(duplicate);
+            }
+        }
+        let mut selected = expected.clone();
+        accept_expected_line_choices(&actual, &mut selected);
+        assert_ne!(actual, selected, "mutation {mutation} must still fail");
     }
 }
 
@@ -111,23 +181,24 @@ async fn check_queries(engine: &ZvecGrep, root: &Path, stage: &str, queries: &[Q
             symbol: query.symbol.into(),
             ..RelationshipOptions::default()
         };
-        let result = match query.direction {
-            "in" => engine.callers(options).await,
-            "out" => engine.callees(options).await,
-            _ => panic!("invalid query direction"),
+        let result = match query.operation {
+            "callers" => engine.callers(options).await,
+            "callees" => engine.callees(options).await,
+            _ => panic!("invalid query operation"),
         };
         let actual = result.unwrap_or_else(|error| {
-            panic!("{}: {} {}: {error}", stage, query.direction, query.symbol)
+            panic!("{}: {} {}: {error}", stage, query.operation, query.symbol)
         });
         let mut actual = serde_json::to_value(actual).expect("serialize relationship response");
         let mut expected = query.expected.clone();
+        accept_expected_line_choices(&actual, &mut expected);
         retain_expected_fields(&mut actual, &expected);
         normalize_calls(&mut actual);
         normalize_calls(&mut expected);
         assert_eq!(
             actual, expected,
             "{}: {} {}",
-            stage, query.direction, query.symbol
+            stage, query.operation, query.symbol
         );
     }
 }
@@ -147,29 +218,27 @@ async fn rust_repeated_calls() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "callee",
                 expected: json!([
                     {"name": "callee", "filePath": "lib.rs", "startLine": 1,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "lib.rs", "startLine": 2}, "line": 3, "column": 4},
-                        {"symbol": {"name": "caller", "filePath": "lib.rs", "startLine": 2}, "line": 4, "column": 4},
+                        {"symbol": {"name": "caller", "filePath": "lib.rs", "startLine": 2}, "line": [3, 4], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "lib.rs", "startLine": 2,
                      "edges": [
-                        {"symbol": {"name": "callee", "filePath": "lib.rs", "startLine": 1}, "line": 3, "column": 4},
-                        {"symbol": {"name": "callee", "filePath": "lib.rs", "startLine": 1}, "line": 4, "column": 4},
+                        {"symbol": {"name": "callee", "filePath": "lib.rs", "startLine": 1}, "line": [3, 4], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "lib.rs", "startLine": 2,
@@ -177,7 +246,7 @@ async fn rust_repeated_calls() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "callee",
                 expected: json!([
                     {"name": "callee", "filePath": "lib.rs", "startLine": 1,
@@ -210,30 +279,30 @@ async fn rust_cross_file() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "callee",
                 expected: json!([
-                    {"name": "foo::callee", "filePath": "foo/mod.rs", "startLine": 1,
+                    {"name": "callee", "filePath": "foo/mod.rs", "startLine": 1,
                      "edges": [
                         {"symbol": {"name": "caller", "filePath": "lib.rs", "startLine": 4}, "line": 5, "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "lib.rs", "startLine": 4,
                      "edges": [
-                        {"symbol": {"name": "foo::callee", "filePath": "foo/mod.rs", "startLine": 1}, "line": 5, "column": 4},
+                        {"symbol": {"name": "callee", "filePath": "foo/mod.rs", "startLine": 1}, "line": 5, "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo::callee",
                 expected: json!([
-                    {"name": "foo::callee", "filePath": "foo/mod.rs", "startLine": 1,
+                    {"name": "callee", "filePath": "foo/mod.rs", "startLine": 1,
                      "edges": [
                         {"symbol": {"name": "caller", "filePath": "lib.rs", "startLine": 4}, "line": 5, "column": 4},
                     ]},
@@ -246,8 +315,8 @@ async fn rust_cross_file() {
 
 // https://github.com/microsoft/pyright/blob/386cfa1161b63f048a9ea663d84189e69ced33b1/packages/pyright-internal/src/tests/fourslash/showcallhierarchy.outgoingCalls.aliasedFunction2.fourslash.ts
 // Upstream case: outgoingCalls.aliasedFunction2. Upstream returns alias/display names and groups
-// repeated calls. zvec-grep uses the canonical declare.py::func definition and preserves each
-// site. Incoming queries below are inverse checks of these upstream outgoing relations. These
+// repeated calls. These expectations use the canonical declare.py::func definition once per
+// endpoint. Incoming queries below invert these upstream outgoing relations. These
 // queries do not request outgoing calls from func.
 #[tokio::test]
 async fn python_import_alias() {
@@ -265,7 +334,7 @@ async fn python_import_alias() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "callByAlias",
                 expected: json!([
                     {"name": "callByAlias", "filePath": "consume.py", "startLine": 4,
@@ -275,7 +344,7 @@ async fn python_import_alias() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "callByName",
                 expected: json!([
                     {"name": "callByName", "filePath": "consume.py", "startLine": 7,
@@ -285,39 +354,35 @@ async fn python_import_alias() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "callByBoth1",
                 expected: json!([
                     {"name": "callByBoth1", "filePath": "consume.py", "startLine": 10,
                      "edges": [
-                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": 11, "column": 4},
-                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": 12, "column": 4},
+                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": [11, 12], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "callByBoth2",
                 expected: json!([
                     {"name": "callByBoth2", "filePath": "consume.py", "startLine": 14,
                      "edges": [
-                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": 15, "column": 4},
-                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": 16, "column": 4},
+                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": [15, 16], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "func",
                 expected: json!([
                     {"name": "func", "filePath": "declare.py", "startLine": 1,
                      "edges": [
                         {"symbol": {"name": "callByAlias", "filePath": "consume.py", "startLine": 4}, "line": 5, "column": 4},
                         {"symbol": {"name": "callByName", "filePath": "consume.py", "startLine": 7}, "line": 8, "column": 4},
-                        {"symbol": {"name": "callByBoth1", "filePath": "consume.py", "startLine": 10}, "line": 11, "column": 4},
-                        {"symbol": {"name": "callByBoth1", "filePath": "consume.py", "startLine": 10}, "line": 12, "column": 4},
-                        {"symbol": {"name": "callByBoth2", "filePath": "consume.py", "startLine": 14}, "line": 15, "column": 4},
-                        {"symbol": {"name": "callByBoth2", "filePath": "consume.py", "startLine": 14}, "line": 16, "column": 4},
+                        {"symbol": {"name": "callByBoth1", "filePath": "consume.py", "startLine": 10}, "line": [11, 12], "column": 4},
+                        {"symbol": {"name": "callByBoth2", "filePath": "consume.py", "startLine": 14}, "line": [15, 16], "column": 4},
                     ]},
                 ]),
             },
@@ -341,7 +406,7 @@ async fn go_enclosing_callers() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "baz",
                 expected: json!([
                     {"name": "baz", "filePath": "a/a.go", "startLine": 11,
@@ -353,7 +418,7 @@ async fn go_enclosing_callers() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "bar",
                 expected: json!([
                     {"name": "bar", "filePath": "a/a.go", "startLine": 7,
@@ -363,7 +428,7 @@ async fn go_enclosing_callers() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "init",
                 expected: json!([
                     {"name": "init", "filePath": "a/a.go", "startLine": 24,
@@ -373,7 +438,7 @@ async fn go_enclosing_callers() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "bluh",
                 expected: json!([
                     {"name": "bluh", "filePath": "a/a.go", "startLine": 15,
@@ -383,7 +448,7 @@ async fn go_enclosing_callers() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "bluh",
                 expected: json!([
                     {"name": "bluh", "filePath": "a/a.go", "startLine": 15,
@@ -391,7 +456,7 @@ async fn go_enclosing_callers() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Foo",
                 expected: json!([
                     {"name": "Foo", "filePath": "a/a.go", "startLine": 3,
@@ -422,7 +487,7 @@ async fn c_file_local_names() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "sf",
                 expected: json!([
                     {"name": "sf", "filePath": "staticFunc1.c", "startLine": 2,
@@ -437,7 +502,7 @@ async fn c_file_local_names() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "sf",
                 expected: json!([
                     {"name": "sf", "filePath": "staticFunc1.c", "startLine": 2,
@@ -453,7 +518,7 @@ async fn c_file_local_names() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "gf",
                 expected: json!([
                     {"name": "gf", "filePath": "staticFunc1.c", "startLine": 6,
@@ -465,7 +530,7 @@ async fn c_file_local_names() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "gf",
                 expected: json!([
                     {"name": "gf", "filePath": "staticFunc1.c", "startLine": 6,
@@ -502,42 +567,38 @@ async fn typescript_methods_and_constructors() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Two::callThreeTwice",
                 expected: json!([
                     {"name": "Two::callThreeTwice", "filePath": "two.ts", "startLine": 4,
                      "edges": [
-                        {"symbol": {"name": "Three", "filePath": "three.ts", "startLine": 2}, "line": 5, "column": 12},
-                        {"symbol": {"name": "Three::tada", "filePath": "three.ts", "startLine": 3}, "line": 5, "column": 20},
-                        {"symbol": {"name": "Three", "filePath": "three.ts", "startLine": 2}, "line": 6, "column": 12},
-                        {"symbol": {"name": "Three::tada", "filePath": "three.ts", "startLine": 3}, "line": 6, "column": 20},
+                        {"symbol": {"name": "Three", "filePath": "three.ts", "startLine": 2}, "line": [5, 6], "column": 12},
+                        {"symbol": {"name": "Three::tada", "filePath": "three.ts", "startLine": 3}, "line": [5, 6], "column": 20},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Three::tada",
                 expected: json!([
                     {"name": "Three::tada", "filePath": "three.ts", "startLine": 3,
                      "edges": [
-                        {"symbol": {"name": "Two::callThreeTwice", "filePath": "two.ts", "startLine": 4}, "line": 5, "column": 20},
-                        {"symbol": {"name": "Two::callThreeTwice", "filePath": "two.ts", "startLine": 4}, "line": 6, "column": 20},
+                        {"symbol": {"name": "Two::callThreeTwice", "filePath": "two.ts", "startLine": 4}, "line": [5, 6], "column": 20},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Three",
                 expected: json!([
                     {"name": "Three", "filePath": "three.ts", "startLine": 2,
                      "edges": [
-                        {"symbol": {"name": "Two::callThreeTwice", "filePath": "two.ts", "startLine": 4}, "line": 5, "column": 12},
-                        {"symbol": {"name": "Two::callThreeTwice", "filePath": "two.ts", "startLine": 4}, "line": 6, "column": 12},
+                        {"symbol": {"name": "Two::callThreeTwice", "filePath": "two.ts", "startLine": 4}, "line": [5, 6], "column": 12},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Three::tada",
                 expected: json!([
                     {"name": "Three::tada", "filePath": "three.ts", "startLine": 3,
@@ -555,7 +616,7 @@ async fn typescript_methods_and_constructors() {
 // JDT LS incomingCalls_src / outgoingCalls_src. Preserve the source sample. Query local calls
 // among main, Base and Child constructors, foo, bar and method_1. External JDK targets have no
 // indexed definitions; fields are not calls. The recursive1/recursive2 component is not queried.
-// Upstream grouped constructor ranges become individual edges. Additional inverse queries check
+// Constructor expectations contain one relationship per endpoint. Inverse queries check
 // the selected source relationships, including inherited methods. Definition ranges come from the
 // source, not JDT call-item selection ranges.
 #[tokio::test]
@@ -572,7 +633,7 @@ async fn java_methods_and_constructors() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "CallHierarchy.Base::bar",
                 expected: json!([
                     {"name": "CallHierarchy.Base::bar", "filePath": "org/sample/CallHierarchy.java", "startLine": 27,
@@ -584,7 +645,7 @@ async fn java_methods_and_constructors() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "CallHierarchy.Base::method_1",
                 expected: json!([
                     {"name": "CallHierarchy.Base::method_1", "filePath": "org/sample/CallHierarchy.java", "startLine": 34,
@@ -595,30 +656,28 @@ async fn java_methods_and_constructors() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "CallHierarchy.Base::bar",
                 expected: json!([
                     {"name": "CallHierarchy.Base::bar", "filePath": "org/sample/CallHierarchy.java", "startLine": 27,
                      "edges": [
-                        {"symbol": {"name": "CallHierarchy.Child::Child", "filePath": "org/sample/CallHierarchy.java", "startLine": 43}, "line": 28, "column": 10},
-                        {"symbol": {"name": "CallHierarchy.Child::Child", "filePath": "org/sample/CallHierarchy.java", "startLine": 43}, "line": 29, "column": 10},
+                        {"symbol": {"name": "CallHierarchy.Child::Child", "filePath": "org/sample/CallHierarchy.java", "startLine": 43}, "line": [28, 29], "column": 10},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "CallHierarchy.Child::Child",
                 expected: json!([
                     {"name": "CallHierarchy.Child::Child", "filePath": "org/sample/CallHierarchy.java", "startLine": 43,
                      "edges": [
                         {"symbol": {"name": "CallHierarchy::main", "filePath": "org/sample/CallHierarchy.java", "startLine": 6}, "line": 8, "column": 8},
-                        {"symbol": {"name": "CallHierarchy.Base::bar", "filePath": "org/sample/CallHierarchy.java", "startLine": 27}, "line": 28, "column": 10},
-                        {"symbol": {"name": "CallHierarchy.Base::bar", "filePath": "org/sample/CallHierarchy.java", "startLine": 27}, "line": 29, "column": 10},
+                        {"symbol": {"name": "CallHierarchy.Base::bar", "filePath": "org/sample/CallHierarchy.java", "startLine": 27}, "line": [28, 29], "column": 10},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "CallHierarchy.Child::Child",
                 expected: json!([
                     {"name": "CallHierarchy.Child::Child", "filePath": "org/sample/CallHierarchy.java", "startLine": 43,
@@ -631,7 +690,7 @@ async fn java_methods_and_constructors() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "CallHierarchy.Base::foo",
                 expected: json!([
                     {"name": "CallHierarchy.Base::foo", "filePath": "org/sample/CallHierarchy.java", "startLine": 23,
@@ -669,24 +728,22 @@ async fn java_cross_file_repeated_calls() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Foo::someMethod",
                 expected: json!([
                     {"name": "Foo::someMethod", "filePath": "org/sample/Foo.java", "startLine": 9,
                      "edges": [
-                        {"symbol": {"name": "Call::main", "filePath": "org/sample/Call.java", "startLine": 4}, "line": 8, "column": 18},
-                        {"symbol": {"name": "Call::main", "filePath": "org/sample/Call.java", "startLine": 4}, "line": 11, "column": 18},
+                        {"symbol": {"name": "Call::main", "filePath": "org/sample/Call.java", "startLine": 4}, "line": [8, 11], "column": 18},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "someMethod",
                 expected: json!([
                     {"name": "Foo::someMethod", "filePath": "org/sample/Foo.java", "startLine": 9,
                      "edges": [
-                        {"symbol": {"name": "Call::main", "filePath": "org/sample/Call.java", "startLine": 4}, "line": 8, "column": 18},
-                        {"symbol": {"name": "Call::main", "filePath": "org/sample/Call.java", "startLine": 4}, "line": 11, "column": 18},
+                        {"symbol": {"name": "Call::main", "filePath": "org/sample/Call.java", "startLine": 4}, "line": [8, 11], "column": 18},
                     ]},
                 ]),
             },
@@ -711,7 +768,7 @@ async fn cpp_qualified_method() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "ns::Waldo::find",
                 expected: json!([
                     {"name": "ns::Waldo::find", "filePath": "main.cc", "startLine": 6,
@@ -722,7 +779,7 @@ async fn cpp_qualified_method() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "ns::caller1",
                 expected: json!([
                     {"name": "ns::caller1", "filePath": "main.cc", "startLine": 7,
@@ -732,7 +789,7 @@ async fn cpp_qualified_method() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "ns::caller2",
                 expected: json!([
                     {"name": "ns::caller2", "filePath": "main.cc", "startLine": 10,
@@ -749,7 +806,7 @@ async fn cpp_qualified_method() {
 // clangd MultiFileCpp, definition-site incoming and outgoing expectations. Remove annotation
 // markers and preserve source coordinates. Query canonical implementation definitions. Header
 // declarations must not duplicate results; cursor-based prepare behavior is outside the symbol-
-// name query contract. Qualified calls retain separate sites, and leaf/root queries return empty
+// name query contract. Qualified calls identify distinct endpoints, and leaf/root queries return empty
 // edges.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // Keep the cross-file fixture and its expectations together.
@@ -781,7 +838,7 @@ async fn cpp_cross_file_call_chain() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "callee",
                 expected: json!([
                     {"name": "callee", "filePath": "callee.cc", "startLine": 3,
@@ -791,19 +848,18 @@ async fn cpp_cross_file_call_chain() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "nsa::caller1",
                 expected: json!([
                     {"name": "nsa::caller1", "filePath": "caller1.cc", "startLine": 5,
                      "edges": [
-                        {"symbol": {"name": "nsb::caller2", "filePath": "caller2.cc", "startLine": 5}, "line": 6, "column": 13},
-                        {"symbol": {"name": "nsb::caller2", "filePath": "caller2.cc", "startLine": 5}, "line": 7, "column": 13},
+                        {"symbol": {"name": "nsb::caller2", "filePath": "caller2.cc", "startLine": 5}, "line": [6, 7], "column": 13},
                         {"symbol": {"name": "nsa::caller3", "filePath": "caller3.cc", "startLine": 5}, "line": 6, "column": 8},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "nsb::caller2",
                 expected: json!([
                     {"name": "nsb::caller2", "filePath": "caller2.cc", "startLine": 5,
@@ -813,7 +869,7 @@ async fn cpp_cross_file_call_chain() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "nsa::caller3",
                 expected: json!([
                     {"name": "nsa::caller3", "filePath": "caller3.cc", "startLine": 5,
@@ -821,7 +877,7 @@ async fn cpp_cross_file_call_chain() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "nsa::caller3",
                 expected: json!([
                     {"name": "nsa::caller3", "filePath": "caller3.cc", "startLine": 5,
@@ -832,18 +888,17 @@ async fn cpp_cross_file_call_chain() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "nsb::caller2",
                 expected: json!([
                     {"name": "nsb::caller2", "filePath": "caller2.cc", "startLine": 5,
                      "edges": [
-                        {"symbol": {"name": "nsa::caller1", "filePath": "caller1.cc", "startLine": 5}, "line": 6, "column": 13},
-                        {"symbol": {"name": "nsa::caller1", "filePath": "caller1.cc", "startLine": 5}, "line": 7, "column": 13},
+                        {"symbol": {"name": "nsa::caller1", "filePath": "caller1.cc", "startLine": 5}, "line": [6, 7], "column": 13},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "nsa::caller1",
                 expected: json!([
                     {"name": "nsa::caller1", "filePath": "caller1.cc", "startLine": 5,
@@ -853,7 +908,7 @@ async fn cpp_cross_file_call_chain() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "callee",
                 expected: json!([
                     {"name": "callee", "filePath": "callee.cc", "startLine": 3,
@@ -877,19 +932,19 @@ async fn cpp_virtual_override_callers() {
             SourceFile { path: "virtual.cc", source: "\n    void callee() {}\n    struct Interface {\n      virtual void Func() = 0;\n    };\n    struct Implementation : public Interface {\n      void Func() override {\n          callee();\n      }\n    };\n    void Test(Interface& cls){\n      cls.Func();\n    }\n  " },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "Implementation::Func", expected: json!([
+            Query { operation: "callers", symbol: "Implementation::Func", expected: json!([
                 {"name": "Implementation::Func", "filePath": "virtual.cc", "startLine": 7,
                  "edges": [
                     {"symbol": {"name": "Test", "filePath": "virtual.cc", "startLine": 11}, "line": 12, "column": 10},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "callee", expected: json!([
+            Query { operation: "callers", symbol: "callee", expected: json!([
                 {"name": "callee", "filePath": "virtual.cc", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "Implementation::Func", "filePath": "virtual.cc", "startLine": 7}, "line": 8, "column": 10},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "Implementation::Func", expected: json!([
+            Query { operation: "callees", symbol: "Implementation::Func", expected: json!([
                 {"name": "Implementation::Func", "filePath": "virtual.cc", "startLine": 7,
                  "edges": [
                     {"symbol": {"name": "callee", "filePath": "virtual.cc", "startLine": 2}, "line": 8, "column": 10},
@@ -911,7 +966,7 @@ async fn cpp_initializer_caller_ownership() {
             SourceFile { path: "initializers.cc", source: "\n    int callee();\n    void caller1() {\n      callee();\n    }\n    void caller2() {\n      int localVar = callee();\n    }\n    int caller3 = callee();\n  " },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "callee", expected: json!([
+            Query { operation: "callers", symbol: "callee", expected: json!([
                 {"name": "callee", "filePath": "initializers.cc", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "caller1", "filePath": "initializers.cc", "startLine": 3}, "line": 4, "column": 6},
@@ -919,13 +974,13 @@ async fn cpp_initializer_caller_ownership() {
                     {"symbol": {"name": "caller3", "filePath": "initializers.cc", "startLine": 9}, "line": 9, "column": 18},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "caller2", expected: json!([
+            Query { operation: "callees", symbol: "caller2", expected: json!([
                 {"name": "caller2", "filePath": "initializers.cc", "startLine": 6,
                  "edges": [
                     {"symbol": {"name": "callee", "filePath": "initializers.cc", "startLine": 2}, "line": 7, "column": 21},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "caller3", expected: json!([
+            Query { operation: "callees", symbol: "caller3", expected: json!([
                 {"name": "caller3", "filePath": "initializers.cc", "startLine": 9,
                  "edges": [
                     {"symbol": {"name": "callee", "filePath": "initializers.cc", "startLine": 2}, "line": 9, "column": 18},
@@ -953,7 +1008,7 @@ async fn typescript_ambiguous_overload_declarations() {
             SourceFile { path: "main.ts", source: "function bar() {\n    foo();\n}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "foo", expected: json!([
+            Query { operation: "callers", symbol: "foo", expected: json!([
                 {"name": "foo", "filePath": "a.d.ts", "startLine": 1,
                  "edges": [
                     {"symbol": {"name": "bar", "filePath": "main.ts", "startLine": 1}, "line": 2, "column": 4},
@@ -963,7 +1018,7 @@ async fn typescript_ambiguous_overload_declarations() {
                     {"symbol": {"name": "bar", "filePath": "main.ts", "startLine": 1}, "line": 2, "column": 4},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "bar", expected: json!([
+            Query { operation: "callees", symbol: "bar", expected: json!([
                 {"name": "bar", "filePath": "main.ts", "startLine": 1,
                  "edges": [
                     {"symbol": {"name": "foo", "filePath": "a.d.ts", "startLine": 1}, "line": 2, "column": 4},
@@ -985,7 +1040,7 @@ async fn typescript_same_name_scopes() {
             SourceFile { path: "scopes.ts", source: "namespace Left {\n    export function work() {}\n    export function caller() {\n        work();\n    }\n}\nnamespace Right {\n    export function work() {}\n    export function caller() {\n        work();\n    }\n}\n" },
         ],
         queries: vec![
-            Query { direction: "out", symbol: "caller", expected: json!([
+            Query { operation: "callees", symbol: "caller", expected: json!([
                 {"name": "Left::caller", "filePath": "scopes.ts", "startLine": 3,
                  "edges": [
                     {"symbol": {"name": "Left::work", "filePath": "scopes.ts", "startLine": 2}, "line": 4, "column": 8},
@@ -995,13 +1050,13 @@ async fn typescript_same_name_scopes() {
                     {"symbol": {"name": "Right::work", "filePath": "scopes.ts", "startLine": 8}, "line": 10, "column": 8},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "Right::work", expected: json!([
+            Query { operation: "callers", symbol: "Right::work", expected: json!([
                 {"name": "Right::work", "filePath": "scopes.ts", "startLine": 8,
                  "edges": [
                     {"symbol": {"name": "Right::caller", "filePath": "scopes.ts", "startLine": 9}, "line": 10, "column": 8},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "work", expected: json!([
+            Query { operation: "callers", symbol: "work", expected: json!([
                 {"name": "Left::work", "filePath": "scopes.ts", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "Left::caller", "filePath": "scopes.ts", "startLine": 3}, "line": 4, "column": 8},
@@ -1011,19 +1066,19 @@ async fn typescript_same_name_scopes() {
                     {"symbol": {"name": "Right::caller", "filePath": "scopes.ts", "startLine": 9}, "line": 10, "column": 8},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "Left::work", expected: json!([
+            Query { operation: "callers", symbol: "Left::work", expected: json!([
                 {"name": "Left::work", "filePath": "scopes.ts", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "Left::caller", "filePath": "scopes.ts", "startLine": 3}, "line": 4, "column": 8},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "Left::caller", expected: json!([
+            Query { operation: "callees", symbol: "Left::caller", expected: json!([
                 {"name": "Left::caller", "filePath": "scopes.ts", "startLine": 3,
                  "edges": [
                     {"symbol": {"name": "Left::work", "filePath": "scopes.ts", "startLine": 2}, "line": 4, "column": 8},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "Right::caller", expected: json!([
+            Query { operation: "callees", symbol: "Right::caller", expected: json!([
                 {"name": "Right::caller", "filePath": "scopes.ts", "startLine": 9,
                  "edges": [
                     {"symbol": {"name": "Right::work", "filePath": "scopes.ts", "startLine": 8}, "line": 10, "column": 8},
@@ -1046,25 +1101,25 @@ async fn typescript_anonymous_function_binding() {
             SourceFile { path: "anonymous.ts", source: "function foo() {\n    bar();\n}\n\nconst bar = function () {\n    baz();\n}\n\nfunction baz() {\n}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "bar", expected: json!([
+            Query { operation: "callers", symbol: "bar", expected: json!([
                 {"name": "bar", "filePath": "anonymous.ts", "startLine": 5,
                  "edges": [
                     {"symbol": {"name": "foo", "filePath": "anonymous.ts", "startLine": 1}, "line": 2, "column": 4},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "bar", expected: json!([
+            Query { operation: "callees", symbol: "bar", expected: json!([
                 {"name": "bar", "filePath": "anonymous.ts", "startLine": 5,
                  "edges": [
                     {"symbol": {"name": "baz", "filePath": "anonymous.ts", "startLine": 9}, "line": 6, "column": 4},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "baz", expected: json!([
+            Query { operation: "callers", symbol: "baz", expected: json!([
                 {"name": "baz", "filePath": "anonymous.ts", "startLine": 9,
                  "edges": [
                     {"symbol": {"name": "bar", "filePath": "anonymous.ts", "startLine": 5}, "line": 6, "column": 4},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "foo", expected: json!([
+            Query { operation: "callees", symbol: "foo", expected: json!([
                 {"name": "foo", "filePath": "anonymous.ts", "startLine": 1,
                  "edges": [
                     {"symbol": {"name": "bar", "filePath": "anonymous.ts", "startLine": 5}, "line": 2, "column": 4},
@@ -1087,19 +1142,19 @@ async fn typescript_class_arrow_function() {
             SourceFile { path: "arrows.ts", source: "class C {\n    caller = () => {\n        this.callee();\n    }\n\n    callee = () => {\n    }\n}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "C::callee", expected: json!([
+            Query { operation: "callers", symbol: "C::callee", expected: json!([
                 {"name": "C::callee", "filePath": "arrows.ts", "startLine": 6,
                  "edges": [
                     {"symbol": {"name": "C::caller", "filePath": "arrows.ts", "startLine": 2}, "line": 3, "column": 13},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "C::caller", expected: json!([
+            Query { operation: "callees", symbol: "C::caller", expected: json!([
                 {"name": "C::caller", "filePath": "arrows.ts", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "C::callee", "filePath": "arrows.ts", "startLine": 6}, "line": 3, "column": 13},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "C::callee", expected: json!([
+            Query { operation: "callees", symbol: "C::callee", expected: json!([
                 {"name": "C::callee", "filePath": "arrows.ts", "startLine": 6,
                  "edges": []},
             ]) },
@@ -1120,11 +1175,11 @@ async fn java_interface_without_callers() {
             SourceFile { path: "org/sample/CallHierarchyGH2771.java", source: "package org.sample;\n\npublic interface CallHierarchyGH2771 {\n    Opt<String> name();\n\n    public static class Opt<T> {\n        public static <T> Opt<T> of(T t) {\n            return new Opt();\n        }\n    }\n}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "CallHierarchyGH2771::name", expected: json!([
+            Query { operation: "callers", symbol: "CallHierarchyGH2771::name", expected: json!([
                 {"name": "CallHierarchyGH2771::name", "filePath": "org/sample/CallHierarchyGH2771.java", "startLine": 4,
                  "edges": []},
             ]) },
-            Query { direction: "out", symbol: "CallHierarchyGH2771::name", expected: json!([
+            Query { operation: "callees", symbol: "CallHierarchyGH2771::name", expected: json!([
                 {"name": "CallHierarchyGH2771::name", "filePath": "org/sample/CallHierarchyGH2771.java", "startLine": 4,
                  "edges": []},
             ]) },
@@ -1212,7 +1267,7 @@ impl IncrementalWorkspace {
             stage,
             &[
                 Query {
-                    direction: "out",
+                    operation: "callees",
                     symbol: "caller",
                     expected: json!([
                         {"name": "caller", "filePath": "caller.py", "startLine": 2,
@@ -1222,7 +1277,7 @@ impl IncrementalWorkspace {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "first",
                     expected: json!([
                         {"name": "first", "filePath": "targets.py", "startLine": 1,
@@ -1232,7 +1287,7 @@ impl IncrementalWorkspace {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "second",
                     expected: json!([
                         {"name": "second", "filePath": "targets.py", "startLine": 4,
@@ -1270,7 +1325,7 @@ async fn incremental_call_target_change_removes_old_edge() {
             "after call edit",
             &[
                 Query {
-                    direction: "out",
+                    operation: "callees",
                     symbol: "caller",
                     expected: json!([
                         {"name": "caller", "filePath": "caller.py", "startLine": 2,
@@ -1280,7 +1335,7 @@ async fn incremental_call_target_change_removes_old_edge() {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "first",
                     expected: json!([
                         {"name": "first", "filePath": "targets.py", "startLine": 1,
@@ -1288,7 +1343,7 @@ async fn incremental_call_target_change_removes_old_edge() {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "second",
                     expected: json!([
                         {"name": "second", "filePath": "targets.py", "startLine": 4,
@@ -1318,7 +1373,7 @@ async fn incremental_target_deletion_invalidates_incoming_edges() {
         .check(
             "deleted target must not leave a dangling resolved edge",
             &[Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.py", "startLine": 2,
@@ -1346,7 +1401,7 @@ async fn incremental_target_recreation_resolves_unchanged_caller() {
         .check(
             "between deletion and recreation",
             &[Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.py", "startLine": 2,
@@ -1375,7 +1430,7 @@ async fn incremental_target_recreation_resolves_unchanged_caller() {
             "recreated target rebinds the unchanged caller",
             &[
                 Query {
-                    direction: "out",
+                    operation: "callees",
                     symbol: "caller",
                     expected: json!([
                         {"name": "caller", "filePath": "caller.py", "startLine": 2,
@@ -1385,7 +1440,7 @@ async fn incremental_target_recreation_resolves_unchanged_caller() {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "first",
                     expected: json!([
                         {"name": "first", "filePath": "targets.py", "startLine": 3,
@@ -1416,7 +1471,7 @@ async fn incremental_caller_deletion_removes_outgoing_edges() {
             "after caller deletion",
             &[
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "first",
                     expected: json!([
                         {"name": "first", "filePath": "targets.py", "startLine": 1,
@@ -1424,7 +1479,7 @@ async fn incremental_caller_deletion_removes_outgoing_edges() {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "second",
                     expected: json!([
                         {"name": "second", "filePath": "targets.py", "startLine": 4,
@@ -1481,7 +1536,7 @@ async fn rust_self_recursion() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "countdown",
                 expected: json!([
                     {"name": "countdown", "filePath": "recursive.rs", "startLine": 1,
@@ -1491,7 +1546,7 @@ async fn rust_self_recursion() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "countdown",
                 expected: json!([
                     {"name": "countdown", "filePath": "recursive.rs", "startLine": 1,
@@ -1503,66 +1558,6 @@ async fn rust_self_recursion() {
         ],
     })
     .await;
-}
-
-// https://github.com/rust-lang/rust-analyzer/blob/3131751eaf1c3b5da6e618acdc2148ad7db65bc7/crates/ide/src/call_hierarchy.rs
-// Adapt test_call_hierarchy_in_macros_incoming: retain the generated definition and call macro,
-// remove cursor markers, and correct fn $ident {} to fn $ident() {} so the fixture is valid Rust.
-// Anchor the generated definition to define!(callee), and the callsite to the callee argument of
-// call!. The inverse outgoing expectation is a zvec-grep requirement; upstream outgoing is an
-// acknowledged FIXME with an empty result, not the oracle.
-#[tokio::test]
-async fn rust_macro_generated_definition() {
-    check_case(Case {
-        name: "rust_macro_generated_definition",
-        files: vec![
-            SourceFile { path: "macros.rs", source: "macro_rules! define {\n    ($ident:ident) => {\n        fn $ident() {}\n    }\n}\nmacro_rules! call {\n    ($ident:ident) => {\n        $ident()\n    }\n}\ndefine!(callee);\nfn caller() {\n    call!(callee);\n}\n" },
-        ],
-        queries: vec![
-            Query { direction: "in", symbol: "callee", expected: json!([
-                {"name": "callee", "filePath": "macros.rs", "startLine": 11,
-                 "edges": [
-                    {"symbol": {"name": "caller", "filePath": "macros.rs", "startLine": 12}, "line": 13, "column": 10},
-                ]},
-            ]) },
-            Query { direction: "out", symbol: "caller", expected: json!([
-                {"name": "caller", "filePath": "macros.rs", "startLine": 12,
-                 "edges": [
-                    {"symbol": {"name": "callee", "filePath": "macros.rs", "startLine": 11}, "line": 13, "column": 10},
-                ]},
-            ]) },
-        ],
-    }).await;
-}
-
-// https://github.com/rust-lang/rust-analyzer/blob/3131751eaf1c3b5da6e618acdc2148ad7db65bc7/crates/ide/src/call_hierarchy.rs
-// Adapt test_call_hierarchy_in_macros_incoming_different_files, first subcase. Fix generated-
-// function syntax as in the local macro test. Definition and callsite are attributed to the
-// invocation file, not the macro definition file. The outgoing assertion is an inverse regression,
-// not the upstream FIXME expectation.
-#[tokio::test]
-async fn rust_cross_file_macro_call() {
-    check_case(Case {
-        name: "rust_cross_file_macro_call",
-        files: vec![
-            SourceFile { path: "lib.rs", source: "#[macro_use]\nmod definitions;\ndefine!(callee);\nfn caller() {\n    call!(callee);\n}\n" },
-            SourceFile { path: "definitions.rs", source: "macro_rules! define {\n    ($ident:ident) => {\n        fn $ident() {}\n    }\n}\nmacro_rules! call {\n    ($ident:ident) => {\n        $ident()\n    }\n}\n" },
-        ],
-        queries: vec![
-            Query { direction: "in", symbol: "callee", expected: json!([
-                {"name": "callee", "filePath": "lib.rs", "startLine": 3,
-                 "edges": [
-                    {"symbol": {"name": "caller", "filePath": "lib.rs", "startLine": 4}, "line": 5, "column": 10},
-                ]},
-            ]) },
-            Query { direction: "out", symbol: "caller", expected: json!([
-                {"name": "caller", "filePath": "lib.rs", "startLine": 4,
-                 "edges": [
-                    {"symbol": {"name": "callee", "filePath": "lib.rs", "startLine": 3}, "line": 5, "column": 10},
-                ]},
-            ]) },
-        ],
-    }).await;
 }
 
 // https://github.com/ycm-core/ycmd/blob/a290328810cec343fc4df23ff86936cfa7630687/ycmd/tests/javascript/subcommands_test.py
@@ -1585,7 +1580,7 @@ async fn javascript_cross_file_method_calls() {
             SourceFile { path: "file3.js", source: "function remoteCaller() {\n  var bar = new Bar();\n  bar.testMethod();\n}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "Bar::testMethod", expected: json!([
+            Query { operation: "callers", symbol: "Bar::testMethod", expected: json!([
                 {"name": "Bar::testMethod", "filePath": "test.js", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "localCaller", "filePath": "test.js", "startLine": 4}, "line": 6, "column": 6},
@@ -1593,21 +1588,21 @@ async fn javascript_cross_file_method_calls() {
                     {"symbol": {"name": "remoteCaller", "filePath": "file3.js", "startLine": 1}, "line": 3, "column": 6},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "localCaller", expected: json!([
+            Query { operation: "callees", symbol: "localCaller", expected: json!([
                 {"name": "localCaller", "filePath": "test.js", "startLine": 4,
                  "edges": [
                     {"symbol": {"name": "Bar", "filePath": "test.js", "startLine": 1}, "line": 5, "column": 16},
                     {"symbol": {"name": "Bar::testMethod", "filePath": "test.js", "startLine": 2}, "line": 6, "column": 6},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "expressionCaller", expected: json!([
+            Query { operation: "callees", symbol: "expressionCaller", expected: json!([
                 {"name": "expressionCaller", "filePath": "file2.js", "startLine": 1,
                  "edges": [
                     {"symbol": {"name": "Bar", "filePath": "test.js", "startLine": 1}, "line": 2, "column": 6},
                     {"symbol": {"name": "Bar::testMethod", "filePath": "test.js", "startLine": 2}, "line": 2, "column": 12},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "remoteCaller", expected: json!([
+            Query { operation: "callees", symbol: "remoteCaller", expected: json!([
                 {"name": "remoteCaller", "filePath": "file3.js", "startLine": 1,
                  "edges": [
                     {"symbol": {"name": "Bar", "filePath": "test.js", "startLine": 1}, "line": 2, "column": 16},
@@ -1633,30 +1628,29 @@ async fn javascript_static_block_call_ownership() {
             SourceFile { path: "static.js", source: "class C {\n    static {\n        function foo() {\n            bar();\n        }\n\n        function bar() {\n            baz();\n            quxx();\n            baz();\n        }\n\n        foo();\n    }\n}\n\nfunction baz() {\n}\n\nfunction quxx() {\n}\n" },
         ],
         queries: vec![
-            Query { direction: "out", symbol: "C::static {}", expected: json!([
+            Query { operation: "callees", symbol: "C::static {}", expected: json!([
                 {"name": "C::static {}", "filePath": "static.js", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "C::foo", "filePath": "static.js", "startLine": 3}, "line": 13, "column": 8},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "C::foo", expected: json!([
+            Query { operation: "callers", symbol: "C::foo", expected: json!([
                 {"name": "C::foo", "filePath": "static.js", "startLine": 3,
                  "edges": [
                     {"symbol": {"name": "C::static {}", "filePath": "static.js", "startLine": 2}, "line": 13, "column": 8},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "C::bar", expected: json!([
+            Query { operation: "callers", symbol: "C::bar", expected: json!([
                 {"name": "C::bar", "filePath": "static.js", "startLine": 7,
                  "edges": [
                     {"symbol": {"name": "C::foo", "filePath": "static.js", "startLine": 3}, "line": 4, "column": 12},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "C::bar", expected: json!([
+            Query { operation: "callees", symbol: "C::bar", expected: json!([
                 {"name": "C::bar", "filePath": "static.js", "startLine": 7,
                  "edges": [
-                    {"symbol": {"name": "baz", "filePath": "static.js", "startLine": 17}, "line": 8, "column": 12},
+                    {"symbol": {"name": "baz", "filePath": "static.js", "startLine": 17}, "line": [8, 10], "column": 12},
                     {"symbol": {"name": "quxx", "filePath": "static.js", "startLine": 20}, "line": 9, "column": 12},
-                    {"symbol": {"name": "baz", "filePath": "static.js", "startLine": 17}, "line": 10, "column": 12},
                 ]},
             ]) },
         ],
@@ -1677,7 +1671,7 @@ async fn go_builtin_method_without_indexed_target() {
         }],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "A",
                 expected: json!([
                     {"name": "A", "filePath": "a/a.go", "startLine": 3,
@@ -1685,7 +1679,7 @@ async fn go_builtin_method_without_indexed_target() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "A",
                 expected: json!([
                     {"name": "A", "filePath": "a/a.go", "startLine": 3,
@@ -1713,25 +1707,25 @@ async fn go_cross_package_call_chain() {
             SourceFile { path: "outgoing/outgoing.go", source: "package outgoing\n\nfunc B() {}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "D", expected: json!([
+            Query { operation: "callers", symbol: "D", expected: json!([
                 {"name": "D", "filePath": "hierarchy.go", "startLine": 5,
                  "edges": [
                     {"symbol": {"name": "A", "filePath": "incoming/incoming.go", "startLine": 5}, "line": 6, "column": 15},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "D", expected: json!([
+            Query { operation: "callees", symbol: "D", expected: json!([
                 {"name": "D", "filePath": "hierarchy.go", "startLine": 5,
                  "edges": [
                     {"symbol": {"name": "B", "filePath": "outgoing/outgoing.go", "startLine": 3}, "line": 6, "column": 10},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "B", expected: json!([
+            Query { operation: "callers", symbol: "B", expected: json!([
                 {"name": "B", "filePath": "outgoing/outgoing.go", "startLine": 3,
                  "edges": [
                     {"symbol": {"name": "D", "filePath": "hierarchy.go", "startLine": 5}, "line": 6, "column": 10},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "A", expected: json!([
+            Query { operation: "callees", symbol: "A", expected: json!([
                 {"name": "A", "filePath": "incoming/incoming.go", "startLine": 5,
                  "edges": [
                     {"symbol": {"name": "D", "filePath": "hierarchy.go", "startLine": 5}, "line": 6, "column": 15},
@@ -1754,19 +1748,19 @@ async fn typescript_getter_calls() {
             SourceFile { path: "accessor.ts", source: "function foo() {\n    new C().bar;\n}\n\nclass C {\n    get bar() {\n        return baz();\n    }\n}\n\nfunction baz() {\n}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "C::bar", expected: json!([
+            Query { operation: "callers", symbol: "C::bar", expected: json!([
                 {"name": "C::bar", "filePath": "accessor.ts", "startLine": 6,
                  "edges": [
                     {"symbol": {"name": "foo", "filePath": "accessor.ts", "startLine": 1}, "line": 2, "column": 12},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "C::bar", expected: json!([
+            Query { operation: "callees", symbol: "C::bar", expected: json!([
                 {"name": "C::bar", "filePath": "accessor.ts", "startLine": 6,
                  "edges": [
                     {"symbol": {"name": "baz", "filePath": "accessor.ts", "startLine": 11}, "line": 7, "column": 15},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "baz", expected: json!([
+            Query { operation: "callers", symbol: "baz", expected: json!([
                 {"name": "baz", "filePath": "accessor.ts", "startLine": 11,
                  "edges": [
                     {"symbol": {"name": "C::bar", "filePath": "accessor.ts", "startLine": 6}, "line": 7, "column": 15},
@@ -1789,13 +1783,13 @@ async fn typescript_malformed_template_preserves_valid_calls() {
             SourceFile { path: "broken.ts", source: "function target() {}\nfunction caller() { target(); }\nfunction updateBadge() {\n    const header = `<div class=\"sub\">${format`;\n    const badge = `<div class=\"badge\">`;\n}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "target", expected: json!([
+            Query { operation: "callers", symbol: "target", expected: json!([
                 {"name": "target", "filePath": "broken.ts", "startLine": 1,
                  "edges": [
                     {"symbol": {"name": "caller", "filePath": "broken.ts", "startLine": 2}, "line": 2, "column": 20},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "caller", expected: json!([
+            Query { operation: "callees", symbol: "caller", expected: json!([
                 {"name": "caller", "filePath": "broken.ts", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "target", "filePath": "broken.ts", "startLine": 1}, "line": 2, "column": 20},
@@ -1817,17 +1811,17 @@ async fn python_function_reference_and_alias_call() {
             SourceFile { path: "references.py", source: "def target():\n    pass\n\ndef holder():\n    alias = target\n    return alias\n\ndef caller():\n    alias = target\n    alias()\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "target", expected: json!([
+            Query { operation: "callers", symbol: "target", expected: json!([
                 {"name": "target", "filePath": "references.py", "startLine": 1,
                  "edges": [
                     {"symbol": {"name": "caller", "filePath": "references.py", "startLine": 8}, "line": 10, "column": 4},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "holder", expected: json!([
+            Query { operation: "callees", symbol: "holder", expected: json!([
                 {"name": "holder", "filePath": "references.py", "startLine": 4,
                  "edges": []},
             ]) },
-            Query { direction: "out", symbol: "caller", expected: json!([
+            Query { operation: "callees", symbol: "caller", expected: json!([
                 {"name": "caller", "filePath": "references.py", "startLine": 8,
                  "edges": [
                     {"symbol": {"name": "target", "filePath": "references.py", "startLine": 1}, "line": 10, "column": 4},
@@ -1850,19 +1844,19 @@ async fn c_prototype_and_definition_calls() {
             SourceFile { path: "functions.c", source: "void proto(void);\nvoid func(void) {\n}\nint main(void) {\n   proto();\n   func();\n   return 0;\n}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "proto", expected: json!([
+            Query { operation: "callers", symbol: "proto", expected: json!([
                 {"name": "proto", "filePath": "functions.c", "startLine": 1,
                  "edges": [
                     {"symbol": {"name": "main", "filePath": "functions.c", "startLine": 4}, "line": 5, "column": 3},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "func", expected: json!([
+            Query { operation: "callers", symbol: "func", expected: json!([
                 {"name": "func", "filePath": "functions.c", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "main", "filePath": "functions.c", "startLine": 4}, "line": 6, "column": 3},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "main", expected: json!([
+            Query { operation: "callees", symbol: "main", expected: json!([
                 {"name": "main", "filePath": "functions.c", "startLine": 4,
                  "edges": [
                     {"symbol": {"name": "proto", "filePath": "functions.c", "startLine": 1}, "line": 5, "column": 3},
@@ -1887,7 +1881,7 @@ async fn java_explicit_constructor_chain() {
             SourceFile { path: "Constructors.java", source: "class Base {\n    Base(int size) {}\n}\nclass Derived extends Base {\n    Derived() {\n        this(5);\n    }\n    Derived(int size) {\n        super(size);\n    }\n}\n" },
         ],
         queries: vec![
-            Query { direction: "out", symbol: "Derived::Derived", expected: json!([
+            Query { operation: "callees", symbol: "Derived::Derived", expected: json!([
                 {"name": "Derived::Derived", "filePath": "Constructors.java", "startLine": 5,
                  "edges": [
                     {"symbol": {"name": "Derived::Derived", "filePath": "Constructors.java", "startLine": 8}, "line": 6, "column": 8},
@@ -1897,7 +1891,7 @@ async fn java_explicit_constructor_chain() {
                     {"symbol": {"name": "Base::Base", "filePath": "Constructors.java", "startLine": 2}, "line": 9, "column": 8},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "Derived::Derived", expected: json!([
+            Query { operation: "callers", symbol: "Derived::Derived", expected: json!([
                 {"name": "Derived::Derived", "filePath": "Constructors.java", "startLine": 5,
                  "edges": []},
                 {"name": "Derived::Derived", "filePath": "Constructors.java", "startLine": 8,
@@ -1905,7 +1899,7 @@ async fn java_explicit_constructor_chain() {
                     {"symbol": {"name": "Derived::Derived", "filePath": "Constructors.java", "startLine": 5}, "line": 6, "column": 8},
                 ]},
             ]) },
-            Query { direction: "in", symbol: "Base::Base", expected: json!([
+            Query { operation: "callers", symbol: "Base::Base", expected: json!([
                 {"name": "Base::Base", "filePath": "Constructors.java", "startLine": 2,
                  "edges": [
                     {"symbol": {"name": "Derived::Derived", "filePath": "Constructors.java", "startLine": 8}, "line": 9, "column": 8},
@@ -1926,7 +1920,7 @@ async fn cpp_overload_arity_and_type() {
             SourceFile { path: "overloads.cc", source: "void run() {}\nvoid run(int value) {}\nvoid run(const char *value) {}\nvoid caller() {\n    run();\n    run(1);\n    run(\"text\");\n}\n" },
         ],
         queries: vec![
-            Query { direction: "in", symbol: "run", expected: json!([
+            Query { operation: "callers", symbol: "run", expected: json!([
                 {"name": "run", "filePath": "overloads.cc", "startLine": 1,
                  "edges": [
                     {"symbol": {"name": "caller", "filePath": "overloads.cc", "startLine": 4}, "line": 5, "column": 4},
@@ -1940,7 +1934,7 @@ async fn cpp_overload_arity_and_type() {
                     {"symbol": {"name": "caller", "filePath": "overloads.cc", "startLine": 4}, "line": 7, "column": 4},
                 ]},
             ]) },
-            Query { direction: "out", symbol: "caller", expected: json!([
+            Query { operation: "callees", symbol: "caller", expected: json!([
                 {"name": "caller", "filePath": "overloads.cc", "startLine": 4,
                  "edges": [
                     {"symbol": {"name": "run", "filePath": "overloads.cc", "startLine": 1}, "line": 5, "column": 4},
@@ -1977,7 +1971,7 @@ mod right {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "left::work", "filePath": "scopes.rs", "startLine": 2,
@@ -1991,7 +1985,7 @@ mod right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "left::caller", "filePath": "scopes.rs", "startLine": 3,
@@ -2005,7 +1999,7 @@ mod right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "left::work",
                 expected: json!([
                     {"name": "left::work", "filePath": "scopes.rs", "startLine": 2,
@@ -2015,7 +2009,7 @@ mod right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "left::caller",
                 expected: json!([
                     {"name": "left::caller", "filePath": "scopes.rs", "startLine": 3,
@@ -2025,7 +2019,7 @@ mod right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "right::work",
                 expected: json!([
                     {"name": "right::work", "filePath": "scopes.rs", "startLine": 8,
@@ -2035,7 +2029,7 @@ mod right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "right::caller",
                 expected: json!([
                     {"name": "right::caller", "filePath": "scopes.rs", "startLine": 9,
@@ -2074,7 +2068,7 @@ namespace Right {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "scopes.cc", "startLine": 2,
@@ -2088,7 +2082,7 @@ namespace Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "scopes.cc", "startLine": 3,
@@ -2102,7 +2096,7 @@ namespace Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "scopes.cc", "startLine": 2,
@@ -2112,7 +2106,7 @@ namespace Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "scopes.cc", "startLine": 3,
@@ -2122,7 +2116,7 @@ namespace Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Right::work",
                 expected: json!([
                     {"name": "Right::work", "filePath": "scopes.cc", "startLine": 8,
@@ -2132,7 +2126,7 @@ namespace Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "scopes.cc", "startLine": 9,
@@ -2171,7 +2165,7 @@ class Right {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "Scopes.java", "startLine": 2,
@@ -2185,7 +2179,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "Scopes.java", "startLine": 3,
@@ -2199,7 +2193,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "Scopes.java", "startLine": 2,
@@ -2209,7 +2203,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "Scopes.java", "startLine": 3,
@@ -2219,7 +2213,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Right::work",
                 expected: json!([
                     {"name": "Right::work", "filePath": "Scopes.java", "startLine": 8,
@@ -2229,7 +2223,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "Scopes.java", "startLine": 9,
@@ -2268,7 +2262,7 @@ class Right {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "scopes.js", "startLine": 2,
@@ -2282,7 +2276,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "scopes.js", "startLine": 3,
@@ -2296,7 +2290,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "scopes.js", "startLine": 2,
@@ -2306,7 +2300,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "scopes.js", "startLine": 3,
@@ -2316,7 +2310,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Right::work",
                 expected: json!([
                     {"name": "Right::work", "filePath": "scopes.js", "startLine": 8,
@@ -2326,7 +2320,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "scopes.js", "startLine": 9,
@@ -2364,7 +2358,7 @@ class Right:
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "scopes.py", "startLine": 2,
@@ -2378,7 +2372,7 @@ class Right:
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "scopes.py", "startLine": 4,
@@ -2392,7 +2386,7 @@ class Right:
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "scopes.py", "startLine": 2,
@@ -2402,7 +2396,7 @@ class Right:
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "scopes.py", "startLine": 4,
@@ -2412,7 +2406,7 @@ class Right:
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Right::work",
                 expected: json!([
                     {"name": "Right::work", "filePath": "scopes.py", "startLine": 8,
@@ -2422,7 +2416,7 @@ class Right:
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "scopes.py", "startLine": 10,
@@ -2462,7 +2456,7 @@ func (self *Right) caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "scopes.go", "startLine": 4,
@@ -2476,7 +2470,7 @@ func (self *Right) caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "scopes.go", "startLine": 5,
@@ -2490,7 +2484,7 @@ func (self *Right) caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::work",
                 expected: json!([
                     {"name": "Left::work", "filePath": "scopes.go", "startLine": 4,
@@ -2500,7 +2494,7 @@ func (self *Right) caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "scopes.go", "startLine": 5,
@@ -2510,7 +2504,7 @@ func (self *Right) caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Right::work",
                 expected: json!([
                     {"name": "Right::work", "filePath": "scopes.go", "startLine": 10,
@@ -2520,7 +2514,7 @@ func (self *Right) caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "scopes.go", "startLine": 11,
@@ -2562,7 +2556,7 @@ static void caller(void) {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "left.c", "startLine": 1,
@@ -2576,7 +2570,7 @@ static void caller(void) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "left.c", "startLine": 2,
@@ -2616,7 +2610,7 @@ fn outer() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "shadow.rs", "startLine": 1,
@@ -2628,7 +2622,7 @@ fn outer() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "target",
                 expected: json!([
                     {"name": "target", "filePath": "shadow.rs", "startLine": 2,
@@ -2638,7 +2632,7 @@ fn outer() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "outer",
                 expected: json!([
                     {"name": "outer", "filePath": "shadow.rs", "startLine": 3,
@@ -2648,7 +2642,7 @@ fn outer() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "outer::work",
                 expected: json!([
                     {"name": "outer::work", "filePath": "shadow.rs", "startLine": 4,
@@ -2684,7 +2678,7 @@ function outer() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "shadow.js", "startLine": 1,
@@ -2696,7 +2690,7 @@ function outer() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "target",
                 expected: json!([
                     {"name": "target", "filePath": "shadow.js", "startLine": 2,
@@ -2706,7 +2700,7 @@ function outer() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "outer",
                 expected: json!([
                     {"name": "outer", "filePath": "shadow.js", "startLine": 3,
@@ -2716,7 +2710,7 @@ function outer() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "outer::work",
                 expected: json!([
                     {"name": "outer::work", "filePath": "shadow.js", "startLine": 4,
@@ -2752,7 +2746,7 @@ def outer():
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "shadow.py", "startLine": 1,
@@ -2764,7 +2758,7 @@ def outer():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "target",
                 expected: json!([
                     {"name": "target", "filePath": "shadow.py", "startLine": 3,
@@ -2774,7 +2768,7 @@ def outer():
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "outer",
                 expected: json!([
                     {"name": "outer", "filePath": "shadow.py", "startLine": 5,
@@ -2784,7 +2778,7 @@ def outer():
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "outer::work",
                 expected: json!([
                     {"name": "outer::work", "filePath": "shadow.py", "startLine": 6,
@@ -2817,7 +2811,7 @@ void caller(void) {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "shadow.c", "startLine": 1,
@@ -2825,7 +2819,7 @@ void caller(void) {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "target",
                 expected: json!([
                     {"name": "target", "filePath": "shadow.c", "startLine": 2,
@@ -2835,7 +2829,7 @@ void caller(void) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "shadow.c", "startLine": 3,
@@ -2873,7 +2867,7 @@ function caller(a: Left, b: Right) {
         }],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "receivers.ts", "startLine": 7,
@@ -2884,7 +2878,7 @@ function caller(a: Left, b: Right) {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::run",
                 expected: json!([
                     {"name": "Left::run", "filePath": "receivers.ts", "startLine": 2,
@@ -2894,7 +2888,7 @@ function caller(a: Left, b: Right) {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Right::run",
                 expected: json!([
                     {"name": "Right::run", "filePath": "receivers.ts", "startLine": 5,
@@ -2934,7 +2928,7 @@ class Use {
         }],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Use::caller",
                 expected: json!([
                     {"name": "Use::caller", "filePath": "Receivers.java", "startLine": 8,
@@ -2945,7 +2939,7 @@ class Use {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::run",
                 expected: json!([
                     {"name": "Left::run", "filePath": "Receivers.java", "startLine": 2,
@@ -2955,7 +2949,7 @@ class Use {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Right::run",
                 expected: json!([
                     {"name": "Right::run", "filePath": "Receivers.java", "startLine": 5,
@@ -2993,7 +2987,7 @@ void caller(Left &a, Right &b) {
         }],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "receivers.cc", "startLine": 7,
@@ -3004,7 +2998,7 @@ void caller(Left &a, Right &b) {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::run",
                 expected: json!([
                     {"name": "Left::run", "filePath": "receivers.cc", "startLine": 2,
@@ -3014,7 +3008,7 @@ void caller(Left &a, Right &b) {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Right::run",
                 expected: json!([
                     {"name": "Right::run", "filePath": "receivers.cc", "startLine": 5,
@@ -3052,7 +3046,7 @@ func caller(a Left, b *Right) {
         }],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "receivers.go", "startLine": 7,
@@ -3063,7 +3057,7 @@ func caller(a Left, b *Right) {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::run",
                 expected: json!([
                     {"name": "Left::run", "filePath": "receivers.go", "startLine": 4,
@@ -3073,7 +3067,7 @@ func caller(a Left, b *Right) {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Right::run",
                 expected: json!([
                     {"name": "Right::run", "filePath": "receivers.go", "startLine": 6,
@@ -3120,7 +3114,7 @@ def caller():
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.py", "startLine": 3,
@@ -3131,7 +3125,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "left.py", "startLine": 1,
@@ -3181,7 +3175,7 @@ function caller() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.ts", "startLine": 3,
@@ -3192,7 +3186,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "left.ts", "startLine": 1,
@@ -3244,7 +3238,7 @@ fn caller() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "lib.rs", "startLine": 5,
@@ -3255,7 +3249,7 @@ fn caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "left::work", "filePath": "left.rs", "startLine": 1,
@@ -3320,7 +3314,7 @@ func caller() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.go", "startLine": 8,
@@ -3331,7 +3325,7 @@ func caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Work",
                 expected: json!([
                     {"name": "Work", "filePath": "left/left.go", "startLine": 3,
@@ -3378,7 +3372,7 @@ function caller() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "leaf.ts", "startLine": 1,
@@ -3388,7 +3382,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.ts", "startLine": 2,
@@ -3404,7 +3398,7 @@ function caller() {
 
 // zvec-grep-specific position regression. Two calls on one line follow Chinese characters and an
 // emoji. Recorded columns are illustrative; this suite does not compare them.
-// Retain both edges even though source, target and line are equal.
+// Expect one relationship even though the same target is called twice on this line.
 #[tokio::test]
 async fn javascript_unicode_prefix_and_repeated_same_line_calls() {
     check_case(Case {
@@ -3419,24 +3413,22 @@ function caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "target",
                 expected: json!([
                     {"name": "target", "filePath": "positions.js", "startLine": 1,
                      "edges": [
                         {"symbol": {"name": "caller", "filePath": "positions.js", "startLine": 2}, "line": 3, "column": 31},
-                        {"symbol": {"name": "caller", "filePath": "positions.js", "startLine": 2}, "line": 3, "column": 41},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "positions.js", "startLine": 2,
                      "edges": [
                         {"symbol": {"name": "target", "filePath": "positions.js", "startLine": 1}, "line": 3, "column": 31},
-                        {"symbol": {"name": "target", "filePath": "positions.js", "startLine": 1}, "line": 3, "column": 41},
                     ]},
                 ]),
             },
@@ -3447,7 +3439,7 @@ function caller() {
 
 // zvec-grep-specific position regression. Two calls on one line follow Chinese characters and an
 // emoji. Recorded columns are illustrative; this suite does not compare them.
-// Retain both edges even though source, target and line are equal.
+// Expect one relationship even though the same target is called twice on this line.
 #[tokio::test]
 async fn c_unicode_prefix_and_repeated_same_line_calls() {
     check_case(Case {
@@ -3462,24 +3454,22 @@ void caller(void) {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "target",
                 expected: json!([
                     {"name": "target", "filePath": "positions.c", "startLine": 1,
                      "edges": [
                         {"symbol": {"name": "caller", "filePath": "positions.c", "startLine": 2}, "line": 3, "column": 21},
-                        {"symbol": {"name": "caller", "filePath": "positions.c", "startLine": 2}, "line": 3, "column": 31},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "positions.c", "startLine": 2,
                      "edges": [
                         {"symbol": {"name": "target", "filePath": "positions.c", "startLine": 1}, "line": 3, "column": 21},
-                        {"symbol": {"name": "target", "filePath": "positions.c", "startLine": 1}, "line": 3, "column": 31},
                     ]},
                 ]),
             },
@@ -3510,7 +3500,7 @@ async fn incremental_target_edit_rebinds_unchanged_caller() {
             "unchanged caller must point to the new target identity",
             &[
                 Query {
-                    direction: "out",
+                    operation: "callees",
                     symbol: "caller",
                     expected: json!([
                         {"name": "caller", "filePath": "caller.py", "startLine": 2,
@@ -3520,7 +3510,7 @@ async fn incremental_target_edit_rebinds_unchanged_caller() {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "first",
                     expected: json!([
                         {"name": "first", "filePath": "targets.py", "startLine": 3,
@@ -3557,7 +3547,7 @@ async fn incremental_target_move_then_import_edit_updates_path() {
             "old explicit import cannot resolve by unrelated workspace fallback",
             &[
                 Query {
-                    direction: "out",
+                    operation: "callees",
                     symbol: "caller",
                     expected: json!([
                         {"name": "caller", "filePath": "caller.py", "startLine": 2,
@@ -3565,7 +3555,7 @@ async fn incremental_target_move_then_import_edit_updates_path() {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "first",
                     expected: json!([
                         {"name": "first", "filePath": "moved.py", "startLine": 1,
@@ -3589,7 +3579,7 @@ async fn incremental_target_move_then_import_edit_updates_path() {
             "updated import uses the moved definition and path",
             &[
                 Query {
-                    direction: "out",
+                    operation: "callees",
                     symbol: "caller",
                     expected: json!([
                         {"name": "caller", "filePath": "caller.py", "startLine": 2,
@@ -3599,7 +3589,7 @@ async fn incremental_target_move_then_import_edit_updates_path() {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "first",
                     expected: json!([
                         {"name": "first", "filePath": "moved.py", "startLine": 1,
@@ -3637,7 +3627,7 @@ async fn incremental_new_candidate_invalidates_unique_resolution() {
 
     let unique = [
         Query {
-            direction: "out",
+            operation: "callees",
             symbol: "caller",
             expected: json!([
                 {"name": "caller", "filePath": "caller.js", "startLine": 1,
@@ -3647,7 +3637,7 @@ async fn incremental_new_candidate_invalidates_unique_resolution() {
             ]),
         },
         Query {
-            direction: "in",
+            operation: "callers",
             symbol: "work",
             expected: json!([
                 {"name": "work", "filePath": "one.js", "startLine": 1,
@@ -3675,7 +3665,7 @@ async fn incremental_new_candidate_invalidates_unique_resolution() {
             "new candidate invalidates the old unique resolution",
             &[
                 Query {
-                    direction: "out",
+                    operation: "callees",
                     symbol: "caller",
                     expected: json!([
                         {"name": "caller", "filePath": "caller.js", "startLine": 1,
@@ -3683,7 +3673,7 @@ async fn incremental_new_candidate_invalidates_unique_resolution() {
                     ]),
                 },
                 Query {
-                    direction: "in",
+                    operation: "callers",
                     symbol: "work",
                     expected: json!([
                         {"name": "work", "filePath": "one.js", "startLine": 1,
@@ -3730,7 +3720,7 @@ void caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "auto.cc", "startLine": 3,
@@ -3742,7 +3732,7 @@ void caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "auto.cc", "startLine": 8,
@@ -3753,7 +3743,7 @@ void caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "auto.cc", "startLine": 6,
@@ -3789,7 +3779,7 @@ void caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "auto.cc", "startLine": 3,
@@ -3801,7 +3791,7 @@ void caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "auto.cc", "startLine": 8,
@@ -3812,7 +3802,7 @@ void caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "auto.cc", "startLine": 6,
@@ -3853,7 +3843,7 @@ void caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "auto.cc", "startLine": 3,
@@ -3865,7 +3855,7 @@ void caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "auto.cc", "startLine": 12,
@@ -3876,7 +3866,7 @@ void caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "makeX",
                 expected: json!([
                     {"name": "makeX", "filePath": "auto.cc", "startLine": 8,
@@ -3886,7 +3876,7 @@ void caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "auto.cc", "startLine": 6,
@@ -3922,7 +3912,7 @@ void caller(X& existing) {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "auto.cc", "startLine": 3,
@@ -3934,7 +3924,7 @@ void caller(X& existing) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "auto.cc", "startLine": 8,
@@ -3944,7 +3934,7 @@ void caller(X& existing) {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "auto.cc", "startLine": 6,
@@ -3987,7 +3977,7 @@ class Use {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "Inferred.java", "startLine": 3,
@@ -3999,7 +3989,7 @@ class Use {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Use::caller",
                 expected: json!([
                     {"name": "Use::caller", "filePath": "Inferred.java", "startLine": 12,
@@ -4010,7 +4000,7 @@ class Use {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "Inferred.java", "startLine": 6,
@@ -4053,7 +4043,7 @@ class Use {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "Inferred.java", "startLine": 3,
@@ -4065,7 +4055,7 @@ class Use {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Use::caller",
                 expected: json!([
                     {"name": "Use::caller", "filePath": "Inferred.java", "startLine": 12,
@@ -4076,7 +4066,7 @@ class Use {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "Inferred.java", "startLine": 6,
@@ -4084,84 +4074,7 @@ class Use {
                 ]),
             },
             Query {
-                direction: "out",
-                symbol: "Use::makeX",
-                expected: json!([
-                    {"name": "Use::makeX", "filePath": "Inferred.java", "startLine": 9,
-                     "edges": [
-                        {"symbol": {"name": "X::X", "filePath": "Inferred.java", "startLine": 2}, "line": 10, "column": 19},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific inferred receiver/callback regression.
-// Java var uses the initializer type, the declared X factory return type, or a copied object
-// reference. The explicit X constructor is a direct call only where new X() occurs. Copying x to y
-// is not a call. Y::foo is deliberately present as a same-named decoy. Query only direct calls:
-// construction inside the factory must not leak into caller.
-#[tokio::test]
-async fn java_inferred_variable_alias_receiver() {
-    check_case(Case {
-        name: "java_inferred_variable_alias_receiver",
-        files: vec![SourceFile {
-            path: "Inferred.java",
-            source: r"class X {
-    X() {}
-    void foo() {}
-}
-class Y {
-    void foo() {}
-}
-class Use {
-    static X makeX() {
-        return new X();
-    }
-    static void caller() {
-        var x = makeX();
-        var y = x;
-        y.foo();
-    }
-}
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "Inferred.java", "startLine": 3,
-                     "edges": [
-                        {"symbol": {"name": "Use::caller", "filePath": "Inferred.java", "startLine": 12}, "line": 15, "column": 10},
-                    ]},
-                    {"name": "Y::foo", "filePath": "Inferred.java", "startLine": 6,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "Use::caller",
-                expected: json!([
-                    {"name": "Use::caller", "filePath": "Inferred.java", "startLine": 12,
-                     "edges": [
-                        {"symbol": {"name": "Use::makeX", "filePath": "Inferred.java", "startLine": 9}, "line": 13, "column": 16},
-                        {"symbol": {"name": "X::foo", "filePath": "Inferred.java", "startLine": 3}, "line": 15, "column": 10},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "Y::foo",
-                expected: json!([
-                    {"name": "Y::foo", "filePath": "Inferred.java", "startLine": 6,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Use::makeX",
                 expected: json!([
                     {"name": "Use::makeX", "filePath": "Inferred.java", "startLine": 9,
@@ -4203,7 +4116,7 @@ function caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.js", "startLine": 2,
@@ -4215,7 +4128,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.js", "startLine": 10,
@@ -4226,7 +4139,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.js", "startLine": 5,
@@ -4266,7 +4179,7 @@ function caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.js", "startLine": 2,
@@ -4278,7 +4191,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.js", "startLine": 10,
@@ -4289,7 +4202,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.js", "startLine": 5,
@@ -4297,81 +4210,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "out",
-                symbol: "makeX",
-                expected: json!([
-                    {"name": "makeX", "filePath": "inferred.js", "startLine": 7,
-                     "edges": [
-                        {"symbol": {"name": "X", "filePath": "inferred.js", "startLine": 1}, "line": 8, "column": 15},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific inferred receiver/callback regression.
-// JavaScript infers the receiver from new X(), factory return expressions and reference aliases.
-// As in the existing implicit-constructor contract, new X() targets the X class definition;
-// copying x to y creates no call. Y::foo is deliberately present as a same-named decoy. Query only
-// direct calls: construction inside the factory must not leak into caller.
-#[tokio::test]
-async fn javascript_inferred_variable_alias_receiver() {
-    check_case(Case {
-        name: "javascript_inferred_variable_alias_receiver",
-        files: vec![SourceFile {
-            path: "inferred.js",
-            source: r"class X {
-    foo() {}
-}
-class Y {
-    foo() {}
-}
-function makeX() {
-    return new X();
-}
-function caller() {
-    const x = makeX();
-    const y = x;
-    y.foo();
-}
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "inferred.js", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "inferred.js", "startLine": 10}, "line": 13, "column": 6},
-                    ]},
-                    {"name": "Y::foo", "filePath": "inferred.js", "startLine": 5,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "caller",
-                expected: json!([
-                    {"name": "caller", "filePath": "inferred.js", "startLine": 10,
-                     "edges": [
-                        {"symbol": {"name": "makeX", "filePath": "inferred.js", "startLine": 7}, "line": 11, "column": 14},
-                        {"symbol": {"name": "X::foo", "filePath": "inferred.js", "startLine": 2}, "line": 13, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "Y::foo",
-                expected: json!([
-                    {"name": "Y::foo", "filePath": "inferred.js", "startLine": 5,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "makeX",
                 expected: json!([
                     {"name": "makeX", "filePath": "inferred.js", "startLine": 7,
@@ -4413,7 +4252,7 @@ function caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.ts", "startLine": 2,
@@ -4425,7 +4264,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.ts", "startLine": 10,
@@ -4436,7 +4275,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.ts", "startLine": 5,
@@ -4476,7 +4315,7 @@ function caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.ts", "startLine": 2,
@@ -4488,7 +4327,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.ts", "startLine": 10,
@@ -4499,7 +4338,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.ts", "startLine": 5,
@@ -4507,81 +4346,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "out",
-                symbol: "makeX",
-                expected: json!([
-                    {"name": "makeX", "filePath": "inferred.ts", "startLine": 7,
-                     "edges": [
-                        {"symbol": {"name": "X", "filePath": "inferred.ts", "startLine": 1}, "line": 8, "column": 15},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific inferred receiver/callback regression.
-// TypeScript infers the receiver from new X(), the declared factory return type and reference
-// aliases. As in the existing implicit-constructor contract, new X() targets the X class
-// definition; copying x to y creates no call. Y::foo is deliberately present as a same-named
-// decoy. Query only direct calls: construction inside the factory must not leak into caller.
-#[tokio::test]
-async fn typescript_inferred_variable_alias_receiver() {
-    check_case(Case {
-        name: "typescript_inferred_variable_alias_receiver",
-        files: vec![SourceFile {
-            path: "inferred.ts",
-            source: r"class X {
-    foo() {}
-}
-class Y {
-    foo() {}
-}
-function makeX(): X {
-    return new X();
-}
-function caller() {
-    const x = makeX();
-    const y = x;
-    y.foo();
-}
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "inferred.ts", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "inferred.ts", "startLine": 10}, "line": 13, "column": 6},
-                    ]},
-                    {"name": "Y::foo", "filePath": "inferred.ts", "startLine": 5,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "caller",
-                expected: json!([
-                    {"name": "caller", "filePath": "inferred.ts", "startLine": 10,
-                     "edges": [
-                        {"symbol": {"name": "makeX", "filePath": "inferred.ts", "startLine": 7}, "line": 11, "column": 14},
-                        {"symbol": {"name": "X::foo", "filePath": "inferred.ts", "startLine": 2}, "line": 13, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "Y::foo",
-                expected: json!([
-                    {"name": "Y::foo", "filePath": "inferred.ts", "startLine": 5,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "makeX",
                 expected: json!([
                     {"name": "makeX", "filePath": "inferred.ts", "startLine": 7,
@@ -4624,7 +4389,7 @@ def caller():
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.py", "startLine": 2,
@@ -4636,7 +4401,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.py", "startLine": 11,
@@ -4647,7 +4412,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.py", "startLine": 5,
@@ -4688,7 +4453,7 @@ def caller():
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.py", "startLine": 2,
@@ -4700,7 +4465,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.py", "startLine": 11,
@@ -4711,7 +4476,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.py", "startLine": 5,
@@ -4719,82 +4484,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "out",
-                symbol: "make_x",
-                expected: json!([
-                    {"name": "make_x", "filePath": "inferred.py", "startLine": 8,
-                     "edges": [
-                        {"symbol": {"name": "X", "filePath": "inferred.py", "startLine": 1}, "line": 9, "column": 11},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific inferred receiver/callback regression.
-// Python infers the receiver from X(), the unannotated factory return expression and a local
-// variable alias. X has no explicit __init__; construction targets the class definition rather
-// than fabricating an initializer entity. Bare assignment is not a call. Y::foo is deliberately
-// present as a same-named decoy. Query only direct calls: construction inside the factory must not
-// leak into caller.
-#[tokio::test]
-async fn python_inferred_variable_alias_receiver() {
-    check_case(Case {
-        name: "python_inferred_variable_alias_receiver",
-        files: vec![SourceFile {
-            path: "inferred.py",
-            source: r"class X:
-    def foo(self):
-        pass
-class Y:
-    def foo(self):
-        pass
-
-def make_x():
-    return X()
-
-def caller():
-    x = make_x()
-    y = x
-    y.foo()
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "inferred.py", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "inferred.py", "startLine": 11}, "line": 14, "column": 6},
-                    ]},
-                    {"name": "Y::foo", "filePath": "inferred.py", "startLine": 5,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "caller",
-                expected: json!([
-                    {"name": "caller", "filePath": "inferred.py", "startLine": 11,
-                     "edges": [
-                        {"symbol": {"name": "make_x", "filePath": "inferred.py", "startLine": 8}, "line": 12, "column": 8},
-                        {"symbol": {"name": "X::foo", "filePath": "inferred.py", "startLine": 2}, "line": 14, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "Y::foo",
-                expected: json!([
-                    {"name": "Y::foo", "filePath": "inferred.py", "startLine": 5,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "make_x",
                 expected: json!([
                     {"name": "make_x", "filePath": "inferred.py", "startLine": 8,
@@ -4836,7 +4526,7 @@ func caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.go", "startLine": 4,
@@ -4848,7 +4538,7 @@ func caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.go", "startLine": 10,
@@ -4858,7 +4548,7 @@ func caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.go", "startLine": 6,
@@ -4898,7 +4588,7 @@ func caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.go", "startLine": 4,
@@ -4910,7 +4600,7 @@ func caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.go", "startLine": 10,
@@ -4921,7 +4611,7 @@ func caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.go", "startLine": 6,
@@ -4929,79 +4619,7 @@ func caller() {
                 ]),
             },
             Query {
-                direction: "out",
-                symbol: "makeX",
-                expected: json!([
-                    {"name": "makeX", "filePath": "inferred.go", "startLine": 7,
-                     "edges": []},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific inferred receiver/callback regression.
-// Go short declarations infer *X from new(X) or the factory signature; y := x copies that pointer.
-// Builtin new has no indexed function target and is not a fabricated constructor call. Pointer-
-// receiver foo must bind to X, not Y. Y::foo is deliberately present as a same-named decoy. Query
-// only direct calls: construction inside the factory must not leak into caller.
-#[tokio::test]
-async fn go_inferred_variable_alias_receiver() {
-    check_case(Case {
-        name: "go_inferred_variable_alias_receiver",
-        files: vec![SourceFile {
-            path: "inferred.go",
-            source: r"package inferred
-
-type X struct{}
-func (x *X) foo() {}
-type Y struct{}
-func (y *Y) foo() {}
-func makeX() *X {
-    return new(X)
-}
-func caller() {
-    x := makeX()
-    y := x
-    y.foo()
-}
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "inferred.go", "startLine": 4,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "inferred.go", "startLine": 10}, "line": 13, "column": 6},
-                    ]},
-                    {"name": "Y::foo", "filePath": "inferred.go", "startLine": 6,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "caller",
-                expected: json!([
-                    {"name": "caller", "filePath": "inferred.go", "startLine": 10,
-                     "edges": [
-                        {"symbol": {"name": "makeX", "filePath": "inferred.go", "startLine": 7}, "line": 11, "column": 9},
-                        {"symbol": {"name": "X::foo", "filePath": "inferred.go", "startLine": 4}, "line": 13, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "Y::foo",
-                expected: json!([
-                    {"name": "Y::foo", "filePath": "inferred.go", "startLine": 6,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "makeX",
                 expected: json!([
                     {"name": "makeX", "filePath": "inferred.go", "startLine": 7,
@@ -5043,7 +4661,7 @@ fn caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.rs", "startLine": 3,
@@ -5055,7 +4673,7 @@ fn caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.rs", "startLine": 12,
@@ -5065,7 +4683,7 @@ fn caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.rs", "startLine": 7,
@@ -5107,7 +4725,7 @@ fn caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "inferred.rs", "startLine": 3,
@@ -5119,7 +4737,7 @@ fn caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "inferred.rs", "startLine": 12,
@@ -5130,7 +4748,7 @@ fn caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "inferred.rs", "startLine": 7,
@@ -5138,81 +4756,7 @@ fn caller() {
                 ]),
             },
             Query {
-                direction: "out",
-                symbol: "make_x",
-                expected: json!([
-                    {"name": "make_x", "filePath": "inferred.rs", "startLine": 9,
-                     "edges": []},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific inferred receiver/callback regression.
-// Rust let bindings infer X from a struct expression or the factory signature. let y = x moves the
-// value without creating a call; y.foo() still binds to X. The X {} struct expression is not a
-// constructor function call. Y::foo is deliberately present as a same-named decoy. Query only
-// direct calls: construction inside the factory must not leak into caller.
-#[tokio::test]
-async fn rust_inferred_variable_alias_receiver() {
-    check_case(Case {
-        name: "rust_inferred_variable_alias_receiver",
-        files: vec![SourceFile {
-            path: "inferred.rs",
-            source: r"struct X {}
-impl X {
-    fn foo(&self) {}
-}
-struct Y {}
-impl Y {
-    fn foo(&self) {}
-}
-fn make_x() -> X {
-    X {}
-}
-fn caller() {
-    let x = make_x();
-    let y = x;
-    y.foo();
-}
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "inferred.rs", "startLine": 3,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "inferred.rs", "startLine": 12}, "line": 15, "column": 6},
-                    ]},
-                    {"name": "Y::foo", "filePath": "inferred.rs", "startLine": 7,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "caller",
-                expected: json!([
-                    {"name": "caller", "filePath": "inferred.rs", "startLine": 12,
-                     "edges": [
-                        {"symbol": {"name": "make_x", "filePath": "inferred.rs", "startLine": 9}, "line": 13, "column": 12},
-                        {"symbol": {"name": "X::foo", "filePath": "inferred.rs", "startLine": 3}, "line": 15, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "Y::foo",
-                expected: json!([
-                    {"name": "Y::foo", "filePath": "inferred.rs", "startLine": 7,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "make_x",
                 expected: json!([
                     {"name": "make_x", "filePath": "inferred.rs", "startLine": 9,
@@ -5270,7 +4814,7 @@ void caller(void) {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "foo", "filePath": "x.c", "startLine": 2,
@@ -5282,7 +4826,7 @@ void caller(void) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.c", "startLine": 2,
@@ -5293,7 +4837,7 @@ void caller(void) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "makeX",
                 expected: json!([
                     {"name": "makeX", "filePath": "x.c", "startLine": 3,
@@ -5352,7 +4896,7 @@ void caller(void) {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "foo", "filePath": "x.c", "startLine": 2,
@@ -5364,7 +4908,7 @@ void caller(void) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.c", "startLine": 2,
@@ -5375,7 +4919,7 @@ void caller(void) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "makeX",
                 expected: json!([
                     {"name": "makeX", "filePath": "x.c", "startLine": 3,
@@ -5435,7 +4979,7 @@ void caller(void) {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "run",
                 expected: json!([
                     {"name": "run", "filePath": "x.c", "startLine": 2,
@@ -5447,7 +4991,7 @@ void caller(void) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.c", "startLine": 2,
@@ -5458,7 +5002,7 @@ void caller(void) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "makeX",
                 expected: json!([
                     {"name": "makeX", "filePath": "x.c", "startLine": 3,
@@ -5494,7 +5038,7 @@ function caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "reassigned.js", "startLine": 2,
@@ -5508,7 +5052,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "X::foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "reassigned.js", "startLine": 2,
@@ -5518,7 +5062,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "reassigned.js", "startLine": 5,
@@ -5528,7 +5072,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "reassigned.js", "startLine": 7,
@@ -5537,87 +5081,6 @@ function caller() {
                         {"symbol": {"name": "X::foo", "filePath": "reassigned.js", "startLine": 2}, "line": 9, "column": 6},
                         {"symbol": {"name": "Y", "filePath": "reassigned.js", "startLine": 4}, "line": 10, "column": 12},
                         {"symbol": {"name": "Y::foo", "filePath": "reassigned.js", "startLine": 5}, "line": 11, "column": 6},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific flow-sensitive receiver regression.
-// Reassignment changes only subsequent x.foo() targets; earlier sites retain X.
-// y captures the X object before x is rebound to Y; y.foo() must still target X.
-#[tokio::test]
-async fn javascript_receiver_reassignment_preserves_alias() {
-    check_case(Case {
-        name: "javascript_receiver_reassignment_preserves_alias",
-        files: vec![SourceFile {
-            path: "reassigned.js",
-            source: r"class X {
-    foo() {}
-}
-class Y {
-    foo() {}
-}
-function caller() {
-    let x = new X();
-    x.foo();
-    const y = x;
-    x = new Y();
-    x.foo();
-    y.foo();
-}
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "reassigned.js", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.js", "startLine": 7}, "line": 9, "column": 6},
-                        {"symbol": {"name": "caller", "filePath": "reassigned.js", "startLine": 7}, "line": 13, "column": 6},
-                    ]},
-                    {"name": "Y::foo", "filePath": "reassigned.js", "startLine": 5,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.js", "startLine": 7}, "line": 12, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "X::foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "reassigned.js", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.js", "startLine": 7}, "line": 9, "column": 6},
-                        {"symbol": {"name": "caller", "filePath": "reassigned.js", "startLine": 7}, "line": 13, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "Y::foo",
-                expected: json!([
-                    {"name": "Y::foo", "filePath": "reassigned.js", "startLine": 5,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.js", "startLine": 7}, "line": 12, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "caller",
-                expected: json!([
-                    {"name": "caller", "filePath": "reassigned.js", "startLine": 7,
-                     "edges": [
-                        {"symbol": {"name": "X", "filePath": "reassigned.js", "startLine": 1}, "line": 8, "column": 16},
-                        {"symbol": {"name": "X::foo", "filePath": "reassigned.js", "startLine": 2}, "line": 9, "column": 6},
-                        {"symbol": {"name": "Y", "filePath": "reassigned.js", "startLine": 4}, "line": 11, "column": 12},
-                        {"symbol": {"name": "Y::foo", "filePath": "reassigned.js", "startLine": 5}, "line": 12, "column": 6},
-                        {"symbol": {"name": "X::foo", "filePath": "reassigned.js", "startLine": 2}, "line": 13, "column": 6},
                     ]},
                 ]),
             },
@@ -5651,7 +5114,7 @@ function caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "reassigned.ts", "startLine": 2,
@@ -5665,7 +5128,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "X::foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "reassigned.ts", "startLine": 2,
@@ -5675,7 +5138,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "reassigned.ts", "startLine": 5,
@@ -5685,7 +5148,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "reassigned.ts", "startLine": 7,
@@ -5694,88 +5157,6 @@ function caller() {
                         {"symbol": {"name": "X::foo", "filePath": "reassigned.ts", "startLine": 2}, "line": 9, "column": 6},
                         {"symbol": {"name": "Y", "filePath": "reassigned.ts", "startLine": 4}, "line": 10, "column": 12},
                         {"symbol": {"name": "Y::foo", "filePath": "reassigned.ts", "startLine": 5}, "line": 11, "column": 6},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific flow-sensitive receiver regression.
-// Reassignment changes only subsequent x.foo() targets; earlier sites retain X.
-// y captures the X object before x is rebound to Y; y.foo() must still target X.
-// The union permits both assignments; each straight-line call has one concrete receiver.
-#[tokio::test]
-async fn typescript_receiver_reassignment_preserves_alias() {
-    check_case(Case {
-        name: "typescript_receiver_reassignment_preserves_alias",
-        files: vec![SourceFile {
-            path: "reassigned.ts",
-            source: r"class X {
-    foo() {}
-}
-class Y {
-    foo() {}
-}
-function caller() {
-    let x: X | Y = new X();
-    x.foo();
-    const y = x;
-    x = new Y();
-    x.foo();
-    y.foo();
-}
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "reassigned.ts", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.ts", "startLine": 7}, "line": 9, "column": 6},
-                        {"symbol": {"name": "caller", "filePath": "reassigned.ts", "startLine": 7}, "line": 13, "column": 6},
-                    ]},
-                    {"name": "Y::foo", "filePath": "reassigned.ts", "startLine": 5,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.ts", "startLine": 7}, "line": 12, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "X::foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "reassigned.ts", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.ts", "startLine": 7}, "line": 9, "column": 6},
-                        {"symbol": {"name": "caller", "filePath": "reassigned.ts", "startLine": 7}, "line": 13, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "Y::foo",
-                expected: json!([
-                    {"name": "Y::foo", "filePath": "reassigned.ts", "startLine": 5,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.ts", "startLine": 7}, "line": 12, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "caller",
-                expected: json!([
-                    {"name": "caller", "filePath": "reassigned.ts", "startLine": 7,
-                     "edges": [
-                        {"symbol": {"name": "X", "filePath": "reassigned.ts", "startLine": 1}, "line": 8, "column": 23},
-                        {"symbol": {"name": "X::foo", "filePath": "reassigned.ts", "startLine": 2}, "line": 9, "column": 6},
-                        {"symbol": {"name": "Y", "filePath": "reassigned.ts", "startLine": 4}, "line": 11, "column": 12},
-                        {"symbol": {"name": "Y::foo", "filePath": "reassigned.ts", "startLine": 5}, "line": 12, "column": 6},
-                        {"symbol": {"name": "X::foo", "filePath": "reassigned.ts", "startLine": 2}, "line": 13, "column": 6},
                     ]},
                 ]),
             },
@@ -5808,7 +5189,7 @@ def caller():
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "reassigned.py", "startLine": 2,
@@ -5822,7 +5203,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "X::foo",
                 expected: json!([
                     {"name": "X::foo", "filePath": "reassigned.py", "startLine": 2,
@@ -5832,7 +5213,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Y::foo",
                 expected: json!([
                     {"name": "Y::foo", "filePath": "reassigned.py", "startLine": 5,
@@ -5842,7 +5223,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "reassigned.py", "startLine": 8,
@@ -5851,87 +5232,6 @@ def caller():
                         {"symbol": {"name": "X::foo", "filePath": "reassigned.py", "startLine": 2}, "line": 10, "column": 6},
                         {"symbol": {"name": "Y", "filePath": "reassigned.py", "startLine": 4}, "line": 11, "column": 8},
                         {"symbol": {"name": "Y::foo", "filePath": "reassigned.py", "startLine": 5}, "line": 12, "column": 6},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific flow-sensitive receiver regression.
-// Reassignment changes only subsequent x.foo() targets; earlier sites retain X.
-// y captures the X object before x is rebound to Y; y.foo() must still target X.
-#[tokio::test]
-async fn python_receiver_reassignment_preserves_alias() {
-    check_case(Case {
-        name: "python_receiver_reassignment_preserves_alias",
-        files: vec![SourceFile {
-            path: "reassigned.py",
-            source: r"class X:
-    def foo(self):
-        pass
-class Y:
-    def foo(self):
-        pass
-
-def caller():
-    x = X()
-    x.foo()
-    y = x
-    x = Y()
-    x.foo()
-    y.foo()
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "reassigned.py", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.py", "startLine": 8}, "line": 10, "column": 6},
-                        {"symbol": {"name": "caller", "filePath": "reassigned.py", "startLine": 8}, "line": 14, "column": 6},
-                    ]},
-                    {"name": "Y::foo", "filePath": "reassigned.py", "startLine": 5,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.py", "startLine": 8}, "line": 13, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "X::foo",
-                expected: json!([
-                    {"name": "X::foo", "filePath": "reassigned.py", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.py", "startLine": 8}, "line": 10, "column": 6},
-                        {"symbol": {"name": "caller", "filePath": "reassigned.py", "startLine": 8}, "line": 14, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "Y::foo",
-                expected: json!([
-                    {"name": "Y::foo", "filePath": "reassigned.py", "startLine": 5,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "reassigned.py", "startLine": 8}, "line": 13, "column": 6},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "caller",
-                expected: json!([
-                    {"name": "caller", "filePath": "reassigned.py", "startLine": 8,
-                     "edges": [
-                        {"symbol": {"name": "X", "filePath": "reassigned.py", "startLine": 1}, "line": 9, "column": 8},
-                        {"symbol": {"name": "X::foo", "filePath": "reassigned.py", "startLine": 2}, "line": 10, "column": 6},
-                        {"symbol": {"name": "Y", "filePath": "reassigned.py", "startLine": 4}, "line": 12, "column": 8},
-                        {"symbol": {"name": "Y::foo", "filePath": "reassigned.py", "startLine": 5}, "line": 13, "column": 6},
-                        {"symbol": {"name": "X::foo", "filePath": "reassigned.py", "startLine": 2}, "line": 14, "column": 6},
                     ]},
                 ]),
             },
@@ -5971,7 +5271,7 @@ function baz() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "default",
                 expected: json!([
                     {"name": "default", "filePath": "other.ts", "startLine": 1,
@@ -5981,7 +5281,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "default",
                 expected: json!([
                     {"name": "default", "filePath": "other.ts", "startLine": 1,
@@ -5991,7 +5291,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "foo",
                 expected: json!([
                     {"name": "foo", "filePath": "main.ts", "startLine": 3,
@@ -6001,7 +5301,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "baz",
                 expected: json!([
                     {"name": "baz", "filePath": "other.ts", "startLine": 5,
@@ -6039,7 +5339,7 @@ function baz() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "bar",
                 expected: json!([
                     {"name": "bar", "filePath": "tagged.ts", "startLine": 5,
@@ -6049,7 +5349,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "bar",
                 expected: json!([
                     {"name": "bar", "filePath": "tagged.ts", "startLine": 5,
@@ -6059,7 +5359,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "foo",
                 expected: json!([
                     {"name": "foo", "filePath": "tagged.ts", "startLine": 1,
@@ -6069,63 +5369,13 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "baz",
                 expected: json!([
                     {"name": "baz", "filePath": "tagged.ts", "startLine": 9,
                      "edges": [
                         {"symbol": {"name": "bar", "filePath": "tagged.ts", "startLine": 5}, "line": 6, "column": 4},
                     ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// https://github.com/rust-lang/rust-analyzer/blob/3131751eaf1c3b5da6e618acdc2148ad7db65bc7/crates/ide/src/call_hierarchy.rs
-// Upstream test_trait_method_call_hierarchy: querying the trait declaration includes a caller
-// invoking its concrete implementation. Strip the cursor marker and leading blank line. Preserve
-// the upstream empty outgoing result for the bodyless trait method; the fixture does not specify
-// caller's outgoing targets, so it does not require an invented duplicate edge to the declaration.
-#[tokio::test]
-async fn rust_lsp_trait_method_call_hierarchy() {
-    check_case(Case {
-        name: "rust_lsp_trait_method_call_hierarchy",
-        files: vec![SourceFile {
-            path: "trait_calls.rs",
-            source: r"trait T1 {
-    fn callee();
-}
-
-struct S1;
-
-impl T1 for S1 {
-    fn callee() {}
-}
-
-fn caller() {
-    S1::callee();
-}
-",
-        }],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "T1::callee",
-                expected: json!([
-                    {"name": "T1::callee", "filePath": "trait_calls.rs", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "caller", "filePath": "trait_calls.rs", "startLine": 11}, "line": 12, "column": 8},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "T1::callee",
-                expected: json!([
-                    {"name": "T1::callee", "filePath": "trait_calls.rs", "startLine": 2,
-                     "edges": []},
                 ]),
             },
         ],
@@ -6157,7 +5407,7 @@ class Right {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.java", "startLine": 2,
@@ -6171,7 +5421,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "receivers.java", "startLine": 3,
@@ -6181,7 +5431,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "receivers.java", "startLine": 9,
@@ -6191,7 +5441,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.java", "startLine": 2,
@@ -6229,7 +5479,7 @@ struct Right {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.cc", "startLine": 2,
@@ -6243,7 +5493,7 @@ struct Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "receivers.cc", "startLine": 3,
@@ -6253,7 +5503,7 @@ struct Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "receivers.cc", "startLine": 9,
@@ -6263,7 +5513,7 @@ struct Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.cc", "startLine": 2,
@@ -6303,7 +5553,7 @@ impl Right {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.rs", "startLine": 3,
@@ -6317,7 +5567,7 @@ impl Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "receivers.rs", "startLine": 4,
@@ -6327,7 +5577,7 @@ impl Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "receivers.rs", "startLine": 11,
@@ -6337,7 +5587,7 @@ impl Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.rs", "startLine": 3,
@@ -6375,7 +5625,7 @@ class Right {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.ts", "startLine": 2,
@@ -6389,7 +5639,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "receivers.ts", "startLine": 3,
@@ -6399,7 +5649,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "receivers.ts", "startLine": 9,
@@ -6409,7 +5659,7 @@ class Right {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.ts", "startLine": 2,
@@ -6446,7 +5696,7 @@ class Right:
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.py", "startLine": 2,
@@ -6460,7 +5710,7 @@ class Right:
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Left::caller",
                 expected: json!([
                     {"name": "Left::caller", "filePath": "receivers.py", "startLine": 4,
@@ -6470,7 +5720,7 @@ class Right:
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Right::caller",
                 expected: json!([
                     {"name": "Right::caller", "filePath": "receivers.py", "startLine": 9,
@@ -6480,7 +5730,7 @@ class Right:
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Left::foo",
                 expected: json!([
                     {"name": "Left::foo", "filePath": "receivers.py", "startLine": 2,
@@ -6518,7 +5768,7 @@ class Other {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.java", "startLine": 2,
@@ -6530,7 +5780,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.java", "startLine": 5,
@@ -6540,7 +5790,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.java", "startLine": 2,
@@ -6579,7 +5829,7 @@ class Other {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.java", "startLine": 2,
@@ -6593,7 +5843,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.java", "startLine": 6,
@@ -6603,7 +5853,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.java", "startLine": 2,
@@ -6642,7 +5892,7 @@ struct Other {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.cc", "startLine": 2,
@@ -6654,7 +5904,7 @@ struct Other {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.cc", "startLine": 5,
@@ -6664,7 +5914,7 @@ struct Other {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.cc", "startLine": 2,
@@ -6704,7 +5954,7 @@ struct Other {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.cc", "startLine": 2,
@@ -6718,7 +5968,7 @@ struct Other {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.cc", "startLine": 6,
@@ -6728,7 +5978,7 @@ struct Other {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.cc", "startLine": 2,
@@ -6766,7 +6016,7 @@ class Other {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.js", "startLine": 2,
@@ -6778,7 +6028,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.js", "startLine": 5,
@@ -6788,7 +6038,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.js", "startLine": 2,
@@ -6827,7 +6077,7 @@ class Other {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.js", "startLine": 2,
@@ -6841,7 +6091,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.js", "startLine": 6,
@@ -6851,7 +6101,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.js", "startLine": 2,
@@ -6889,7 +6139,7 @@ class Other {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.ts", "startLine": 2,
@@ -6901,7 +6151,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.ts", "startLine": 5,
@@ -6911,7 +6161,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.ts", "startLine": 2,
@@ -6950,7 +6200,7 @@ class Other {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.ts", "startLine": 2,
@@ -6964,7 +6214,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.ts", "startLine": 6,
@@ -6974,7 +6224,7 @@ class Other {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.ts", "startLine": 2,
@@ -7010,7 +6260,7 @@ class Other:
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.py", "startLine": 2,
@@ -7022,7 +6272,7 @@ class Other:
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.py", "startLine": 5,
@@ -7032,7 +6282,7 @@ class Other:
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.py", "startLine": 2,
@@ -7071,7 +6321,7 @@ class Other:
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.py", "startLine": 2,
@@ -7085,7 +6335,7 @@ class Other:
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Derived::caller",
                 expected: json!([
                     {"name": "Derived::caller", "filePath": "inheritance.py", "startLine": 7,
@@ -7095,7 +6345,7 @@ class Other:
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Base::foo",
                 expected: json!([
                     {"name": "Base::foo", "filePath": "inheritance.py", "startLine": 2,
@@ -7148,25 +6398,23 @@ def caller():
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.py", "startLine": 3,
                      "edges": [
-                        {"symbol": {"name": "work", "filePath": "left.py", "startLine": 1}, "line": 4, "column": 13},
+                        {"symbol": {"name": "work", "filePath": "left.py", "startLine": 1}, "line": [4, 6], "column": 13},
                         {"symbol": {"name": "work", "filePath": "right.py", "startLine": 1}, "line": 5, "column": 14},
-                        {"symbol": {"name": "work", "filePath": "left.py", "startLine": 1}, "line": 6, "column": 13},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "left.py", "startLine": 1,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "caller.py", "startLine": 3}, "line": 4, "column": 13},
-                        {"symbol": {"name": "caller", "filePath": "caller.py", "startLine": 3}, "line": 6, "column": 13},
+                        {"symbol": {"name": "caller", "filePath": "caller.py", "startLine": 3}, "line": [4, 6], "column": 13},
                     ]},
                     {"name": "work", "filePath": "right.py", "startLine": 1,
                      "edges": [
@@ -7175,7 +6423,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "stop",
                 expected: json!([
                     {"name": "stop", "filePath": "left.py", "startLine": 4,
@@ -7223,25 +6471,23 @@ function caller() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.js", "startLine": 3,
                      "edges": [
-                        {"symbol": {"name": "work", "filePath": "left.js", "startLine": 1}, "line": 4, "column": 12},
+                        {"symbol": {"name": "work", "filePath": "left.js", "startLine": 1}, "line": [4, 6], "column": 12},
                         {"symbol": {"name": "work", "filePath": "right.js", "startLine": 1}, "line": 5, "column": 13},
-                        {"symbol": {"name": "work", "filePath": "left.js", "startLine": 1}, "line": 6, "column": 12},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "left.js", "startLine": 1,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "caller.js", "startLine": 3}, "line": 4, "column": 12},
-                        {"symbol": {"name": "caller", "filePath": "caller.js", "startLine": 3}, "line": 6, "column": 12},
+                        {"symbol": {"name": "caller", "filePath": "caller.js", "startLine": 3}, "line": [4, 6], "column": 12},
                     ]},
                     {"name": "work", "filePath": "right.js", "startLine": 1,
                      "edges": [
@@ -7250,7 +6496,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "stop",
                 expected: json!([
                     {"name": "stop", "filePath": "left.js", "startLine": 2,
@@ -7298,25 +6544,23 @@ function caller() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.ts", "startLine": 3,
                      "edges": [
-                        {"symbol": {"name": "work", "filePath": "left.ts", "startLine": 1}, "line": 4, "column": 12},
+                        {"symbol": {"name": "work", "filePath": "left.ts", "startLine": 1}, "line": [4, 6], "column": 12},
                         {"symbol": {"name": "work", "filePath": "right.ts", "startLine": 1}, "line": 5, "column": 13},
-                        {"symbol": {"name": "work", "filePath": "left.ts", "startLine": 1}, "line": 6, "column": 12},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "left.ts", "startLine": 1,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "caller.ts", "startLine": 3}, "line": 4, "column": 12},
-                        {"symbol": {"name": "caller", "filePath": "caller.ts", "startLine": 3}, "line": 6, "column": 12},
+                        {"symbol": {"name": "caller", "filePath": "caller.ts", "startLine": 3}, "line": [4, 6], "column": 12},
                     ]},
                     {"name": "work", "filePath": "right.ts", "startLine": 1,
                      "edges": [
@@ -7325,144 +6569,13 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "stop",
                 expected: json!([
                     {"name": "stop", "filePath": "left.ts", "startLine": 2,
                      "edges": []},
                     {"name": "stop", "filePath": "right.ts", "startLine": 2,
                      "edges": []},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific binding regression.
-// The imported run alias works in control, but a nearer binding hides it in shadowed.
-// The local run variable points to local_target; its call must resolve there, not to library.work.
-#[tokio::test]
-async fn python_binding_import_alias_local_shadow() {
-    check_case(Case {
-        name: "python_binding_import_alias_local_shadow",
-        files: vec![
-            SourceFile {
-                path: "library.py",
-                source: r"def work():
-    pass
-",
-            },
-            SourceFile {
-                path: "caller.py",
-                source: r"from library import work as run
-def local_target():
-    pass
-def shadowed():
-    run = local_target
-    run()
-def control():
-    run()
-",
-            },
-        ],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "work",
-                expected: json!([
-                    {"name": "work", "filePath": "library.py", "startLine": 1,
-                     "edges": [
-                        {"symbol": {"name": "control", "filePath": "caller.py", "startLine": 7}, "line": 8, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "shadowed",
-                expected: json!([
-                    {"name": "shadowed", "filePath": "caller.py", "startLine": 4,
-                     "edges": [
-                        {"symbol": {"name": "local_target", "filePath": "caller.py", "startLine": 2}, "line": 6, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "control",
-                expected: json!([
-                    {"name": "control", "filePath": "caller.py", "startLine": 7,
-                     "edges": [
-                        {"symbol": {"name": "work", "filePath": "library.py", "startLine": 1}, "line": 8, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "local_target",
-                expected: json!([
-                    {"name": "local_target", "filePath": "caller.py", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "shadowed", "filePath": "caller.py", "startLine": 4}, "line": 6, "column": 4},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific binding regression.
-// The imported run alias works in control, but a nearer binding hides it in shadowed.
-// The callback parameter has no known concrete target; its call stays unresolved.
-#[tokio::test]
-async fn python_binding_import_alias_parameter_shadow() {
-    check_case(Case {
-        name: "python_binding_import_alias_parameter_shadow",
-        files: vec![
-            SourceFile {
-                path: "library.py",
-                source: r"def work():
-    pass
-",
-            },
-            SourceFile {
-                path: "caller.py",
-                source: r"from library import work as run
-def shadowed(run):
-    run()
-def control():
-    run()
-",
-            },
-        ],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "work",
-                expected: json!([
-                    {"name": "work", "filePath": "library.py", "startLine": 1,
-                     "edges": [
-                        {"symbol": {"name": "control", "filePath": "caller.py", "startLine": 4}, "line": 5, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "shadowed",
-                expected: json!([
-                    {"name": "shadowed", "filePath": "caller.py", "startLine": 2,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "control",
-                expected: json!([
-                    {"name": "control", "filePath": "caller.py", "startLine": 4,
-                     "edges": [
-                        {"symbol": {"name": "work", "filePath": "library.py", "startLine": 1}, "line": 5, "column": 4},
-                    ]},
                 ]),
             },
         ],
@@ -7498,7 +6611,7 @@ def caller():
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.py", "startLine": 4,
@@ -7508,7 +6621,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "decoy.py", "startLine": 1,
@@ -7516,7 +6629,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "known",
                 expected: json!([
                     {"name": "known", "filePath": "caller.py", "startLine": 2,
@@ -7561,7 +6674,7 @@ def caller():
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.py", "startLine": 4,
@@ -7571,7 +6684,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "make",
                 expected: json!([
                     {"name": "make", "filePath": "decoy.py", "startLine": 1,
@@ -7579,7 +6692,7 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Local::foo",
                 expected: json!([
                     {"name": "Local::foo", "filePath": "decoy.py", "startLine": 4,
@@ -7587,144 +6700,12 @@ def caller():
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "known",
                 expected: json!([
                     {"name": "known", "filePath": "caller.py", "startLine": 2,
                      "edges": [
                         {"symbol": {"name": "caller", "filePath": "caller.py", "startLine": 4}, "line": 5, "column": 4},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific binding regression.
-// The imported run alias works in control, but a nearer binding hides it in shadowed.
-// The local run variable points to local_target; its call must resolve there, not to library.work.
-#[tokio::test]
-async fn javascript_binding_import_alias_local_shadow() {
-    check_case(Case {
-        name: "javascript_binding_import_alias_local_shadow",
-        files: vec![
-            SourceFile {
-                path: "library.js",
-                source: r"export function work() {}
-",
-            },
-            SourceFile {
-                path: "caller.js",
-                source: r#"import { work as run } from "./library";
-function local_target() {}
-function shadowed() {
-    const run = local_target;
-    run();
-}
-function control() {
-    run();
-}
-"#,
-            },
-        ],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "work",
-                expected: json!([
-                    {"name": "work", "filePath": "library.js", "startLine": 1,
-                     "edges": [
-                        {"symbol": {"name": "control", "filePath": "caller.js", "startLine": 7}, "line": 8, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "shadowed",
-                expected: json!([
-                    {"name": "shadowed", "filePath": "caller.js", "startLine": 3,
-                     "edges": [
-                        {"symbol": {"name": "local_target", "filePath": "caller.js", "startLine": 2}, "line": 5, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "control",
-                expected: json!([
-                    {"name": "control", "filePath": "caller.js", "startLine": 7,
-                     "edges": [
-                        {"symbol": {"name": "work", "filePath": "library.js", "startLine": 1}, "line": 8, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "local_target",
-                expected: json!([
-                    {"name": "local_target", "filePath": "caller.js", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "shadowed", "filePath": "caller.js", "startLine": 3}, "line": 5, "column": 4},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific binding regression.
-// The imported run alias works in control, but a nearer binding hides it in shadowed.
-// The callback parameter has no known concrete target; its call stays unresolved.
-#[tokio::test]
-async fn javascript_binding_import_alias_parameter_shadow() {
-    check_case(Case {
-        name: "javascript_binding_import_alias_parameter_shadow",
-        files: vec![
-            SourceFile {
-                path: "library.js",
-                source: r"export function work() {}
-",
-            },
-            SourceFile {
-                path: "caller.js",
-                source: r#"import { work as run } from "./library";
-function shadowed(run) {
-    run();
-}
-function control() {
-    run();
-}
-"#,
-            },
-        ],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "work",
-                expected: json!([
-                    {"name": "work", "filePath": "library.js", "startLine": 1,
-                     "edges": [
-                        {"symbol": {"name": "control", "filePath": "caller.js", "startLine": 5}, "line": 6, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "shadowed",
-                expected: json!([
-                    {"name": "shadowed", "filePath": "caller.js", "startLine": 2,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "control",
-                expected: json!([
-                    {"name": "control", "filePath": "caller.js", "startLine": 5,
-                     "edges": [
-                        {"symbol": {"name": "work", "filePath": "library.js", "startLine": 1}, "line": 6, "column": 4},
                     ]},
                 ]),
             },
@@ -7760,7 +6741,7 @@ function caller() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.js", "startLine": 3,
@@ -7770,7 +6751,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "decoy.js", "startLine": 1,
@@ -7778,7 +6759,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "known",
                 expected: json!([
                     {"name": "known", "filePath": "caller.js", "startLine": 2,
@@ -7822,7 +6803,7 @@ function caller() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.js", "startLine": 3,
@@ -7832,7 +6813,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "make",
                 expected: json!([
                     {"name": "make", "filePath": "decoy.js", "startLine": 1,
@@ -7840,7 +6821,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Local::foo",
                 expected: json!([
                     {"name": "Local::foo", "filePath": "decoy.js", "startLine": 3,
@@ -7848,144 +6829,12 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "known",
                 expected: json!([
                     {"name": "known", "filePath": "caller.js", "startLine": 2,
                      "edges": [
                         {"symbol": {"name": "caller", "filePath": "caller.js", "startLine": 3}, "line": 4, "column": 4},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific binding regression.
-// The imported run alias works in control, but a nearer binding hides it in shadowed.
-// The local run variable points to local_target; its call must resolve there, not to library.work.
-#[tokio::test]
-async fn typescript_binding_import_alias_local_shadow() {
-    check_case(Case {
-        name: "typescript_binding_import_alias_local_shadow",
-        files: vec![
-            SourceFile {
-                path: "library.ts",
-                source: r"export function work() {}
-",
-            },
-            SourceFile {
-                path: "caller.ts",
-                source: r#"import { work as run } from "./library";
-function local_target() {}
-function shadowed() {
-    const run = local_target;
-    run();
-}
-function control() {
-    run();
-}
-"#,
-            },
-        ],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "work",
-                expected: json!([
-                    {"name": "work", "filePath": "library.ts", "startLine": 1,
-                     "edges": [
-                        {"symbol": {"name": "control", "filePath": "caller.ts", "startLine": 7}, "line": 8, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "shadowed",
-                expected: json!([
-                    {"name": "shadowed", "filePath": "caller.ts", "startLine": 3,
-                     "edges": [
-                        {"symbol": {"name": "local_target", "filePath": "caller.ts", "startLine": 2}, "line": 5, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "control",
-                expected: json!([
-                    {"name": "control", "filePath": "caller.ts", "startLine": 7,
-                     "edges": [
-                        {"symbol": {"name": "work", "filePath": "library.ts", "startLine": 1}, "line": 8, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "in",
-                symbol: "local_target",
-                expected: json!([
-                    {"name": "local_target", "filePath": "caller.ts", "startLine": 2,
-                     "edges": [
-                        {"symbol": {"name": "shadowed", "filePath": "caller.ts", "startLine": 3}, "line": 5, "column": 4},
-                    ]},
-                ]),
-            },
-        ],
-    })
-    .await;
-}
-
-// zvec-grep-specific binding regression.
-// The imported run alias works in control, but a nearer binding hides it in shadowed.
-// The callback parameter has no known concrete target; its call stays unresolved.
-#[tokio::test]
-async fn typescript_binding_import_alias_parameter_shadow() {
-    check_case(Case {
-        name: "typescript_binding_import_alias_parameter_shadow",
-        files: vec![
-            SourceFile {
-                path: "library.ts",
-                source: r"export function work() {}
-",
-            },
-            SourceFile {
-                path: "caller.ts",
-                source: r#"import { work as run } from "./library";
-function shadowed(run: () => void) {
-    run();
-}
-function control() {
-    run();
-}
-"#,
-            },
-        ],
-        queries: vec![
-            Query {
-                direction: "in",
-                symbol: "work",
-                expected: json!([
-                    {"name": "work", "filePath": "library.ts", "startLine": 1,
-                     "edges": [
-                        {"symbol": {"name": "control", "filePath": "caller.ts", "startLine": 5}, "line": 6, "column": 4},
-                    ]},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "shadowed",
-                expected: json!([
-                    {"name": "shadowed", "filePath": "caller.ts", "startLine": 2,
-                     "edges": []},
-                ]),
-            },
-            Query {
-                direction: "out",
-                symbol: "control",
-                expected: json!([
-                    {"name": "control", "filePath": "caller.ts", "startLine": 5,
-                     "edges": [
-                        {"symbol": {"name": "work", "filePath": "library.ts", "startLine": 1}, "line": 6, "column": 4},
                     ]},
                 ]),
             },
@@ -8021,7 +6870,7 @@ function caller() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.ts", "startLine": 3,
@@ -8031,7 +6880,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "decoy.ts", "startLine": 1,
@@ -8039,7 +6888,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "known",
                 expected: json!([
                     {"name": "known", "filePath": "caller.ts", "startLine": 2,
@@ -8083,7 +6932,7 @@ function caller() {
         ],
         queries: vec![
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.ts", "startLine": 3,
@@ -8093,7 +6942,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "make",
                 expected: json!([
                     {"name": "make", "filePath": "decoy.ts", "startLine": 1,
@@ -8101,7 +6950,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Local::foo",
                 expected: json!([
                     {"name": "Local::foo", "filePath": "decoy.ts", "startLine": 3,
@@ -8109,7 +6958,7 @@ function caller() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "known",
                 expected: json!([
                     {"name": "known", "filePath": "caller.ts", "startLine": 2,
@@ -8150,7 +6999,7 @@ function baz() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Bar",
                 expected: json!([
                     {"name": "Bar", "filePath": "expression.ts", "startLine": 5,
@@ -8160,7 +7009,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Bar",
                 expected: json!([
                     {"name": "Bar", "filePath": "expression.ts", "startLine": 5,
@@ -8170,7 +7019,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "foo",
                 expected: json!([
                     {"name": "foo", "filePath": "expression.ts", "startLine": 1,
@@ -8180,7 +7029,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "baz",
                 expected: json!([
                     {"name": "baz", "filePath": "expression.ts", "startLine": 11,
@@ -8227,7 +7076,7 @@ function baz() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "default",
                 expected: json!([
                     {"name": "default", "filePath": "other.ts", "startLine": 1,
@@ -8237,7 +7086,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "default",
                 expected: json!([
                     {"name": "default", "filePath": "other.ts", "startLine": 1,
@@ -8247,7 +7096,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "foo",
                 expected: json!([
                     {"name": "foo", "filePath": "main.ts", "startLine": 3,
@@ -8257,7 +7106,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "baz",
                 expected: json!([
                     {"name": "baz", "filePath": "other.ts", "startLine": 7,
@@ -8304,7 +7153,7 @@ function baz() {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "exported",
                 expected: json!([
                     {"name": "exported", "filePath": "other.ts", "startLine": 1,
@@ -8314,7 +7163,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "exported",
                 expected: json!([
                     {"name": "exported", "filePath": "other.ts", "startLine": 1,
@@ -8324,7 +7173,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "foo",
                 expected: json!([
                     {"name": "foo", "filePath": "main.ts", "startLine": 3,
@@ -8334,7 +7183,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "baz",
                 expected: json!([
                     {"name": "baz", "filePath": "other.ts", "startLine": 5,
@@ -8373,7 +7222,7 @@ function baz() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Bar",
                 expected: json!([
                     {"name": "Bar", "filePath": "main.tsx", "startLine": 5,
@@ -8383,7 +7232,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Bar",
                 expected: json!([
                     {"name": "Bar", "filePath": "main.tsx", "startLine": 5,
@@ -8393,7 +7242,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "foo",
                 expected: json!([
                     {"name": "foo", "filePath": "main.tsx", "startLine": 1,
@@ -8403,7 +7252,7 @@ function baz() {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "baz",
                 expected: json!([
                     {"name": "baz", "filePath": "main.tsx", "startLine": 9,
@@ -8459,40 +7308,37 @@ void caller(Foo& ref, Foo* ptr) {
         ],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "bar",
                 expected: json!([
                     {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": 3, "column": 8},
-                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": 4, "column": 9},
+                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": [3, 4], "column": 8},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "Foo::bar",
                 expected: json!([
                     {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": 3, "column": 8},
-                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": 4, "column": 9},
+                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": [3, 4], "column": 8},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "caller.cc", "startLine": 2,
                      "edges": [
-                        {"symbol": {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3}, "line": 3, "column": 8},
-                        {"symbol": {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3}, "line": 4, "column": 9},
+                        {"symbol": {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3}, "line": [3, 4], "column": 8},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Foo::bar",
                 expected: json!([
                     {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3,
@@ -8502,7 +7348,7 @@ void caller(Foo& ref, Foo* ptr) {
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "baz",
                 expected: json!([
                     {"name": "Foo::baz", "filePath": "Foo.cc", "startLine": 7,
@@ -8512,7 +7358,7 @@ void caller(Foo& ref, Foo* ptr) {
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "Foo::baz",
                 expected: json!([
                     {"name": "Foo::baz", "filePath": "Foo.cc", "startLine": 7,
@@ -8543,31 +7389,27 @@ void caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "explicit.cc", "startLine": 1,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "explicit.cc", "startLine": 2}, "line": 3, "column": 4},
-                        {"symbol": {"name": "caller", "filePath": "explicit.cc", "startLine": 2}, "line": 4, "column": 4},
-                        {"symbol": {"name": "caller", "filePath": "explicit.cc", "startLine": 2}, "line": 5, "column": 4},
+                        {"symbol": {"name": "caller", "filePath": "explicit.cc", "startLine": 2}, "line": [3, 4, 5], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "explicit.cc", "startLine": 2,
                      "edges": [
-                        {"symbol": {"name": "work", "filePath": "explicit.cc", "startLine": 1}, "line": 3, "column": 4},
-                        {"symbol": {"name": "work", "filePath": "explicit.cc", "startLine": 1}, "line": 4, "column": 4},
-                        {"symbol": {"name": "work", "filePath": "explicit.cc", "startLine": 1}, "line": 5, "column": 4},
+                        {"symbol": {"name": "work", "filePath": "explicit.cc", "startLine": 1}, "line": [3, 4, 5], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "explicit.cc", "startLine": 1,
@@ -8598,31 +7440,27 @@ void caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "deduced.cc", "startLine": 1,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "deduced.cc", "startLine": 2}, "line": 3, "column": 4},
-                        {"symbol": {"name": "caller", "filePath": "deduced.cc", "startLine": 2}, "line": 4, "column": 4},
-                        {"symbol": {"name": "caller", "filePath": "deduced.cc", "startLine": 2}, "line": 5, "column": 4},
+                        {"symbol": {"name": "caller", "filePath": "deduced.cc", "startLine": 2}, "line": [3, 4, 5], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "deduced.cc", "startLine": 2,
                      "edges": [
-                        {"symbol": {"name": "work", "filePath": "deduced.cc", "startLine": 1}, "line": 3, "column": 4},
-                        {"symbol": {"name": "work", "filePath": "deduced.cc", "startLine": 1}, "line": 4, "column": 4},
-                        {"symbol": {"name": "work", "filePath": "deduced.cc", "startLine": 1}, "line": 5, "column": 4},
+                        {"symbol": {"name": "work", "filePath": "deduced.cc", "startLine": 1}, "line": [3, 4, 5], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "deduced.cc", "startLine": 1,
@@ -8656,46 +7494,42 @@ void caller() {
         }],
         queries: vec![
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "body.cc", "startLine": 2,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "body.cc", "startLine": 6}, "line": 7, "column": 4},
-                        {"symbol": {"name": "caller", "filePath": "body.cc", "startLine": 6}, "line": 8, "column": 4},
+                        {"symbol": {"name": "caller", "filePath": "body.cc", "startLine": 6}, "line": [7, 8], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "caller",
                 expected: json!([
                     {"name": "caller", "filePath": "body.cc", "startLine": 6,
                      "edges": [
-                        {"symbol": {"name": "work", "filePath": "body.cc", "startLine": 2}, "line": 7, "column": 4},
-                        {"symbol": {"name": "work", "filePath": "body.cc", "startLine": 2}, "line": 8, "column": 4},
+                        {"symbol": {"name": "work", "filePath": "body.cc", "startLine": 2}, "line": [7, 8], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "out",
+                operation: "callees",
                 symbol: "work",
                 expected: json!([
                     {"name": "work", "filePath": "body.cc", "startLine": 2,
                      "edges": [
-                        {"symbol": {"name": "helper", "filePath": "body.cc", "startLine": 1}, "line": 3, "column": 4},
-                        {"symbol": {"name": "helper", "filePath": "body.cc", "startLine": 1}, "line": 4, "column": 4},
+                        {"symbol": {"name": "helper", "filePath": "body.cc", "startLine": 1}, "line": [3, 4], "column": 4},
                     ]},
                 ]),
             },
             Query {
-                direction: "in",
+                operation: "callers",
                 symbol: "helper",
                 expected: json!([
                     {"name": "helper", "filePath": "body.cc", "startLine": 1,
                      "edges": [
-                        {"symbol": {"name": "work", "filePath": "body.cc", "startLine": 2}, "line": 3, "column": 4},
-                        {"symbol": {"name": "work", "filePath": "body.cc", "startLine": 2}, "line": 4, "column": 4},
+                        {"symbol": {"name": "work", "filePath": "body.cc", "startLine": 2}, "line": [3, 4], "column": 4},
                     ]},
                 ]),
             },
