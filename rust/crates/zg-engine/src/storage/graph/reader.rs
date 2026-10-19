@@ -71,26 +71,38 @@ impl SqliteGraphStorage {
     /// This is the resolver's name index; empty names never occur because
     /// unnamed entities are not persisted.
     ///
+    /// When a definition exists for the name, pure declarations never
+    /// surface: a prototype shadows nothing, but any definition beats every
+    /// same-named declaration (C/C++ ODR-style preference), so the rules
+    /// downstream never mis-bind a call to a bodyless header entity.
+    ///
     /// # Errors
     /// Rejects blank names, invalid stored data, and SQLite errors.
     pub(crate) fn lookup_by_name(&self, name: &str) -> Result<Vec<NameIndexEntry>> {
         nonempty(name)?;
         let mut statement = self.connection.prepare(
-            "SELECT entity_id, file_id, qualified_name, is_exported, arity FROM entities
+            "SELECT entity_id, file_id, qualified_name, is_exported, arity, is_declaration
+             FROM entities
              WHERE name = ?1 ORDER BY entity_id",
         )?;
-        let rows = statement.query_map([name], |row| {
-            Ok(NameIndexEntry {
-                entity_id: row.get(0)?,
-                file_id: row.get(1)?,
-                qualified_name: row.get(2)?,
-                is_exported: row.get::<_, i64>(3)? == 1,
-                arity: row
-                    .get::<_, Option<i64>>(4)?
-                    .and_then(|arity| u32::try_from(arity).ok()),
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut rows = statement
+            .query_map([name], |row| {
+                Ok(NameIndexEntry {
+                    entity_id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    qualified_name: row.get(2)?,
+                    is_exported: row.get::<_, i64>(3)? == 1,
+                    arity: row
+                        .get::<_, Option<i64>>(4)?
+                        .and_then(|arity| u32::try_from(arity).ok()),
+                    is_declaration: row.get::<_, i64>(5)? == 1,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.iter().any(|row| !row.is_declaration) {
+            rows.retain(|row| !row.is_declaration);
+        }
+        Ok(rows)
     }
 
     /// The single workspace entity declaring `name`, or `None` when absent or

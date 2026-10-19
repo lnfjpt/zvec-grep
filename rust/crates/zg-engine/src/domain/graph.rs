@@ -82,6 +82,9 @@ pub(crate) struct FileGraphNode {
     pub arity: Option<usize>,
     pub visibility: Option<String>,
     pub is_exported: bool,
+    /// Pure declaration without a body (C/C++ prototypes, in-class member
+    /// declarations); definitions shadow them in name-based binding.
+    pub is_declaration: bool,
 }
 
 /// Per-file graph extraction output, assembled after the walk and partition.

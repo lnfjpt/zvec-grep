@@ -137,6 +137,17 @@ pub(super) fn resolve_pending(
                         target_id: hit.entity_id.clone(),
                         provenance: Provenance::WorkspaceUnique,
                     });
+                } else if stored.reference.receiver_name.is_none() {
+                    // Bare name, same file, single hit: the in-file symbol table
+                    // skips declaration entities, so a pending bare call can only
+                    // mean this one indexed location. Receiver-qualified calls
+                    // still stay pending — a same-file receiver bind would be a
+                    // type-inference guess.
+                    resolutions.push(Resolution {
+                        ref_id: stored.id,
+                        target_id: hit.entity_id.clone(),
+                        provenance: Provenance::FileScoped,
+                    });
                 }
             } else if hits.len() > 1 {
                 if let Some(resolution) =
@@ -346,11 +357,15 @@ fn resolve_qualified_name(
         return None;
     }
     let receiver = reference.receiver_name.as_deref()?;
+    // The receiver may spell the full declaring path (`ns::Waldo::find()`) or
+    // only its innermost segment (`Waldo::find()`); accept either spelling,
+    // and bind only when exactly one entity answers.
     let scope = receiver.rsplit("::").next().unwrap_or(receiver);
-    let expected = format!("{scope}::{}", reference.name_tail);
+    let expected_full = format!("{receiver}::{}", reference.name_tail);
+    let expected_tail = format!("{scope}::{}", reference.name_tail);
     let matches: Vec<&NameIndexEntry> = hits
         .iter()
-        .filter(|hit| hit.qualified_name == expected)
+        .filter(|hit| hit.qualified_name == expected_full || hit.qualified_name == expected_tail)
         .collect();
     if let [hit] = matches.as_slice() {
         return Some(Resolution {
@@ -610,6 +625,7 @@ mod tests {
             qualified_name: name.to_owned(),
             is_exported: true,
             arity: None,
+            is_declaration: false,
         }
     }
 
@@ -953,7 +969,9 @@ mod tests {
     }
 
     #[test]
-    fn same_file_hits_stay_pending() {
+    fn same_file_bare_unique_binds_file_scoped() {
+        // The in-file symbol table skips declaration entities, so a same-file
+        // bare call with exactly one indexed name is unambiguous workspace-wide.
         let mut graph = open_memory();
         graph
             .write_file_graph(
@@ -962,6 +980,32 @@ mod tests {
                 &graph_with_pending(vec![record("local", "helper")], "helper"),
                 &[],
             )
+            .expect("write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        assert_eq!(sweep.scanned, 1);
+        assert_eq!(sweep.resolved, 1);
+        assert_eq!(sweep.candidates_recorded, 0);
+        assert!(
+            graph
+                .list_pending_refs(10, 0)
+                .expect("pending page")
+                .refs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn same_file_qualified_unique_stays_pending() {
+        // Receiver-qualified calls need the receiver's type; binding on a
+        // same-file name hit alone would be a coincidental guess.
+        let mut graph = open_memory();
+        let mut file_graph = graph_with_qualified_call("recv", "helper");
+        file_graph.entities.push(record("local", "helper"));
+        file_graph.entity_ids.push("local".to_owned());
+        graph
+            .write_file_graph(9, "run.ts", &file_graph, &[])
             .expect("write");
 
         let sweep = resolve_pending(&mut graph).expect("sweep");
@@ -1345,6 +1389,7 @@ mod tests {
             qualified_name: qualified_name.to_owned(),
             is_exported: true,
             arity: None,
+            is_declaration: false,
         }
     }
 
@@ -1545,6 +1590,7 @@ mod tests {
             qualified_name: format!("scope::{name}"),
             is_exported,
             arity: (arity > 0).then_some(arity),
+            is_declaration: false,
         }
     }
 
@@ -1782,6 +1828,7 @@ mod tests {
                     qualified_name: "scope::handler".to_owned(),
                     is_exported: true,
                     arity: None,
+                    is_declaration: false,
                 }]),
                 &[],
             )

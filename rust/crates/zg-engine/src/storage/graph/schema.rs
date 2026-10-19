@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use super::{Error, Result};
 
 // Unsupported versions require an index rebuild; no schema migration is provided.
-pub(crate) const VERSION: i64 = 1;
+pub(crate) const VERSION: i64 = 16;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;
 
 pub(crate) fn validate(connection: &Connection) -> Result<()> {
@@ -25,7 +25,7 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<()> {
     let application_id: i64 = tx.query_row("PRAGMA application_id", [], |row| row.get(0))?;
     if version == 0 && application_id == 0 {
         let objects: i64 = tx.query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+            "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
             [],
             |row| row.get(0),
         )?;
@@ -44,7 +44,9 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<()> {
 
 // Direct local edges and references share one table. Resolution fills the target
 // on the existing reference row; invalidation clears it and retains the evidence.
-// `failed` is reserved for resolver integration; no API currently sets it.
+// `failed` terminates import references whose specifier addresses modules
+// outside the workspace; they carry no target, so invalidation cannot
+// resurrect them and only a rewrite of the owning file re-enqueues them.
 const SCHEMA: &str = "
 CREATE TABLE edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,13 +60,16 @@ CREATE TABLE edges (
     arity INTEGER CHECK (arity >= 0),
     line INTEGER CHECK (line >= 1),
     col INTEGER CHECK (col >= 0),
-    provenance TEXT CHECK (provenance IN ('file_local', 'import_scoped', 'preferred_file', 'workspace_unique')),
+    candidates TEXT CHECK (candidates IS NULL OR (json_valid(candidates) AND json_type(candidates) = 'array')),
+    language TEXT NOT NULL DEFAULT 'unknown',
+    name_tail TEXT NOT NULL DEFAULT '',
+    provenance TEXT CHECK (provenance IN ('arity_bound', 'export_bound', 'file_local', 'file_scoped', 'import_bound', 'import_scoped', 'preferred_file', 'workspace_unique')),
     metadata TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata) AND json_type(metadata) = 'object'),
     CHECK ((status = 'resolved' AND target IS NOT NULL AND provenance IS NOT NULL)
         OR (status IN ('pending', 'failed') AND target IS NULL AND provenance IS NULL)),
     CHECK (
         (reference_name IS NULL AND status = 'resolved' AND provenance = 'file_local'
-            AND receiver_name IS NULL AND arity IS NULL)
+            AND receiver_name IS NULL AND arity IS NULL AND candidates IS NULL)
         OR
         (reference_name IS NOT NULL AND length(trim(reference_name)) > 0
             AND line IS NOT NULL AND col IS NOT NULL
@@ -76,4 +81,28 @@ CREATE INDEX edges_source_kind ON edges(source, kind);
 CREATE INDEX edges_target_kind ON edges(target, kind);
 -- Index only the pending queue so resolved queries use the endpoint indexes.
 CREATE INDEX edges_pending_id ON edges(id) WHERE status = 'pending';
+-- Workspace name index consumed by the cross-file resolver. Rows follow the
+-- file snapshot lifecycle; unnamed entities are omitted.
+CREATE TABLE entities (
+    file_id INTEGER NOT NULL CHECK (file_id BETWEEN 0 AND 4294967295),
+    entity_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    is_exported INTEGER NOT NULL CHECK (is_exported IN (0, 1)),
+    arity INTEGER CHECK (arity >= 0),
+    is_declaration INTEGER NOT NULL DEFAULT 0 CHECK (is_declaration IN (0, 1)),
+    PRIMARY KEY (file_id, entity_id)
+) STRICT;
+CREATE INDEX entities_name ON entities(name);
+-- Backs joining import-edge entity targets onto their owning file for the
+-- resolver's import scope; the composite primary key cannot serve this lookup.
+CREATE INDEX entities_entity ON entities(entity_id);
+-- Workspace-relative paths keyed by file, consumed by the resolver to map
+-- import specifiers onto file endpoints. Paths use forward slashes on every
+-- platform; rows follow the file snapshot lifecycle.
+CREATE TABLE file_paths (
+    file_id INTEGER PRIMARY KEY CHECK (file_id BETWEEN 0 AND 4294967295),
+    relative_path TEXT NOT NULL CHECK (length(trim(relative_path)) > 0)
+) STRICT;
+CREATE UNIQUE INDEX file_paths_relative ON file_paths(relative_path);
 ";
