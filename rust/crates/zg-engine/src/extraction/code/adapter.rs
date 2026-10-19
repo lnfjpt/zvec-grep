@@ -403,16 +403,12 @@ impl LanguageAdapter {
 
     fn should_index_entity(self, node: Node<'_>) -> bool {
         match self.kind {
+            // Only function-shaped declarations (`void f(int);`, in-class
+            // member declarations, function-pointer variables) become
+            // entities; plain variable declarations stay unindexed.
             Language::C | Language::Cpp => {
-                if matches!(node.kind(), "declaration" | "field_declaration") {
-                    find_descendant_by_kind(node, "function_declarator").is_some()
-                } else if node.kind() == "macro_type_specifier" {
-                    // The text check is repeated by name extraction; keeping the node here
-                    // lets malformed macro function types fall out when no name is found.
-                    true
-                } else {
-                    true
-                }
+                !matches!(node.kind(), "declaration" | "field_declaration")
+                    || find_descendant_by_kind(node, "function_declarator").is_some()
             }
             Language::JavaScript | Language::TypeScript => {
                 should_index_javascript_typescript_entity(node)
@@ -429,6 +425,14 @@ impl LanguageAdapter {
             }
             _ => true,
         }
+    }
+
+    /// True for pure C/C++ declarations that never carry a body; definitions
+    /// shadow them in name-based binding, but a lone declaration is the only
+    /// known location of its symbol and stays bindable.
+    pub(super) fn is_declaration(self, node: Node<'_>) -> bool {
+        matches!(self.kind, Language::C | Language::Cpp)
+            && matches!(node.kind(), "declaration" | "field_declaration")
     }
 
     fn should_enter_scope(self, node: Node<'_>) -> bool {

@@ -127,7 +127,7 @@ pub(super) fn assemble_file_graph(
 /// Builds a graph node from a bound entity. Node identity is the entity ID
 /// string; qualified names join the breadcrumb with `::`.
 fn entity_node(entity: &Entity, language: FileFormat) -> FileGraphNode {
-    let (name, kind, qualified_name, signature, doc, visibility, arity, is_exported) =
+    let (name, kind, qualified_name, signature, doc, visibility, arity, is_exported, is_declaration) =
         match entity.metadata.as_ref() {
             Some(EntityMetadata::Code(code)) => {
                 let name = code.symbol_name.clone();
@@ -145,6 +145,7 @@ fn entity_node(entity: &Entity, language: FileFormat) -> FileGraphNode {
                     code.visibility.clone(),
                     code.arity,
                     code.is_exported,
+                    code.is_declaration,
                 )
             }
             _ => (
@@ -155,6 +156,7 @@ fn entity_node(entity: &Entity, language: FileFormat) -> FileGraphNode {
                 None,
                 None,
                 None,
+                false,
                 false,
             ),
         };
@@ -177,6 +179,7 @@ fn entity_node(entity: &Entity, language: FileFormat) -> FileGraphNode {
         arity,
         visibility: visibility.map(|visibility| visibility.as_str().to_owned()),
         is_exported,
+        is_declaration,
     }
 }
 

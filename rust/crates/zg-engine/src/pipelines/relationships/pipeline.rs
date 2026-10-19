@@ -54,6 +54,14 @@ pub(super) fn query_symbols(
     if definitions.is_empty() {
         definitions = recall_symbols(storage, name, scope)?;
     }
+    if definitions.is_empty() && scope.is_some() {
+        // Qualified lookups fall back to the bare name. Rust's module layout
+        // (`mod foo;` beside foo/mod.rs) lives in file paths, so top-level
+        // entities there carry no recorded scope and a scope-restricted
+        // lookup can never see them; a bare-name retry keeps those lookups
+        // usable until scopes record module paths.
+        definitions = storage.find_symbols(name, None)?;
+    }
     let mut symbols: HashMap<_, _> = definitions
         .iter()
         .map(|stored| (stored.entity.id.clone(), describe(stored)))

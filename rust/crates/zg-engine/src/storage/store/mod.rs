@@ -308,7 +308,7 @@ impl IndexStore {
         self.read(|state| {
             let ids = state.fragments.find_symbol_entity_ids(name)?;
             let mut entities = get_entities(state, &ids)?;
-            Ok(ids
+            let mut matched: Vec<StoredEntity> = ids
                 .into_iter()
                 .filter_map(|id| entities.remove(&id))
                 .filter(|stored| {
@@ -319,7 +319,26 @@ impl IndexStore {
                                 && scope.is_none_or(|scope| metadata.scope.as_deref() == Some(scope))
                     )
                 })
-                .collect())
+                .collect();
+            // ODR-style preference for name queries: when a definition
+            // exists, pure declarations (C/C++ prototypes) never surface as
+            // result groups; a lone declaration remains the only known
+            // location and stays reportable.
+            let any_definition = matched.iter().any(|stored| {
+                !matches!(
+                    &stored.entity.metadata,
+                    Some(EntityMetadata::Code(metadata)) if metadata.is_declaration
+                )
+            });
+            if any_definition {
+                matched.retain(|stored| {
+                    !matches!(
+                        &stored.entity.metadata,
+                        Some(EntityMetadata::Code(metadata)) if metadata.is_declaration
+                    )
+                });
+            }
+            Ok(matched)
         })
     }
 

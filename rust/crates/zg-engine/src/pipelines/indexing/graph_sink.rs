@@ -80,6 +80,7 @@ pub(super) fn file_graph(
             qualified_name: node.qualified_name.clone(),
             is_exported: node.is_exported,
             arity: position(node.arity)?,
+            is_declaration: node.is_declaration,
         });
     }
 
@@ -194,6 +195,7 @@ mod tests {
             arity: None,
             visibility: None,
             is_exported,
+            is_declaration: false,
         }
     }
 
@@ -231,6 +233,7 @@ mod tests {
                 arity: None,
                 visibility: None,
                 is_exported: false,
+                is_declaration: false,
             }],
             edges: vec![FileEdge {
                 kind: GraphEdgeKind::Contains,
@@ -257,6 +260,7 @@ mod tests {
                 qualified_name: "a".to_owned(),
                 is_exported: false,
                 arity: None,
+                is_declaration: false,
             }]
         );
         let [edge] = snapshot.edges.as_slice() else {
@@ -316,6 +320,7 @@ mod tests {
                 qualified_name: "scope::visible".to_owned(),
                 is_exported: true,
                 arity: None,
+                is_declaration: false,
             }]
         );
     }

@@ -113,6 +113,9 @@ pub(crate) struct EntityRecord {
     pub qualified_name: String,
     pub is_exported: bool,
     pub arity: Option<u32>,
+    /// Pure declaration without a body (C/C++ prototypes); definitions
+    /// shadow them in name-based binding.
+    pub is_declaration: bool,
 }
 
 /// A complete per-file snapshot. Node metadata is deliberately not stored here,
@@ -136,6 +139,8 @@ pub(crate) struct NameIndexEntry {
     pub qualified_name: String,
     pub is_exported: bool,
     pub arity: Option<u32>,
+    /// Pure declaration without a body (C/C++ prototypes).
+    pub is_declaration: bool,
 }
 
 /// A pending reference with its database identity.

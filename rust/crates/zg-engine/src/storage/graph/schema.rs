@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use super::{Error, Result};
 
 // Unsupported versions require an index rebuild; no schema migration is provided.
-pub(crate) const VERSION: i64 = 15;
+pub(crate) const VERSION: i64 = 16;
 pub(crate) const APPLICATION_ID: i64 = 0x5a47_5250;
 
 pub(crate) fn validate(connection: &Connection) -> Result<()> {
@@ -90,6 +90,7 @@ CREATE TABLE entities (
     qualified_name TEXT NOT NULL,
     is_exported INTEGER NOT NULL CHECK (is_exported IN (0, 1)),
     arity INTEGER CHECK (arity >= 0),
+    is_declaration INTEGER NOT NULL DEFAULT 0 CHECK (is_declaration IN (0, 1)),
     PRIMARY KEY (file_id, entity_id)
 ) STRICT;
 CREATE INDEX entities_name ON entities(name);

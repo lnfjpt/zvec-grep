@@ -60,6 +60,12 @@ pub struct CodeMetadata {
     /// Whether the symbol is importable from outside its module.
     #[serde(default)]
     pub is_exported: bool,
+    /// True for pure declarations (C/C++ prototypes, in-class member
+    /// declarations) that never carry a body. Name-based binding prefers the
+    /// definition when both exist for the same symbol; a lone declaration is
+    /// the only known location and stays bindable.
+    #[serde(default)]
+    pub is_declaration: bool,
 }
 
 impl CodeMetadata {

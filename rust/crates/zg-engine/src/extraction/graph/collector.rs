@@ -102,20 +102,35 @@ fn is_identifier_like(value: &str) -> bool {
 /// skipped: the inner call is collected on its own visit when the walk
 /// reaches it as a sibling — keeping attribution shallow matches how the
 /// outline collector treats nested calls and avoids double-counting chains.
+/// `boundary` marks subtrees owned by another entity (nested members of a
+/// container entity); their call sites are claimed when the walk reaches the
+/// owning entity, so they are not collected here.
 pub(crate) fn scan_call_edges(
     entity_node: Node<'_>,
     owner_index: usize,
     source: &[u8],
     context: &mut WalkContext,
+    boundary: Option<&dyn Fn(Node<'_>) -> bool>,
 ) {
-    visit_for_calls(entity_node, owner_index, source, context);
+    visit_for_calls(entity_node, owner_index, source, context, boundary);
 }
 
-fn visit_for_calls(node: Node<'_>, owner_index: usize, source: &[u8], context: &mut WalkContext) {
+fn visit_for_calls(
+    node: Node<'_>,
+    owner_index: usize,
+    source: &[u8],
+    context: &mut WalkContext,
+    boundary: Option<&dyn Fn(Node<'_>) -> bool>,
+) {
     if is_call_node(node) {
         if let Some(callee) = callee_text_of(node, source) {
-            if callee.len() <= MAX_CALLEE_TEXT_CHARS && is_identifier_like(callee) {
-                let (ref_name, receiver_name) = split_callee_name(callee);
+            // C/C++ arrow member access joins the identifier gate and the
+            // split under the dot spelling: `ptr->bar()` names the same
+            // member shape as `ref.bar()`. The buffered raw text keeps the
+            // original spelling.
+            let normalized = callee.replace("->", ".");
+            if normalized.len() <= MAX_CALLEE_TEXT_CHARS && is_identifier_like(&normalized) {
+                let (ref_name, receiver_name) = split_callee_name(&normalized);
                 context.add_call_edge(
                     owner_index,
                     &ref_name,
@@ -132,7 +147,10 @@ fn visit_for_calls(node: Node<'_>, owner_index: usize, source: &[u8], context: &
         return;
     }
     for child in named_children(node) {
-        visit_for_calls(child, owner_index, source, context);
+        if boundary.is_some_and(|owns| owns(child)) {
+            continue;
+        }
+        visit_for_calls(child, owner_index, source, context, boundary);
     }
 }
 

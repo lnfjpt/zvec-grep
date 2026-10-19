@@ -21,6 +21,7 @@ fn named(store: &IndexStore, path: &str) -> Snapshot {
         qualified_name: "target".into(),
         is_exported: true,
         arity: Some(0),
+        is_declaration: false,
     });
     write(store, &target);
     target

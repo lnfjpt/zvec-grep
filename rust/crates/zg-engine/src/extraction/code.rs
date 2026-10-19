@@ -1,6 +1,6 @@
 mod adapter;
 
-use tree_sitter::{Language, Node, Parser};
+use tree_sitter::{Language, Node, Parser, Point};
 
 use crate::{
     EngineError,
@@ -184,6 +184,17 @@ struct CodeEntity<'tree> {
     documentation: Option<String>,
     arity: Option<usize>,
     is_exported: bool,
+    /// Drives the language-specific scope separator; queries spell Java
+    /// scopes with dots (`CallHierarchy.Base::bar`) and the rest with `::`.
+    format: FileFormat,
+    /// LSP-style definition start: the name token when the grammar exposes
+    /// one, so leading annotations (`@Deprecated` above `main`) stay outside
+    /// the reported range. Falls back to the node start.
+    span_start_byte: usize,
+    span_start: Point,
+    /// Pure declaration without a body (C/C++ prototypes); definitions
+    /// shadow them in name-based binding.
+    is_declaration: bool,
 }
 
 fn walk_code_node<'tree>(
@@ -209,7 +220,17 @@ fn walk_code_node<'tree>(
                 scope_entity_index = Some(entity_index);
                 let name = adapter.extract_name(entity, source);
                 let entity_breadcrumb = adapter.scope_breadcrumb(entity, source, breadcrumb);
-                graph_context.register_symbol(name.as_deref(), entity_index);
+                let (span_start_byte, span_start) = entity
+                    .child_by_field_name("name")
+                    .map(|name_node| (name_node.start_byte(), name_node.start_position()))
+                    .unwrap_or((entity.start_byte(), entity.start_position()));
+                // Declarations stay out of the in-file symbol table: an
+                // in-file call must not bind to a bodyless prototype when a
+                // definition exists anywhere in the workspace, and the
+                // resolver's name index applies that preference globally.
+                if !adapter.is_declaration(entity) {
+                    graph_context.register_symbol(name.as_deref(), entity_index);
+                }
                 graph_context.add_contains_edge(
                     entity_index,
                     entity.start_position().row + 1,
@@ -224,16 +245,33 @@ fn walk_code_node<'tree>(
                     documentation: LanguageAdapter::extract_doc(entity, source),
                     arity: adapter.extract_arity(entity, source),
                     is_exported: adapter.is_exported(entity, !breadcrumb.is_empty()),
+                    format,
+                    span_start_byte,
+                    span_start,
+                    is_declaration: adapter.is_declaration(entity),
                 });
             }
             // Name-based references are collected from the first resolved
             // entity's subtree: the walk does not descend into entity bodies,
             // so this attributes call sites and inheritance clauses to their
-            // owning entity.
+            // owning entity. A container entity (class/namespace) also walks
+            // as a scope, so its scan must skip nested member subtrees —
+            // those claim their own call sites when the scope recursion
+            // reaches them, and claiming them twice duplicates edges.
             if let (Some(first_entity_index), Some(first_entity)) =
                 (first_entity_index, out.get(start_index))
             {
-                scan_call_edges(first_entity.node, first_entity_index, source, graph_context);
+                let member_owned =
+                    |node: Node<'_>| adapter.is_entity(node) || adapter.is_scope(node);
+                let boundary: Option<&dyn Fn(Node<'_>) -> bool> =
+                    is_scope.then(|| &member_owned as &dyn Fn(Node<'_>) -> bool);
+                scan_call_edges(
+                    first_entity.node,
+                    first_entity_index,
+                    source,
+                    graph_context,
+                    boundary,
+                );
                 collect_inheritance_edges(
                     first_entity.node,
                     source,
@@ -302,11 +340,11 @@ fn append_entity(
     let (content_max, content_overlap) =
         chunk_options_for_metadata(max_chars, overlap_chars, Some(&metadata));
     let range = TextRange::from_coordinates(
-        entity.node.start_byte(),
+        entity.span_start_byte,
         entity.node.end_byte(),
-        entity.node.start_position().row + 1,
+        entity.span_start.row + 1,
         entity.node.end_position().row + 1,
-        entity.node.start_position().column,
+        entity.span_start.column,
         entity.node.end_position().column,
     )
     .expect("parser coordinates refer to source text");
@@ -324,10 +362,17 @@ fn append_entity(
 }
 
 fn code_entity_metadata(entity: &CodeEntity<'_>) -> EntityMetadata {
+    // Java scopes join with dots — `CallHierarchy.Base::bar` is the language's
+    // own qualified-member spelling, and relationship queries split the symbol
+    // at the last `::` expecting exactly that scope spelling.
+    let scope_separator = match entity.format {
+        FileFormat::Java => ".",
+        _ => "::",
+    };
     EntityMetadata::Code(CodeMetadata {
         symbol_type: entity.symbol_type,
         symbol_name: entity.name.clone(),
-        scope: (!entity.breadcrumb.is_empty()).then(|| entity.breadcrumb.join("::")),
+        scope: (!entity.breadcrumb.is_empty()).then(|| entity.breadcrumb.join(scope_separator)),
         signature: entity.signature.clone(),
         documentation: entity.documentation.clone(),
         visibility: None,
@@ -335,6 +380,7 @@ fn code_entity_metadata(entity: &CodeEntity<'_>) -> EntityMetadata {
         language: None,
         arity: entity.arity,
         is_exported: entity.is_exported,
+        is_declaration: entity.is_declaration,
     })
 }
 
@@ -615,6 +661,7 @@ mod tests {
                 documentation: Some("Adds one.".to_owned()),
                 arity: Some(1),
                 is_exported: false,
+                is_declaration: false,
             }))
         );
         assert!(matches!(
@@ -634,6 +681,7 @@ mod tests {
                 documentation: None,
                 arity: Some(0),
                 is_exported: false,
+                is_declaration: false,
             }))
         );
         assert!(matches!(
@@ -681,6 +729,7 @@ mod tests {
                 documentation: None,
                 arity: None,
                 is_exported: false,
+                is_declaration: false,
             }))
         );
         assert!(matches!(
@@ -713,6 +762,7 @@ mod tests {
                 documentation: None,
                 arity: Some(0),
                 is_exported: false,
+                is_declaration: false,
             }))
         );
         assert!(matches!(
@@ -746,6 +796,7 @@ mod tests {
                 documentation: None,
                 arity: Some(1),
                 is_exported: false,
+                is_declaration: false,
             }))
         );
     }
@@ -1352,7 +1403,7 @@ mod tests {
         assert_eq!(range.start_line(), 1);
         assert_eq!(
             range.start_byte_column(),
-            "<p>你好 😀</p><script>export ".len()
+            "<p>你好 😀</p><script>export function ".len()
         );
 
         let plain_script = test_source(
@@ -1469,11 +1520,11 @@ mod tests {
         assert_eq!(
             range,
             TextRange::from_coordinates(
-                "const prefix = \"你好 😀\";\r\nexport ".len(),
+                "const prefix = \"你好 😀\";\r\nexport function ".len(),
                 source.text.len(),
                 2,
                 2,
-                "export ".len(),
+                "export function ".len(),
                 "export function afterEmoji() { return true; }".len(),
             )
             .expect("function coordinates")
@@ -1559,46 +1610,39 @@ mod tests {
         );
 
         let names = graph_context.name_edges();
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 4);
         // Imports belong to the file scope.
         assert_eq!(names[0].ref_kind, GraphRefKind::Imports);
         assert_eq!(names[0].owner_index, FILE_SCOPE_INDEX);
         assert_eq!(names[0].ref_name, "./utils.js");
         assert_eq!((names[0].line, names[0].column), (1, 0));
-        // The class-level scan attributes method-body calls to the class.
-        assert_eq!(names[1].ref_kind, GraphRefKind::Calls);
-        assert_eq!(
-            (names[1].owner_index, names[1].ref_name.as_str()),
-            (0, "init")
-        );
-        assert_eq!(names[1].receiver_name.as_deref(), Some("this"));
-        assert_eq!(names[1].arity, Some(2));
-        assert_eq!((names[1].line, names[1].column), (5, 4));
         // The extends clause is collected from the class node; positions
         // point at the clause itself, not the inherited expression.
-        assert_eq!(names[2].ref_kind, GraphRefKind::Extends);
+        assert_eq!(names[1].ref_kind, GraphRefKind::Extends);
         assert_eq!(
-            (names[2].owner_index, names[2].ref_name.as_str()),
+            (names[1].owner_index, names[1].ref_name.as_str()),
             (0, "Base")
         );
-        assert_eq!(names[2].raw_text.as_deref(), Some("extends Base"));
-        assert_eq!((names[2].line, names[2].column), (3, 13));
-        // The constructor's own scan attributes the same call to itself and
-        // collapses the duplicate `this.init(3)` site into the first one.
+        assert_eq!(names[1].raw_text.as_deref(), Some("extends Base"));
+        assert_eq!((names[1].line, names[1].column), (3, 13));
+        // The constructor's own scan attributes the method-body call to
+        // itself and collapses the duplicate `this.init(3)` site into the
+        // first one. The class-level scan skips member subtrees, so the
+        // class no longer duplicates the same call site.
+        assert_eq!(names[2].ref_kind, GraphRefKind::Calls);
+        assert_eq!(
+            (names[2].owner_index, names[2].ref_name.as_str()),
+            (1, "init")
+        );
+        assert_eq!(names[2].arity, Some(2));
+        assert_eq!((names[2].line, names[2].column), (5, 4));
+        // Top-level function scan.
         assert_eq!(names[3].ref_kind, GraphRefKind::Calls);
         assert_eq!(
             (names[3].owner_index, names[3].ref_name.as_str()),
-            (1, "init")
-        );
-        assert_eq!(names[3].arity, Some(2));
-        assert_eq!((names[3].line, names[3].column), (5, 4));
-        // Top-level function scan.
-        assert_eq!(names[4].ref_kind, GraphRefKind::Calls);
-        assert_eq!(
-            (names[4].owner_index, names[4].ref_name.as_str()),
             (2, "helper")
         );
-        assert_eq!(names[4].arity, Some(0));
+        assert_eq!(names[3].arity, Some(0));
     }
 
     #[test]
@@ -1705,29 +1749,23 @@ mod tests {
         assert_eq!(resolved.arity, Some(0));
 
         // Everything else stays pending in walk order: the import (file-owned),
-        // receiver-qualified calls, the undeclared extends target, and the
-        // imported-but-undeclared `helper`.
+        // the undeclared extends target, the receiver-qualified call attributed
+        // to the constructor, and the imported-but-undeclared `helper`.
         let pending = &graph.pending;
-        assert_eq!(pending.len(), 5);
+        assert_eq!(pending.len(), 4);
         assert_eq!(pending[0].ref_kind, GraphRefKind::Imports);
         assert_eq!(pending[0].owner_index, FILE_SCOPE_INDEX);
         assert_eq!(pending[0].ref_name, "./utils.js");
         assert_eq!(
             (pending[1].ref_kind, pending[1].ref_name.as_str()),
-            (GraphRefKind::Calls, "init")
-        );
-        assert_eq!(pending[1].owner_index, 0);
-        assert_eq!(pending[1].receiver_name.as_deref(), Some("this"));
-        assert_eq!(
-            (pending[2].ref_kind, pending[2].ref_name.as_str()),
             (GraphRefKind::Extends, "Base")
         );
         assert_eq!(
-            (pending[3].owner_index, pending[3].ref_name.as_str()),
+            (pending[2].owner_index, pending[2].ref_name.as_str()),
             (1, "init")
         );
         assert_eq!(
-            (pending[4].owner_index, pending[4].ref_name.as_str()),
+            (pending[3].owner_index, pending[3].ref_name.as_str()),
             (2, "helper")
         );
     }
