@@ -35,13 +35,39 @@ pub(crate) fn is_call_node(node: Node<'_>) -> bool {
 }
 
 /// Extracts the callee expression text for a call node, if recoverable.
-fn callee_text_of<'source>(node: Node<'_>, source: &'source [u8]) -> Option<&'source str> {
+fn callee_text_of(node: Node<'_>, source: &[u8]) -> Option<String> {
+    // Java spells member calls as separate `object` and `name` fields; the
+    // shared field walk below would return the bare method name and drop
+    // the receiver the resolver needs.
+    if let Some(member) = java_member_callee(node, source) {
+        return Some(member);
+    }
     for field in CALLEE_FIELDS {
         if let Some(target) = node.child_by_field_name(field) {
-            return Some(node_text(target, source));
+            return Some(node_text(target, source).to_owned());
         }
     }
-    node.named_child(0).map(|first| node_text(first, source))
+    node.named_child(0)
+        .map(|first| node_text(first, source).to_owned())
+}
+
+/// Joins a Java `method_invocation`'s `object` and `name` fields back into
+/// the spelled receiver expression (`this.foo`, `super.foo`, `util.run`).
+/// Call-shaped receivers (`new Foo().run()`) keep the bare member name:
+/// their rejoined text would fail the identifier gate and drop the edge
+/// that the bare spelling resolves. Calls without an object field fall
+/// through to the shared walk.
+fn java_member_callee(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() != "method_invocation" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    let name = node.child_by_field_name("name")?;
+    let object_text = node_text(object, source);
+    if !is_identifier_like(object_text) {
+        return None;
+    }
+    Some(format!("{object_text}.{}", node_text(name, source)))
 }
 
 /// Counts call arguments when the grammar exposes an `arguments` field.
@@ -68,10 +94,24 @@ fn split_callee_name(callee_text: &str) -> (String, Option<String>) {
     if separator == 0 || separator + 1 >= cleaned.len() {
         return (cleaned.to_owned(), None);
     }
-    (
-        cleaned[separator + 1..].to_owned(),
-        Some(cleaned[..separator].trim_end_matches(':').to_owned()),
-    )
+    let receiver = cleaned[..separator].trim_end_matches(':');
+    (cleaned[separator + 1..].to_owned(), Some(receiver.to_owned()))
+}
+
+/// Collapses Python's `super().member` call receiver to the bare `super`
+/// keyword, the same superclass address the other languages spell without
+/// the call. The identifier gate below would otherwise drop the whole
+/// edge because of the parenthesis pair.
+fn normalize_super_call(callee: &str) -> String {
+    let Some(separator) = callee.rfind('.') else {
+        return callee.to_owned();
+    };
+    let (receiver, member) = callee.split_at(separator);
+    if receiver == "super()" {
+        format!("super{member}")
+    } else {
+        callee.to_owned()
+    }
 }
 
 /// Strips a leading `new ` constructor prefix (`/^new\s+/`).
@@ -129,13 +169,14 @@ fn visit_for_calls(
             // member shape as `ref.bar()`. The buffered raw text keeps the
             // original spelling.
             let normalized = callee.replace("->", ".");
+            let normalized = normalize_super_call(&normalized);
             if normalized.len() <= MAX_CALLEE_TEXT_CHARS && is_identifier_like(&normalized) {
                 let (ref_name, receiver_name) = split_callee_name(&normalized);
                 context.add_call_edge(
                     owner_index,
                     &ref_name,
                     receiver_name.as_deref(),
-                    Some(callee),
+                    Some(callee.as_str()),
                     call_arity_of(node),
                     node.start_position().row + 1,
                     node.start_position().column,
@@ -557,6 +598,59 @@ mod tests {
         assert_eq!(
             module_path_of(import_node, source.as_bytes(), FileFormat::JavaScript),
             Some("./utils.js".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalizes_the_super_call_receiver() {
+        // Python spells the superclass dispatch with a call receiver; the
+        // bare keyword is the shape the split and resolver consume.
+        assert_eq!(normalize_super_call("super().foo"), "super.foo");
+        assert_eq!(normalize_super_call("super().a.b"), "super().a.b");
+        assert_eq!(normalize_super_call("self.foo"), "self.foo");
+        assert_eq!(
+            split_callee_name(&normalize_super_call("super().foo")),
+            ("foo".to_owned(), Some("super".to_owned()))
+        );
+    }
+
+    #[test]
+    fn java_member_calls_keep_their_receiver() {
+        // Java spells member calls as separate `object`/`name` fields; the
+        // callee text must rejoin them or the resolver loses the receiver.
+        // Call-shaped receivers keep the bare member: their rejoined text
+        // would fail the identifier gate and drop the edge entirely.
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("java grammar loads");
+        let source = "class A { void m() { this.foo(); super.foo(); util.run(); plain(); new A().run(); } }";
+        let tree = parser.parse(source, None).expect("java source parses");
+        fn collect<'t>(node: tree_sitter::Node<'t>, out: &mut Vec<tree_sitter::Node<'t>>) {
+            if node.kind() == "method_invocation" {
+                out.push(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect(child, out);
+            }
+        }
+        let mut calls = Vec::new();
+        collect(tree.root_node(), &mut calls);
+        let bytes = source.as_bytes();
+        let texts: Vec<String> = calls
+            .iter()
+            .filter_map(|call| callee_text_of(*call, bytes))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "this.foo".to_owned(),
+                "super.foo".to_owned(),
+                "util.run".to_owned(),
+                "plain".to_owned(),
+                "run".to_owned(),
+            ]
         );
     }
 }

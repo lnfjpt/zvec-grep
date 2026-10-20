@@ -1,7 +1,7 @@
 //! Restricted resolver access to a coordinated, locked storage snapshot.
 use super::*;
 use crate::storage::graph::{
-    ImportReference, NameIndexEntry, PendingRefPage, Resolution, ResolutionStats,
+    EntityRecord, ImportReference, NameIndexEntry, PendingRefPage, Resolution, ResolutionStats,
     StoredPendingRef,
 };
 
@@ -11,6 +11,14 @@ pub(crate) trait ResolutionSession {
     fn list_pending_refs(&mut self, limit: usize, cursor: i64) -> EngineResult<PendingRefPage>;
     /// None defers the name because some indexed candidates are not yet visible.
     fn lookup_candidates(&self, name: &str) -> EngineResult<Option<Vec<NameIndexEntry>>>;
+    /// The name-index record of one entity by ID, for the receiver class
+    /// hierarchy.
+    fn entity_record(&self, entity_id: &str) -> EngineResult<Option<EntityRecord>>;
+    /// Base entity IDs of one class entity, merging resolved inheritance
+    /// edges with base names that are still pending: a pending base name
+    /// binds only when it is workspace-unique, so the receiver rules see
+    /// the same hierarchy within one sweep that resolved the edges.
+    fn inheritance_bases(&self, entity_id: &str) -> EngineResult<Vec<String>>;
     fn file_path(&self, file_id: u32) -> EngineResult<Option<String>>;
     fn file_id_by_path(&self, path: &str) -> EngineResult<Option<u32>>;
     /// Existence evidence only, including unfinished modules: temporarily
@@ -128,6 +136,29 @@ impl ResolutionSession for StoreResolutionSession<'_> {
             return Ok(None);
         }
         Ok(Some(candidates))
+    }
+
+    fn entity_record(&self, entity_id: &str) -> EngineResult<Option<EntityRecord>> {
+        self.graph().entity_record(entity_id).map_err(graph_error)
+    }
+
+    fn inheritance_bases(&self, entity_id: &str) -> EngineResult<Vec<String>> {
+        let (resolved, pending) = self
+            .graph()
+            .inheritance_bases(entity_id)
+            .map_err(graph_error)?;
+        let mut bases = resolved;
+        for name in pending {
+            let Some(candidates) = self.lookup_candidates(&name)? else {
+                // Hidden candidates must not turn an ambiguous base name
+                // into a seemingly unique ancestor.
+                continue;
+            };
+            if let [hit] = candidates.as_slice() {
+                bases.push(hit.entity_id.clone());
+            }
+        }
+        Ok(bases)
     }
 
     fn file_path(&self, file_id: u32) -> EngineResult<Option<String>> {
