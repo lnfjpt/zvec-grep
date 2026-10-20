@@ -1,5 +1,5 @@
 use super::{
-    Direction, Edge, EdgeKind, ImportReference, Metadata, NameIndexEntry, Result,
+    Direction, Edge, EdgeKind, EntityRecord, ImportReference, Metadata, NameIndexEntry, Result,
     SqliteGraphStorage, decode_enum, decode_metadata, nonempty,
 };
 use rusqlite::{Row, params_from_iter};
@@ -227,6 +227,75 @@ impl SqliteGraphStorage {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The name-index record of one entity by ID, or `None` when the entity
+    /// has no persisted record. Anchors the resolver's receiver hierarchy:
+    /// a call site's owner spells the enclosing class as its qualified-name
+    /// scope.
+    ///
+    /// # Errors
+    /// Propagates SQLite errors.
+    pub(crate) fn entity_record(&self, entity_id: &str) -> Result<Option<EntityRecord>> {
+        nonempty(entity_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT entity_id, name, qualified_name, is_exported, arity, is_declaration
+             FROM entities WHERE entity_id = ?1",
+        )?;
+        let mut rows = statement.query_map([entity_id], |row| {
+            Ok(EntityRecord {
+                entity_id: row.get(0)?,
+                name: row.get(1)?,
+                qualified_name: row.get(2)?,
+                is_exported: row.get::<_, i64>(3)? == 1,
+                arity: row
+                    .get::<_, Option<i64>>(4)?
+                    .and_then(|arity| u32::try_from(arity).ok()),
+                is_declaration: row.get::<_, i64>(5)? == 1,
+            })
+        })?;
+        Ok(match rows.next() {
+            Some(row) => Some(row?),
+            None => None,
+        })
+    }
+
+    /// Inheritance evidence of one class entity: the base entity IDs whose
+    /// extends/implements edges have resolved, plus the base names still
+    /// pending. The resolver merges both views so a receiver call resolves
+    /// in the same sweep that resolves the class's own inheritance edges.
+    ///
+    /// # Errors
+    /// Propagates SQLite errors.
+    pub(crate) fn inheritance_bases(&self, entity_id: &str) -> Result<(Vec<String>, Vec<String>)> {
+        nonempty(entity_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT target, reference_name, status FROM edges
+             WHERE source = ?1 AND kind IN ('extends', 'implements') ORDER BY id",
+        )?;
+        let rows = statement.query_map([entity_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut resolved = Vec::new();
+        let mut pending = Vec::new();
+        for row in rows {
+            // Same-file bases resolve in the partition, whose resolved edges
+            // spell the base in `target` alone; cross-file bases stay pending
+            // with their spelled `reference_name`.
+            let (target, base_name, status) = row?;
+            if status == "resolved" {
+                if let Some(target) = target {
+                    resolved.push(target);
+                }
+            } else if let Some(base_name) = base_name {
+                pending.push(base_name);
+            }
+        }
+        Ok((resolved, pending))
     }
 }
 

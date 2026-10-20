@@ -14,6 +14,7 @@
 //! [`ResolutionSession::apply_resolutions`] writes each batch atomically.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 
 use crate::domain::{FileFormat, formats_for_path, reference_compatible_with};
@@ -151,6 +152,14 @@ pub(super) fn resolve_pending(
                 filter_compatible_hits(graph, stored, raw, &mut candidate_paths)?
             };
             if let Some(resolution) = resolve_receiver_local(stored, &hits) {
+                resolutions.push(resolution);
+                sweep.file_scoped += 1;
+                continue;
+            }
+            if let Some(resolution) = resolve_receiver_class(graph, stored, &hits)? {
+                // The receiver names the enclosing instance or superclass, so
+                // the member's declaring scope is pinned to the owner's class
+                // hierarchy before workspace-wide ambiguity is considered.
                 resolutions.push(resolution);
                 sweep.file_scoped += 1;
                 continue;
@@ -795,6 +804,134 @@ fn resolve_receiver_local(
     None
 }
 
+/// Resolves a receiver call that names the enclosing instance (`self`,
+/// `this`, Python's `me`) or the superclass (`super`): the receiver's type
+/// is the class owning the call site, so the invoked member's declaring
+/// scope must be that class or — through the class's extends/implements
+/// edges — one of its bases. `super` skips the enclosing class and
+/// addresses the direct bases only. A unique scope-matched declaration
+/// binds; members the hierarchy declares ambiguously and receivers of
+/// classes without a persisted owner record stay pending.
+///
+/// # Errors
+/// Propagates graph storage failures; an unresolvable reference is `None`.
+fn resolve_receiver_class(
+    graph: &dyn ResolutionSession,
+    stored: &StoredPendingRef,
+    hits: &[NameIndexEntry],
+) -> crate::EngineResult<Option<Resolution>> {
+    let reference = &stored.reference;
+    if reference.reference_kind != EdgeKind::Calls {
+        return Ok(None);
+    }
+    let Some(receiver) = reference.receiver_name.as_deref() else {
+        return Ok(None);
+    };
+    let superclass = receiver == "super";
+    let self_names: &[&str] = if reference.language == "python" {
+        &["self", "me"]
+    } else {
+        &["self", "this"]
+    };
+    if !superclass && !self_names.contains(&receiver) {
+        return Ok(None);
+    }
+    let Some(owner) = graph.entity_record(&reference.from_node_id)? else {
+        return Ok(None);
+    };
+    // The enclosing class is the owner's qualified-name scope; an owner
+    // without one is the class itself (static initializers), while a
+    // `super` receiver of such an owner has no base to address.
+    let Some(enclosing) = (match owner.qualified_name.rsplit_once("::") {
+        Some((scope, _)) => Some(scope.to_owned()),
+        None if !superclass => Some(owner.qualified_name.clone()),
+        None => None,
+    }) else {
+        return Ok(None);
+    };
+    let mut scopes = Vec::new();
+    if superclass {
+        collect_base_scopes(graph, &enclosing, &mut scopes, &mut HashSet::new(), 1)?;
+    } else {
+        scopes.push(enclosing.clone());
+        collect_base_scopes(graph, &enclosing, &mut scopes, &mut HashSet::new(), 8)?;
+    }
+    let matched: Vec<&NameIndexEntry> = hits
+        .iter()
+        .filter(|hit| {
+            hit.qualified_name.rsplit_once("::").is_some_and(|(scope, _)| {
+                scopes.iter().any(|candidate| candidate == scope)
+            })
+        })
+        .collect();
+    if let [hit] = matched.as_slice() {
+        return Ok(Some(Resolution {
+            ref_id: stored.id,
+            target_id: hit.entity_id.clone(),
+            provenance: Provenance::FileScoped,
+        }));
+    }
+    Ok(None)
+}
+
+/// Appends the qualified names of every base class reachable from
+/// `class_scope` through extends/implements edges. `remaining` bounds the
+/// chain depth (one hop for `super` receivers, a fixed limit for the
+/// transitive `self` chain) and `visited` guards against inheritance
+/// cycles; a class whose entities spell its scope ambiguously ends the
+/// walk conservatively.
+///
+/// # Errors
+/// Propagates graph storage failures.
+fn collect_base_scopes(
+    graph: &dyn ResolutionSession,
+    class_scope: &str,
+    scopes: &mut Vec<String>,
+    visited: &mut HashSet<String>,
+    remaining: usize,
+) -> crate::EngineResult<()> {
+    if remaining == 0 || !visited.insert(class_scope.to_owned()) {
+        return Ok(());
+    }
+    let Some(class_id) = class_entity_id(graph, class_scope)? else {
+        return Ok(());
+    };
+    for base_id in graph.inheritance_bases(&class_id)? {
+        let Some(base) = graph.entity_record(&base_id)? else {
+            continue;
+        };
+        scopes.push(base.qualified_name.clone());
+        collect_base_scopes(graph, &base.qualified_name, scopes, visited, remaining - 1)?;
+    }
+    Ok(())
+}
+
+/// The entity whose qualified name spells `class_scope`, addressed through
+/// its last `::` segment in the name index. A scope no entity spells
+/// exactly, or several that do, keeps the hierarchy unknown.
+///
+/// # Errors
+/// Propagates graph storage failures; an unmatched scope is `None`.
+fn class_entity_id(
+    graph: &dyn ResolutionSession,
+    class_scope: &str,
+) -> crate::EngineResult<Option<String>> {
+    let Some(tail) = class_scope.rsplit("::").next() else {
+        return Ok(None);
+    };
+    let Some(hits) = graph.lookup_candidates(tail)? else {
+        return Ok(None);
+    };
+    let matched: Vec<&NameIndexEntry> = hits
+        .iter()
+        .filter(|hit| hit.qualified_name == class_scope)
+        .collect();
+    if let [hit] = matched.as_slice() {
+        return Ok(Some(hit.entity_id.clone()));
+    }
+    Ok(None)
+}
+
 /// Binds a qualified call (`Class::method()`, including receivers spelled as
 /// full `crate::path::Class` paths reduced to their last `::` segment) to the
 /// entity whose `qualified_name` spells exactly that scope and member. The
@@ -1077,6 +1214,27 @@ mod tests {
                 .map(Some)
                 .map_err(|error| crate::EngineError::storage_failure(error.to_string()))
         }
+        fn entity_record(
+            &self,
+            entity_id: &str,
+        ) -> crate::EngineResult<Option<crate::storage::graph::EntityRecord>> {
+            SqliteGraphStorage::entity_record(self, entity_id)
+                .map_err(|error| crate::EngineError::storage_failure(error.to_string()))
+        }
+        fn inheritance_bases(&self, entity_id: &str) -> crate::EngineResult<Vec<String>> {
+            let (resolved, pending) = SqliteGraphStorage::inheritance_bases(self, entity_id)
+                .map_err(|error| crate::EngineError::storage_failure(error.to_string()))?;
+            let mut bases = resolved;
+            for name in pending {
+                let Some(candidates) = self.lookup_candidates(&name)? else {
+                    continue;
+                };
+                if let [hit] = candidates.as_slice() {
+                    bases.push(hit.entity_id.clone());
+                }
+            }
+            Ok(bases)
+        }
     }
 
     fn record(entity_id: &str, name: &str) -> EntityRecord {
@@ -1087,6 +1245,25 @@ mod tests {
             is_exported: true,
             arity: None,
             is_declaration: false,
+        }
+    }
+
+    fn scoped_record(entity_id: &str, qualified: &str) -> EntityRecord {
+        let name = qualified.rsplit("::").next().unwrap_or(qualified);
+        let mut entity = record(entity_id, name);
+        entity.qualified_name = qualified.to_owned();
+        entity
+    }
+
+    fn graph_with_refs(
+        entities: Vec<EntityRecord>,
+        pending_refs: Vec<crate::storage::graph::PendingRef>,
+    ) -> FileGraph {
+        FileGraph {
+            entity_ids: entities.iter().map(|e| e.entity_id.clone()).collect(),
+            entities,
+            pending_refs,
+            ..empty_graph(Vec::new())
         }
     }
 
@@ -1952,6 +2129,196 @@ mod tests {
             .expect("inbound");
         assert_eq!(inbound.len(), 1);
         assert_eq!(inbound[0].provenance, Provenance::ImportBound);
+    }
+
+    #[test]
+    fn enclosing_class_receiver_binds_own_member() {
+        let mut graph = open_memory();
+        // Two same-file classes declare `foo`; the receiver's enclosing
+        // class scopes the call to its own declaration.
+        let entities = vec![
+            scoped_record("left", "Left"),
+            scoped_record("left-caller", "Left::caller"),
+            scoped_record("left-foo", "Left::foo"),
+            scoped_record("right", "Right"),
+            scoped_record("right-caller", "Right::caller"),
+            scoped_record("right-foo", "Right::foo"),
+        ];
+        let mut call =
+            pending_reference("left-caller", "foo", crate::storage::graph::EdgeKind::Calls, "typescript");
+        call.receiver_name = Some("this".to_owned());
+        graph
+            .write_file_graph(
+                9,
+                "receivers.ts",
+                &graph_with_refs(entities, vec![call]),
+                &[],
+            )
+            .expect("write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        assert_eq!(sweep.resolved, 1);
+        let inbound = graph
+            .neighborhood(
+                "left-foo",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("inbound");
+        assert_eq!(inbound.len(), 1);
+        let right_inbound = graph
+            .neighborhood(
+                "right-foo",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("right inbound");
+        assert!(right_inbound.is_empty());
+    }
+
+    #[test]
+    fn inherited_receiver_binds_base_member() {
+        let mut graph = open_memory();
+        // `foo` is only declared on Base; the pending extends edge resolves
+        // within the same sweep and scopes the receiver call to it.
+        let entities = vec![
+            scoped_record("base", "Base"),
+            scoped_record("base-foo", "Base::foo"),
+            scoped_record("derived", "Derived"),
+            scoped_record("derived-caller", "Derived::caller"),
+        ];
+        let extends = pending_reference(
+            "derived",
+            "Base",
+            crate::storage::graph::EdgeKind::Extends,
+            "java",
+        );
+        let mut call =
+            pending_reference("derived-caller", "foo", crate::storage::graph::EdgeKind::Calls, "java");
+        call.receiver_name = Some("this".to_owned());
+        graph
+            .write_file_graph(
+                9,
+                "inheritance.java",
+                &graph_with_refs(entities, vec![extends, call]),
+                &[],
+            )
+            .expect("write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        // The extends edge and the receiver call both resolve.
+        assert_eq!(sweep.resolved, 2);
+        let inbound = graph
+            .neighborhood(
+                "base-foo",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("inbound");
+        assert_eq!(inbound.len(), 1);
+    }
+
+    #[test]
+    fn super_receiver_skips_enclosing_class() {
+        let mut graph = open_memory();
+        // Both classes declare `foo`; `super` addresses the base class's
+        // declaration, never the enclosing class's own.
+        let entities = vec![
+            scoped_record("base", "Base"),
+            scoped_record("base-foo", "Base::foo"),
+            scoped_record("derived", "Derived"),
+            scoped_record("derived-foo", "Derived::foo"),
+            scoped_record("derived-caller", "Derived::caller"),
+        ];
+        let extends = pending_reference(
+            "derived",
+            "Base",
+            crate::storage::graph::EdgeKind::Extends,
+            "java",
+        );
+        let mut call =
+            pending_reference("derived-caller", "foo", crate::storage::graph::EdgeKind::Calls, "java");
+        call.receiver_name = Some("super".to_owned());
+        graph
+            .write_file_graph(
+                9,
+                "override.java",
+                &graph_with_refs(entities, vec![extends, call]),
+                &[],
+            )
+            .expect("write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        assert_eq!(sweep.resolved, 2);
+        let derived_inbound = graph
+            .neighborhood(
+                "derived-foo",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("derived inbound");
+        assert!(derived_inbound.is_empty());
+        let base_inbound = graph
+            .neighborhood(
+                "base-foo",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("base inbound");
+        assert_eq!(base_inbound.len(), 1);
+    }
+
+    #[test]
+    fn inheritance_cycle_stops_the_walk() {
+        let mut graph = open_memory();
+        // Cyclic extends edges must not loop the ancestor walk; `foo`
+        // declared on B still binds through A's hierarchy.
+        let entities = vec![
+            scoped_record("a", "A"),
+            scoped_record("a-caller", "A::caller"),
+            scoped_record("b", "B"),
+            scoped_record("b-foo", "B::foo"),
+        ];
+        let mut a_extends_b = pending_reference(
+            "a",
+            "B",
+            crate::storage::graph::EdgeKind::Extends,
+            "typescript",
+        );
+        a_extends_b.receiver_name = None;
+        let mut b_extends_a = pending_reference(
+            "b",
+            "A",
+            crate::storage::graph::EdgeKind::Extends,
+            "typescript",
+        );
+        b_extends_a.receiver_name = None;
+        let mut call =
+            pending_reference("a-caller", "foo", crate::storage::graph::EdgeKind::Calls, "typescript");
+        call.receiver_name = Some("this".to_owned());
+        graph
+            .write_file_graph(
+                9,
+                "cycle.ts",
+                &graph_with_refs(entities, vec![a_extends_b, b_extends_a, call]),
+                &[],
+            )
+            .expect("write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        assert_eq!(sweep.resolved, 3);
+        let inbound = graph
+            .neighborhood(
+                "b-foo",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("inbound");
+        assert_eq!(inbound.len(), 1);
     }
 
     #[test]
