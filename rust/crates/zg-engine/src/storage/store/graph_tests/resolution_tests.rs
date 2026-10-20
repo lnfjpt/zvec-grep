@@ -81,7 +81,7 @@ fn incomplete_candidates_defer_uniqueness_and_ready_names_still_resolve() {
             assert_eq!(session.file_id_by_path("hidden.rs")?, None);
             assert_eq!(session.file_path(hidden.file.id.get())?, None);
             assert!(
-                session.path_has_module("hidden", &["rs"])?,
+                session.path_has_module("hidden", &[".rs"])?,
                 "unfinished is not external"
             );
             assert_eq!(
