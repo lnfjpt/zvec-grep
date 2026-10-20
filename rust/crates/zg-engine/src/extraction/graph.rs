@@ -87,7 +87,7 @@ pub(crate) struct WalkContext {
     name_edges: Vec<NameEdge>,
     scope_stack: Vec<usize>,
     symbols: HashMap<String, Vec<usize>>,
-    seen_name_edges: HashSet<(GraphRefKind, usize, String)>,
+    seen_name_edges: HashSet<(GraphRefKind, usize, Option<String>, String)>,
     entity_counter: usize,
 }
 
@@ -158,10 +158,17 @@ impl WalkContext {
     }
 
     /// Buffers a name-based reference. Duplicate references (same owner, kind,
-    /// and name — e.g. a callee invoked in a loop) collapse to the first
-    /// occurrence; per-site evidence can be accumulated later via metadata.
+    /// receiver, and name — e.g. a callee invoked in a loop) collapse to the
+    /// first occurrence; per-site evidence can be accumulated later via
+    /// metadata. Distinct receivers stay separate: `left_api.work()` and
+    /// `right_api.work()` can bind different declarations.
     pub(crate) fn add_name_edge(&mut self, edge: NameEdge) {
-        let key = (edge.ref_kind, edge.owner_index, edge.ref_name.clone());
+        let key = (
+            edge.ref_kind,
+            edge.owner_index,
+            edge.receiver_name.clone(),
+            edge.ref_name.clone(),
+        );
         if !self.seen_name_edges.insert(key) {
             return;
         }
@@ -307,20 +314,23 @@ mod tests {
     fn collapses_duplicate_name_edges() {
         let mut context = WalkContext::new();
         context.add_call_edge(0, "helper", None, None, None, 3, 1);
-        // Same owner, kind, and name: collapses even when the site evidence
-        // (receiver, raw text, arity, position) differs.
+        // Same owner, kind, receiver, and name: collapses even when the site
+        // evidence (raw text, arity, position) differs.
+        context.add_call_edge(0, "helper", None, Some("helper()"), Some(0), 9, 8);
+        // A distinct receiver binds independently: `this.helper()` can
+        // resolve to another declaration than a bare `helper()`.
         context.add_call_edge(
             0,
             "helper",
             Some("this"),
             Some("this.helper()"),
             Some(0),
+            10,
             9,
-            8,
         );
         context.add_call_edge(1, "helper", None, None, None, 4, 2);
         context.add_call_edge(0, "other", None, None, None, 5, 3);
-        assert_eq!(context.name_edges().len(), 3);
+        assert_eq!(context.name_edges().len(), 4);
     }
 
     #[test]

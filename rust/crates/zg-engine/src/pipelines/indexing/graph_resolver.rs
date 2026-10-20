@@ -19,7 +19,7 @@ use std::collections::hash_map::Entry;
 use crate::domain::{FileFormat, formats_for_path, reference_compatible_with};
 use crate::storage::ResolutionSession;
 use crate::storage::graph::{
-    EdgeKind, NameIndexEntry, PendingRef, Provenance, Resolution, StoredPendingRef,
+    EdgeKind, ImportReference, NameIndexEntry, PendingRef, Provenance, Resolution, StoredPendingRef,
 };
 
 /// Outcome of one resolution sweep.
@@ -81,6 +81,8 @@ pub(super) fn resolve_pending(
     let mut candidate_paths: HashMap<u32, Option<String>> = HashMap::new();
     let mut importing_files: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut module_paths: HashMap<(String, String), bool> = HashMap::new();
+    let mut alias_bindings: HashMap<u32, Vec<AliasBinding>> = HashMap::new();
+    let mut alias_targets: HashMap<(String, String), Option<u32>> = HashMap::new();
     let mut cursor = 0;
     loop {
         let page = graph.list_pending_refs(1000, cursor)?;
@@ -110,6 +112,34 @@ pub(super) fn resolve_pending(
                     }
                 }
                 resolutions.push(resolution);
+                continue;
+            }
+            if let Some(resolution) = resolve_alias_bound(
+                graph,
+                stored,
+                &mut alias_bindings,
+                &mut importing_paths,
+                &mut alias_targets,
+            )? {
+                // An `as` alias never names an indexed symbol itself, so the
+                // bare-name lookup below would only park the call; the alias
+                // binding pins its imported name's module directly.
+                resolutions.push(resolution);
+                sweep.import_bound += 1;
+                continue;
+            }
+            if let Some(resolution) = resolve_namespace_bound(
+                graph,
+                stored,
+                &mut alias_bindings,
+                &mut importing_paths,
+                &mut alias_targets,
+            )? {
+                // The receiver names a module object, so the bare-name lookup
+                // below would only see workspace-wide ambiguity; the binding
+                // scopes the member to its one module.
+                resolutions.push(resolution);
+                sweep.import_bound += 1;
                 continue;
             }
             let hits = {
@@ -227,9 +257,12 @@ fn filter_compatible_hits(
     Ok(filtered)
 }
 
-/// Resolves a relative import specifier (`./x`, `../y`) onto the target
-/// file's endpoint `f{file_id}`. Bare package names and alias roots stay
-/// pending: they address modules outside the workspace snapshot.
+/// Resolves an import specifier onto the target file's endpoint
+/// `f{file_id}`: TS/JS spell file-relative specifiers (`./x`, `../y`),
+/// while Python spells dotted module paths that address the workspace root
+/// (`from declare import x` addresses `declare.py` there). Bare package
+/// names and alias roots stay pending: they address modules outside the
+/// workspace snapshot.
 ///
 /// # Errors
 /// Propagates graph storage failures; an unmatched specifier is `None`.
@@ -239,12 +272,20 @@ fn resolve_import(
     importing_paths: &mut HashMap<u32, Option<String>>,
 ) -> crate::EngineResult<Option<Resolution>> {
     let reference = &stored.reference;
-    if reference.reference_kind != EdgeKind::Imports
-        || !(reference.reference_name.starts_with("./")
-            || reference.reference_name.starts_with("../"))
-    {
+    if reference.reference_kind != EdgeKind::Imports {
         return Ok(None);
     }
+    let module = match reference.language.as_str() {
+        "python" if !reference.reference_name.starts_with('.') => {
+            reference.reference_name.replace('.', "/")
+        }
+        _ if reference.reference_name.starts_with("./")
+            || reference.reference_name.starts_with("../") =>
+        {
+            reference.reference_name.clone()
+        }
+        _ => return Ok(None),
+    };
     let path = match importing_paths.entry(stored.file_id) {
         Entry::Occupied(entry) => entry.get().clone(),
         Entry::Vacant(entry) => entry.insert(graph.file_path(stored.file_id)?).clone(),
@@ -253,7 +294,11 @@ fn resolve_import(
         // A file without a persisted path cannot anchor a relative specifier.
         return Ok(None);
     };
-    let Some(base) = join_specifier(importing_dir(&path), &reference.reference_name) else {
+    let base = match reference.language.as_str() {
+        "python" => join_specifier("", &module),
+        _ => join_specifier(importing_dir(&path), &module),
+    };
+    let Some(base) = base else {
         return Ok(None);
     };
     for candidate in path_variants(&base, extensions_for(&reference.language)) {
@@ -308,6 +353,415 @@ fn resolve_import_bound(
             target_id: hit.entity_id.clone(),
             provenance: Provenance::ImportBound,
         }));
+    }
+    Ok(None)
+}
+
+/// One `as` alias binding parsed from an import statement's raw text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AliasBinding {
+    /// Local name the importing file binds (`leftWork`, `left_work`).
+    local: String,
+    /// Name the import addresses inside the specifier's module (`work`),
+    /// or `None` for module-namespace bindings (`import left as left_api`),
+    /// which bare-name resolution cannot follow without a receiver type.
+    imported: Option<String>,
+    /// Module specifier the statement imports from.
+    specifier: String,
+}
+
+/// Binds a bare call whose name is an `as` alias of an import: the alias
+/// never names an indexed symbol itself, and the binding pins which module
+/// the imported name addresses, so a unique same-module declaration of the
+/// imported name is the call's target. Receiver-typed calls wait for
+/// receiver inference and namespace bindings stay with the namespace rule;
+/// specifiers addressing no snapshot module keep the general rules.
+///
+/// # Errors
+/// Propagates graph storage failures; an unresolvable reference is `None`.
+fn resolve_alias_bound(
+    graph: &dyn ResolutionSession,
+    stored: &StoredPendingRef,
+    bindings: &mut HashMap<u32, Vec<AliasBinding>>,
+    importing_paths: &mut HashMap<u32, Option<String>>,
+    targets: &mut HashMap<(String, String), Option<u32>>,
+) -> crate::EngineResult<Option<Resolution>> {
+    let reference = &stored.reference;
+    if reference.receiver_name.is_some() || reference.reference_kind != EdgeKind::Calls {
+        return Ok(None);
+    }
+    let file_bindings = load_bindings(graph, stored, bindings)?;
+    let matched: Vec<&AliasBinding> = file_bindings
+        .iter()
+        .filter(|binding| binding.imported.is_some() && binding.local == reference.name_tail)
+        .collect();
+    let [binding] = matched.as_slice() else {
+        return Ok(None);
+    };
+    bind_in_module(
+        graph,
+        stored,
+        binding.imported.as_deref().expect("imported binding"),
+        binding,
+        importing_paths,
+        targets,
+    )
+}
+
+/// Binds a call whose receiver names a module-namespace binding
+/// (`import left as left_api`, then `left_api.work()`): the receiver is
+/// the module object itself, so a unique declaration of the invoked member
+/// inside that one module is the call's target. Namespace imports of no
+/// snapshot module and members the module declares ambiguously keep the
+/// reference with the general rules.
+///
+/// # Errors
+/// Propagates graph storage failures; an unresolvable reference is `None`.
+fn resolve_namespace_bound(
+    graph: &dyn ResolutionSession,
+    stored: &StoredPendingRef,
+    bindings: &mut HashMap<u32, Vec<AliasBinding>>,
+    importing_paths: &mut HashMap<u32, Option<String>>,
+    targets: &mut HashMap<(String, String), Option<u32>>,
+) -> crate::EngineResult<Option<Resolution>> {
+    let reference = &stored.reference;
+    let Some(receiver) = reference.receiver_name.as_deref() else {
+        return Ok(None);
+    };
+    if reference.reference_kind != EdgeKind::Calls {
+        return Ok(None);
+    }
+    let file_bindings = load_bindings(graph, stored, bindings)?;
+    let matched: Vec<&AliasBinding> = file_bindings
+        .iter()
+        .filter(|binding| binding.imported.is_none() && binding.local == receiver)
+        .collect();
+    let [binding] = matched.as_slice() else {
+        return Ok(None);
+    };
+    bind_in_module(
+        graph,
+        stored,
+        &reference.name_tail,
+        binding,
+        importing_paths,
+        targets,
+    )
+}
+
+/// Cached alias bindings of the reference's own file.
+///
+/// # Errors
+/// Propagates graph storage failures.
+fn load_bindings(
+    graph: &dyn ResolutionSession,
+    stored: &StoredPendingRef,
+    bindings: &mut HashMap<u32, Vec<AliasBinding>>,
+) -> crate::EngineResult<Vec<AliasBinding>> {
+    Ok(match bindings.entry(stored.file_id) {
+        Entry::Occupied(entry) => entry.get().clone(),
+        Entry::Vacant(entry) => entry
+            .insert(load_alias_bindings(graph, stored)?)
+            .clone(),
+    })
+}
+
+/// Binds the addressed member to the one declaration inside the binding's
+/// module: the import pins the module, so a unique same-module hit is the
+/// target. A specifier addressing no snapshot module and members the
+/// module declares ambiguously keep the reference with the general rules.
+///
+/// # Errors
+/// Propagates graph storage failures; an unresolvable reference is `None`.
+fn bind_in_module(
+    graph: &dyn ResolutionSession,
+    stored: &StoredPendingRef,
+    imported: &str,
+    binding: &AliasBinding,
+    importing_paths: &mut HashMap<u32, Option<String>>,
+    targets: &mut HashMap<(String, String), Option<u32>>,
+) -> crate::EngineResult<Option<Resolution>> {
+    let Some(target_file) = alias_target_file(graph, stored, binding, importing_paths, targets)?
+    else {
+        return Ok(None);
+    };
+    let Some(raw_hits) = graph.lookup_candidates(imported)? else {
+        // Hidden candidates must not turn the binding into a seemingly
+        // unique match against an unfinished snapshot.
+        return Ok(None);
+    };
+    let scoped: Vec<&NameIndexEntry> = raw_hits
+        .iter()
+        .filter(|hit| hit.file_id == target_file)
+        .collect();
+    if let [hit] = scoped.as_slice() {
+        return Ok(Some(Resolution {
+            ref_id: stored.id,
+            target_id: hit.entity_id.clone(),
+            provenance: Provenance::ImportBound,
+        }));
+    }
+    Ok(None)
+}
+
+/// Loads the file's import edges and parses their statement text into `as`
+/// alias bindings. Only statements spelling an explicit `as` produce
+/// bindings: unaliased imports keep flowing through the bare-name and
+/// import-bound rules, which already resolve them.
+///
+/// # Errors
+/// Propagates graph storage failures.
+fn load_alias_bindings(
+    graph: &dyn ResolutionSession,
+    stored: &StoredPendingRef,
+) -> crate::EngineResult<Vec<AliasBinding>> {
+    let pairs: fn(&str) -> Vec<(String, Option<String>)> = match stored.reference.language.as_str()
+    {
+        "typescript" | "javascript" => ts_alias_pairs,
+        "python" => python_alias_pairs,
+        "rust" => rust_alias_pairs,
+        _ => return Ok(Vec::new()),
+    };
+    let mut bindings = Vec::new();
+    for reference in graph.import_references(stored.file_id)? {
+        let Some(raw_text) = reference.raw_text.as_deref() else {
+            continue;
+        };
+        for (local, imported) in pairs(raw_text) {
+            bindings.push(AliasBinding {
+                local,
+                imported,
+                specifier: reference.specifier.clone(),
+            });
+        }
+    }
+    Ok(bindings)
+}
+
+/// Parses an import statement into aliased `(local, imported)` pairs and
+/// namespace bindings: `import { work as leftWork } from './left'` pairs a
+/// local alias with the imported name, `import * as leftApi from './left'`
+/// binds the module itself (`imported` stays `None`). Default imports and
+/// unaliased names never spell a binding.
+fn ts_alias_pairs(statement: &str) -> Vec<(String, Option<String>)> {
+    let Some(clause_end) = statement.rfind(" from ") else {
+        return Vec::new();
+    };
+    let clause = statement[..clause_end].trim();
+    let Some(open) = clause.find('{') else {
+        let Some(rest) = clause.strip_prefix("import ") else {
+            return Vec::new();
+        };
+        let rest = rest.trim();
+        let Some(as_index) = rest.find(" as ") else {
+            return Vec::new();
+        };
+        if rest[..as_index].trim() != "*" {
+            return Vec::new();
+        }
+        let local = rest[as_index + " as ".len()..].trim();
+        if local.is_empty() {
+            return Vec::new();
+        }
+        return vec![(local.to_owned(), None)];
+    };
+    let Some(close) = clause.rfind('}') else {
+        return Vec::new();
+    };
+    if close < open {
+        return Vec::new();
+    }
+    let mut pairs = Vec::new();
+    for entry in clause[open + 1..close].split(',') {
+        let entry = entry.trim();
+        let Some(as_index) = entry.find(" as ") else {
+            continue;
+        };
+        let imported = entry[..as_index].trim();
+        let local = entry[as_index + " as ".len()..].trim();
+        // `default as x` addresses the module's default export, which no
+        // named lookup can reach.
+        if imported.is_empty() || local.is_empty() || imported == "default" {
+            continue;
+        }
+        pairs.push((local.to_owned(), Some(imported.to_owned())));
+    }
+    pairs
+}
+
+/// Parses `from declare import func as foobar` statements into aliased
+/// `(local, imported)` pairs, and `import left as left_api` statements into
+/// namespace bindings whose imported half stays `None`. Unaliased forms
+/// never spell an `as`, so they stay unparsed.
+fn python_alias_pairs(statement: &str) -> Vec<(String, Option<String>)> {
+    let trimmed = statement.trim_start();
+    // `from m import ...` spells statement-level names; a leading `import`
+    // binds the module itself as a namespace.
+    if !trimmed.starts_with("from ") {
+        let Some(names) = trimmed.strip_prefix("import ") else {
+            return Vec::new();
+        };
+        return python_namespace_pairs(names);
+    }
+    let Some(import_index) = statement.find(" import ") else {
+        return Vec::new();
+    };
+    let names = statement[import_index + " import ".len()..].trim();
+    let names = names
+        .strip_prefix('(')
+        .map(|stripped| stripped.strip_suffix(')').unwrap_or(stripped))
+        .unwrap_or(names);
+    let mut pairs = Vec::new();
+    for entry in names.split(',') {
+        let entry = entry.trim();
+        let Some(as_index) = entry.find(" as ") else {
+            continue;
+        };
+        let imported = entry[..as_index].trim();
+        let local = entry[as_index + " as ".len()..].trim();
+        if imported.is_empty() || local.is_empty() {
+            continue;
+        }
+        pairs.push((local.to_owned(), Some(imported.to_owned())));
+    }
+    pairs
+}
+
+/// Parses comma-separated `module as alias` entries of a plain `import`
+/// statement into namespace bindings.
+fn python_namespace_pairs(names: &str) -> Vec<(String, Option<String>)> {
+    let mut pairs = Vec::new();
+    for entry in names.trim().trim_end_matches(';').split(',') {
+        let entry = entry.trim();
+        let Some(as_index) = entry.find(" as ") else {
+            continue;
+        };
+        let imported = entry[..as_index].trim();
+        let local = entry[as_index + " as ".len()..].trim();
+        if imported.is_empty() || local.is_empty() {
+            continue;
+        }
+        pairs.push((local.to_owned(), None));
+    }
+    pairs
+}
+
+/// Parses `use left::work as left_work;` statements into aliased
+/// `(local, imported)` pairs. Brace groups (`use a::{b as c}`) need
+/// per-item module paths the statement text alone cannot pin, so they
+/// stay unparsed.
+fn rust_alias_pairs(statement: &str) -> Vec<(String, Option<String>)> {
+    if statement.contains('{') {
+        return Vec::new();
+    }
+    let Some(as_index) = statement.find(" as ") else {
+        return Vec::new();
+    };
+    let Some(path) = statement[..as_index].strip_prefix("use ") else {
+        return Vec::new();
+    };
+    let path = path.trim();
+    let local = statement[as_index + " as ".len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let Some((module, imported)) = path.rsplit_once("::") else {
+        return Vec::new();
+    };
+    if module.is_empty() || imported.is_empty() || local.is_empty() {
+        return Vec::new();
+    }
+    vec![(local.to_owned(), Some(imported.to_owned()))]
+}
+
+/// Resolves an alias binding's module specifier onto the file it imports:
+/// TS/JS specifiers are file-relative, Python dotted paths are root
+/// relative, and Rust use paths name their module with the first segment
+/// (a leading `crate::` addresses the workspace root). `None` keeps the
+/// reference with the general rules.
+///
+/// # Errors
+/// Propagates graph storage failures.
+fn alias_target_file(
+    graph: &dyn ResolutionSession,
+    stored: &StoredPendingRef,
+    binding: &AliasBinding,
+    importing_paths: &mut HashMap<u32, Option<String>>,
+    targets: &mut HashMap<(String, String), Option<u32>>,
+) -> crate::EngineResult<Option<u32>> {
+    let language = stored.reference.language.as_str();
+    let resolved = match targets.entry((language.to_owned(), binding.specifier.clone())) {
+        Entry::Occupied(entry) => *entry.get(),
+        Entry::Vacant(entry) => entry
+            .insert(alias_target_file_uncached(graph, stored, binding, importing_paths)?)
+            .clone(),
+    };
+    Ok(resolved)
+}
+
+/// Uncached specifier resolution behind [`alias_target_file`].
+///
+/// # Errors
+/// Propagates graph storage failures.
+fn alias_target_file_uncached(
+    graph: &dyn ResolutionSession,
+    stored: &StoredPendingRef,
+    binding: &AliasBinding,
+    importing_paths: &mut HashMap<u32, Option<String>>,
+) -> crate::EngineResult<Option<u32>> {
+    let language = stored.reference.language.as_str();
+    let module: String = match language {
+        "typescript" | "javascript" => {
+            if !binding.specifier.starts_with("./") && !binding.specifier.starts_with("../") {
+                return Ok(None);
+            }
+            binding.specifier.clone()
+        }
+        "python" => {
+            if binding.specifier.starts_with('.') {
+                return Ok(None);
+            }
+            binding.specifier.replace('.', "/")
+        }
+        "rust" => {
+            let crate_path = binding
+                .specifier
+                .strip_prefix("crate::")
+                .unwrap_or(&binding.specifier);
+            let Some(first) = crate_path.split("::").find(|segment| !segment.is_empty()) else {
+                return Ok(None);
+            };
+            first.to_owned()
+        }
+        _ => return Ok(None),
+    };
+    let base = match language {
+        "typescript" | "javascript" => {
+            let path = match importing_paths.entry(stored.file_id) {
+                Entry::Occupied(entry) => entry.get().clone(),
+                Entry::Vacant(entry) => entry.insert(graph.file_path(stored.file_id)?).clone(),
+            };
+            let Some(path) = path else {
+                return Ok(None);
+            };
+            match join_specifier(importing_dir(&path), &module) {
+                Some(base) => base,
+                None => return Ok(None),
+            }
+        }
+        // Python and Rust specifiers address the workspace root.
+        _ => module,
+    };
+    let mut variants = path_variants(&base, extensions_for(language));
+    if language == "rust" {
+        // Rust modules live in `<base>.rs` or `<base>/mod.rs`; the index
+        // variant path_variants emits covers neither.
+        variants.push(format!("{base}/mod.rs"));
+    }
+    for candidate in variants {
+        if let Some(file_id) = graph.file_id_by_path(&candidate)? {
+            return Ok(Some(file_id));
+        }
     }
     Ok(None)
 }
@@ -590,6 +1044,13 @@ mod tests {
             SqliteGraphStorage::imported_file_ids(self, file_id)
                 .map_err(|error| crate::EngineError::storage_failure(error.to_string()))
         }
+        fn import_references(
+            &self,
+            file_id: u32,
+        ) -> crate::EngineResult<Vec<crate::storage::graph::ImportReference>> {
+            SqliteGraphStorage::import_references(self, file_id)
+                .map_err(|error| crate::EngineError::storage_failure(error.to_string()))
+        }
         fn apply_resolutions(
             &mut self,
             resolutions: &[Resolution],
@@ -706,6 +1167,66 @@ mod tests {
                     "typescript",
                 ),
             ],
+            ..empty_graph(Vec::new())
+        }
+    }
+
+    fn graph_with_alias_import_and_call(
+        specifier: &str,
+        raw_text: &str,
+        call: &str,
+        language: &str,
+    ) -> FileGraph {
+        let mut import = pending_reference(
+            "f9",
+            specifier,
+            crate::storage::graph::EdgeKind::Imports,
+            language,
+        );
+        import.metadata.insert(
+            "rawText".to_owned(),
+            serde_json::Value::String(raw_text.to_owned()),
+        );
+        FileGraph {
+            pending_refs: vec![
+                import,
+                pending_reference(
+                    "f9",
+                    call,
+                    crate::storage::graph::EdgeKind::Calls,
+                    language,
+                ),
+            ],
+            ..empty_graph(Vec::new())
+        }
+    }
+
+    fn graph_with_namespace_import_and_call(
+        specifier: &str,
+        raw_text: &str,
+        receiver: &str,
+        call: &str,
+        language: &str,
+    ) -> FileGraph {
+        let mut import = pending_reference(
+            "f9",
+            specifier,
+            crate::storage::graph::EdgeKind::Imports,
+            language,
+        );
+        import.metadata.insert(
+            "rawText".to_owned(),
+            serde_json::Value::String(raw_text.to_owned()),
+        );
+        let mut call_reference = pending_reference(
+            "f9",
+            call,
+            crate::storage::graph::EdgeKind::Calls,
+            language,
+        );
+        call_reference.receiver_name = Some(receiver.to_owned());
+        FileGraph {
+            pending_refs: vec![import, call_reference],
             ..empty_graph(Vec::new())
         }
     }
@@ -1075,6 +1596,404 @@ mod tests {
         assert_eq!(inbound.len(), 1);
         assert_eq!(inbound[0].source, "f9");
         assert_eq!(inbound[0].provenance, Provenance::ImportBound);
+    }
+
+    #[test]
+    fn ts_alias_pairs_parse_named_imports() {
+        assert_eq!(
+            ts_alias_pairs("import { work as leftWork } from './left';"),
+            vec![("leftWork".to_owned(), Some("work".to_owned()))]
+        );
+        assert_eq!(
+            ts_alias_pairs("import { work as a, rest as b } from './m';"),
+            vec![
+                ("a".to_owned(), Some("work".to_owned())),
+                ("b".to_owned(), Some("rest".to_owned())),
+            ]
+        );
+        // Namespace clauses, default imports, and unaliased names never
+        // spell a named binding; `* as ns` binds the module itself.
+        assert_eq!(
+            ts_alias_pairs("import * as ns from './m';"),
+            vec![("ns".to_owned(), None)]
+        );
+        assert!(ts_alias_pairs("import def from './m';").is_empty());
+        assert!(ts_alias_pairs("import { plain } from './m';").is_empty());
+    }
+
+    #[test]
+    fn python_alias_pairs_parse_from_imports() {
+        assert_eq!(
+            python_alias_pairs("from declare import func as foobar"),
+            vec![("foobar".to_owned(), Some("func".to_owned()))]
+        );
+        assert_eq!(
+            python_alias_pairs("from m import (a as x, b as y)"),
+            vec![
+                ("x".to_owned(), Some("a".to_owned())),
+                ("y".to_owned(), Some("b".to_owned())),
+            ]
+        );
+        // `import a as b` binds the module itself as a namespace.
+        assert_eq!(
+            python_alias_pairs("import left as left_api"),
+            vec![("left_api".to_owned(), None)]
+        );
+        assert!(python_alias_pairs("from m import plain").is_empty());
+    }
+
+    #[test]
+    fn rust_alias_pairs_parse_use_statements() {
+        assert_eq!(
+            rust_alias_pairs("use left::work as left_work;"),
+            vec![("left_work".to_owned(), Some("work".to_owned()))]
+        );
+        assert_eq!(
+            rust_alias_pairs("use crate::deep::item as short;"),
+            vec![("short".to_owned(), Some("item".to_owned()))]
+        );
+        // Brace groups pin per-item paths the statement text alone cannot
+        // spell, and unaliased uses flow through the general rules.
+        assert!(rust_alias_pairs("use a::{b as c};").is_empty());
+        assert!(rust_alias_pairs("use left::work;").is_empty());
+    }
+
+    #[test]
+    fn aliased_import_call_binds_imported_symbol() {
+        let mut graph = open_memory();
+        graph
+            .write_file_graph(
+                1,
+                "left.ts",
+                &empty_graph(vec![record("left-work", "work")]),
+                &[],
+            )
+            .expect("left write");
+        graph
+            .write_file_graph(
+                2,
+                "right.ts",
+                &empty_graph(vec![record("right-work", "work")]),
+                &[],
+            )
+            .expect("right write");
+        graph
+            .write_file_graph(
+                9,
+                "caller.ts",
+                &graph_with_alias_import_and_call(
+                    "./left",
+                    "import { work as leftWork } from './left';",
+                    "leftWork",
+                    "typescript",
+                ),
+                &[],
+            )
+            .expect("caller write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        // `leftWork` matches no indexed symbol, so only the alias binding
+        // can pin it to left.ts's `work`.
+        assert_eq!(sweep.scanned, 2);
+        assert_eq!(sweep.resolved, 2);
+        assert_eq!(sweep.import_bound, 1);
+        assert!(
+            graph
+                .list_pending_refs(10, 0)
+                .expect("pending page")
+                .refs
+                .is_empty()
+        );
+        let left_inbound = graph
+            .neighborhood(
+                "left-work",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("left inbound");
+        assert_eq!(left_inbound.len(), 1);
+        assert_eq!(left_inbound[0].source, "f9");
+        assert_eq!(left_inbound[0].provenance, Provenance::ImportBound);
+        let right_inbound = graph
+            .neighborhood(
+                "right-work",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("right inbound");
+        assert!(right_inbound.is_empty());
+    }
+
+    #[test]
+    fn python_alias_import_binds_imported_symbol() {
+        let mut graph = open_memory();
+        graph
+            .write_file_graph(
+                1,
+                "declare.py",
+                &empty_graph(vec![record("declare-func", "func")]),
+                &[],
+            )
+            .expect("declare write");
+        graph
+            .write_file_graph(
+                9,
+                "caller.py",
+                &graph_with_alias_import_and_call(
+                    "declare",
+                    "from declare import func as foobar",
+                    "foobar",
+                    "python",
+                ),
+                &[],
+            )
+            .expect("caller write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        // The dotted module specifier resolves from the workspace root, and
+        // the alias pins `foobar` to that module's `func`.
+        assert_eq!(sweep.scanned, 2);
+        assert_eq!(sweep.resolved, 2);
+        assert_eq!(sweep.import_bound, 1);
+        assert_eq!(sweep.failed, 0);
+        let inbound = graph
+            .neighborhood(
+                "declare-func",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("inbound");
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].provenance, Provenance::ImportBound);
+    }
+
+    #[test]
+    fn rust_alias_use_binds_imported_symbol() {
+        let mut graph = open_memory();
+        let mut work = record("left-work", "work");
+        work.qualified_name = "left::work".to_owned();
+        graph
+            .write_file_graph(1, "left.rs", &empty_graph(vec![work]), &[])
+            .expect("left write");
+        graph
+            .write_file_graph(
+                9,
+                "caller.rs",
+                &graph_with_alias_import_and_call(
+                    "left::work",
+                    "use left::work as left_work;",
+                    "left_work",
+                    "rust",
+                ),
+                &[],
+            )
+            .expect("caller write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        // The use path's first segment names the module, and the alias pins
+        // `left_work` to its `work`. The use edge itself binds through its
+        // name tail's workspace uniqueness, as any Rust use edge does.
+        assert_eq!(sweep.resolved, 2);
+        assert_eq!(sweep.import_bound, 1);
+        let inbound = graph
+            .neighborhood(
+                "left-work",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("inbound");
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].provenance, Provenance::ImportBound);
+    }
+
+    #[test]
+    fn namespace_import_call_binds_module_member() {
+        let mut graph = open_memory();
+        graph
+            .write_file_graph(
+                1,
+                "left.py",
+                &empty_graph(vec![record("left-work", "work"), record("left-stop", "stop")]),
+                &[],
+            )
+            .expect("left write");
+        graph
+            .write_file_graph(2, "right.py", &empty_graph(vec![record("right-work", "work")]), &[])
+            .expect("right write");
+        graph
+            .write_file_graph(
+                9,
+                "caller.py",
+                &graph_with_namespace_import_and_call(
+                    "left",
+                    "import left as left_api",
+                    "left_api",
+                    "work",
+                    "python",
+                ),
+                &[],
+            )
+            .expect("caller write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        // `left_api.work()` matches two workspace-wide `work` declarations;
+        // the namespace binding scopes the member to left.py alone.
+        assert_eq!(sweep.resolved, 2);
+        assert_eq!(sweep.import_bound, 1);
+        let inbound = graph
+            .neighborhood(
+                "left-work",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("inbound");
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].provenance, Provenance::ImportBound);
+        let right_inbound = graph
+            .neighborhood(
+                "right-work",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("right inbound");
+        assert!(right_inbound.is_empty());
+    }
+
+    #[test]
+    fn namespace_call_with_missing_member_stays_pending() {
+        let mut graph = open_memory();
+        // left.py never declares `work`; the workspace names it twice.
+        graph
+            .write_file_graph(1, "left.py", &empty_graph(vec![record("left-stop", "stop")]), &[])
+            .expect("left write");
+        graph
+            .write_file_graph(2, "right.py", &empty_graph(vec![record("right-work", "work")]), &[])
+            .expect("right write");
+        graph
+            .write_file_graph(3, "third.py", &empty_graph(vec![record("third-work", "work")]), &[])
+            .expect("third write");
+        graph
+            .write_file_graph(
+                9,
+                "caller.py",
+                &graph_with_namespace_import_and_call(
+                    "left",
+                    "import left as left_api",
+                    "left_api",
+                    "work",
+                    "python",
+                ),
+                &[],
+            )
+            .expect("caller write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        // The namespace pins the member to left.py, which declares no
+        // `work`; binding either workspace-wide declaration would be a
+        // coincidence, so the call stays queued with its candidates.
+        assert_eq!(sweep.resolved, 1);
+        assert_eq!(sweep.import_bound, 0);
+        assert_eq!(
+            graph
+                .list_pending_refs(10, 0)
+                .expect("pending page")
+                .refs
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn ts_namespace_import_call_binds_module_member() {
+        let mut graph = open_memory();
+        graph
+            .write_file_graph(
+                1,
+                "left.ts",
+                &empty_graph(vec![record("left-work", "work"), record("left-stop", "stop")]),
+                &[],
+            )
+            .expect("left write");
+        graph
+            .write_file_graph(2, "right.ts", &empty_graph(vec![record("right-work", "work")]), &[])
+            .expect("right write");
+        graph
+            .write_file_graph(
+                9,
+                "caller.ts",
+                &graph_with_namespace_import_and_call(
+                    "./left",
+                    "import * as leftApi from './left';",
+                    "leftApi",
+                    "work",
+                    "typescript",
+                ),
+                &[],
+            )
+            .expect("caller write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        // The `* as leftApi` clause binds the module object, and the member
+        // call scopes to left.ts exactly like the Python form.
+        assert_eq!(sweep.resolved, 2);
+        assert_eq!(sweep.import_bound, 1);
+        let inbound = graph
+            .neighborhood(
+                "left-work",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("inbound");
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].provenance, Provenance::ImportBound);
+    }
+
+    #[test]
+    fn alias_call_with_unresolvable_module_stays_pending() {
+        let mut graph = open_memory();
+        graph
+            .write_file_graph(
+                1,
+                "other.ts",
+                &empty_graph(vec![record("other-work", "work")]),
+                &[],
+            )
+            .expect("other write");
+        graph
+            .write_file_graph(
+                9,
+                "caller.ts",
+                &graph_with_alias_import_and_call(
+                    "./missing",
+                    "import { work as leftWork } from './missing';",
+                    "leftWork",
+                    "typescript",
+                ),
+                &[],
+            )
+            .expect("caller write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        // No snapshot module answers the specifier: binding the one
+        // workspace-wide `work` would be a coincidence, not the alias's
+        // target, so the call stays queued.
+        assert_eq!(sweep.resolved, 0);
+        assert_eq!(sweep.import_bound, 0);
+        assert_eq!(
+            graph
+                .list_pending_refs(10, 0)
+                .expect("pending page")
+                .refs
+                .len(),
+            2
+        );
     }
 
     #[test]

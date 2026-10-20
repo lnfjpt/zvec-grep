@@ -1,8 +1,9 @@
 use super::{
-    Direction, Edge, EdgeKind, NameIndexEntry, Result, SqliteGraphStorage, decode_enum,
-    decode_metadata, nonempty,
+    Direction, Edge, EdgeKind, ImportReference, Metadata, NameIndexEntry, Result,
+    SqliteGraphStorage, decode_enum, decode_metadata, nonempty,
 };
 use rusqlite::{Row, params_from_iter};
+use serde_json::Value;
 
 impl SqliteGraphStorage {
     /// All resolved one-hop edges in insertion order, with no result limit.
@@ -151,9 +152,10 @@ impl SqliteGraphStorage {
     }
 
     /// Whether the workspace snapshot contains a module rooted at `name`:
-    /// a file matching one of `extensions`, or any path inside a directory
-    /// named `name`. Anchors the resolver's external-import detection;
-    /// specifiers are identifiers, so no LIKE escaping is needed.
+    /// a file matching one of the dot-prefixed `extensions`, or any path
+    /// inside a directory named `name`. Anchors the resolver's
+    /// external-import detection; specifiers are identifiers, so no LIKE
+    /// escaping is needed.
     ///
     /// # Errors
     /// Propagates SQLite errors.
@@ -162,7 +164,7 @@ impl SqliteGraphStorage {
             let mut statement = self
                 .connection
                 .prepare("SELECT EXISTS(SELECT 1 FROM file_paths WHERE relative_path = ?1)")?;
-            let path = format!("{name}.{extension}");
+            let path = format!("{name}{extension}");
             if statement.query_row([&path], |row| row.get::<_, i64>(0))? != 0 {
                 return Ok(true);
             }
@@ -202,6 +204,29 @@ impl SqliteGraphStorage {
         ids.sort_unstable();
         ids.dedup();
         Ok(ids)
+    }
+
+    /// Import statements of a file in insertion order, both pending and
+    /// resolved: the resolver parses alias bindings from their statement
+    /// text regardless of whether the specifier has been resolved yet.
+    ///
+    /// # Errors
+    /// Propagates SQLite errors and invalid stored metadata.
+    pub(crate) fn import_references(&self, file_id: u32) -> Result<Vec<ImportReference>> {
+        let mut statement = self.connection.prepare(
+            "SELECT reference_name, metadata FROM edges
+             WHERE file_id = ?1 AND kind = 'imports' ORDER BY id",
+        )?;
+        let rows = statement.query_map([file_id], |row| {
+            let specifier: String = row.get(0)?;
+            let metadata: Metadata = decode_metadata(&row.get::<_, String>(1)?)?;
+            let raw_text = metadata.get("rawText").and_then(Value::as_str);
+            Ok(ImportReference {
+                specifier,
+                raw_text: raw_text.map(str::to_owned),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
 

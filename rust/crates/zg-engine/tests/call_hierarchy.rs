@@ -359,7 +359,10 @@ async fn python_import_alias() {
                 expected: json!([
                     {"name": "callByBoth1", "filePath": "consume.py", "startLine": 10,
                      "edges": [
-                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": [11, 12], "column": 4},
+                        // `func()` and `foobar()` are distinct call sites that
+                        // both bind to the one declaration: one edge per site.
+                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": 11, "column": 4},
+                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": 12, "column": 4},
                     ]},
                 ]),
             },
@@ -369,7 +372,8 @@ async fn python_import_alias() {
                 expected: json!([
                     {"name": "callByBoth2", "filePath": "consume.py", "startLine": 14,
                      "edges": [
-                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": [15, 16], "column": 4},
+                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": 15, "column": 4},
+                        {"symbol": {"name": "func", "filePath": "declare.py", "startLine": 1}, "line": 16, "column": 4},
                     ]},
                 ]),
             },
@@ -381,8 +385,10 @@ async fn python_import_alias() {
                      "edges": [
                         {"symbol": {"name": "callByAlias", "filePath": "consume.py", "startLine": 4}, "line": 5, "column": 4},
                         {"symbol": {"name": "callByName", "filePath": "consume.py", "startLine": 7}, "line": 8, "column": 4},
-                        {"symbol": {"name": "callByBoth1", "filePath": "consume.py", "startLine": 10}, "line": [11, 12], "column": 4},
-                        {"symbol": {"name": "callByBoth2", "filePath": "consume.py", "startLine": 14}, "line": [15, 16], "column": 4},
+                        {"symbol": {"name": "callByBoth1", "filePath": "consume.py", "startLine": 10}, "line": 11, "column": 4},
+                        {"symbol": {"name": "callByBoth1", "filePath": "consume.py", "startLine": 10}, "line": 12, "column": 4},
+                        {"symbol": {"name": "callByBoth2", "filePath": "consume.py", "startLine": 14}, "line": 15, "column": 4},
+                        {"symbol": {"name": "callByBoth2", "filePath": "consume.py", "startLine": 14}, "line": 16, "column": 4},
                     ]},
                 ]),
             },
@@ -7270,6 +7276,7 @@ function baz() {
 // Foo.cc defines them, and a third translation unit calls bar through reference/pointer receivers.
 // Canonical symbols and ranges must come from Foo.cc, with no duplicate header-declaration groups.
 // Calls within the out-of-line bar definition belong to Foo::bar and resolve this against Foo.
+// `ref.bar()` and `ptr->bar()` are distinct call sites with distinct receivers: one edge per site.
 #[tokio::test]
 async fn cpp_class_header_and_implementation() {
     check_case(Case {
@@ -7313,7 +7320,8 @@ void caller(Foo& ref, Foo* ptr) {
                 expected: json!([
                     {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": [3, 4], "column": 8},
+                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": 3, "column": 8},
+                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": 4, "column": 8},
                     ]},
                 ]),
             },
@@ -7323,7 +7331,8 @@ void caller(Foo& ref, Foo* ptr) {
                 expected: json!([
                     {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3,
                      "edges": [
-                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": [3, 4], "column": 8},
+                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": 3, "column": 8},
+                        {"symbol": {"name": "caller", "filePath": "caller.cc", "startLine": 2}, "line": 4, "column": 8},
                     ]},
                 ]),
             },
@@ -7333,7 +7342,8 @@ void caller(Foo& ref, Foo* ptr) {
                 expected: json!([
                     {"name": "caller", "filePath": "caller.cc", "startLine": 2,
                      "edges": [
-                        {"symbol": {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3}, "line": [3, 4], "column": 8},
+                        {"symbol": {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3}, "line": 3, "column": 8},
+                        {"symbol": {"name": "Foo::bar", "filePath": "Foo.cc", "startLine": 3}, "line": 4, "column": 8},
                     ]},
                 ]),
             },

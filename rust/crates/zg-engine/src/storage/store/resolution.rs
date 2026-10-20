@@ -1,7 +1,8 @@
 //! Restricted resolver access to a coordinated, locked storage snapshot.
 use super::*;
 use crate::storage::graph::{
-    NameIndexEntry, PendingRefPage, Resolution, ResolutionStats, StoredPendingRef,
+    ImportReference, NameIndexEntry, PendingRefPage, Resolution, ResolutionStats,
+    StoredPendingRef,
 };
 
 /// The resolver can inspect references/candidates and submit decisions, but
@@ -16,6 +17,8 @@ pub(crate) trait ResolutionSession {
     /// unavailable local modules must not be classified as external failures.
     fn path_has_module(&self, name: &str, extensions: &[&str]) -> EngineResult<bool>;
     fn imported_file_ids(&self, file_id: u32) -> EngineResult<Vec<u32>>;
+    /// Import statements of one file, for the resolver's alias bindings.
+    fn import_references(&self, file_id: u32) -> EngineResult<Vec<ImportReference>>;
     fn apply_resolutions(&mut self, resolutions: &[Resolution]) -> EngineResult<ResolutionStats>;
     fn apply_failures(&mut self, refs: &[i64]) -> EngineResult<usize>;
     fn record_candidates(&mut self, candidates: &[(i64, Vec<String>)]) -> EngineResult<usize>;
@@ -161,6 +164,13 @@ impl ResolutionSession for StoreResolutionSession<'_> {
             .into_iter()
             .filter(|id| visible.contains_key(&FileId::new(*id)))
             .collect())
+    }
+
+    fn import_references(&self, file_id: u32) -> EngineResult<Vec<ImportReference>> {
+        if self.file_path(file_id)?.is_none() {
+            return Ok(Vec::new());
+        }
+        self.graph().import_references(file_id).map_err(graph_error)
     }
 
     fn apply_resolutions(&mut self, resolutions: &[Resolution]) -> EngineResult<ResolutionStats> {

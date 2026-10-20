@@ -189,6 +189,19 @@ fn module_path_of(node: Node<'_>, source: &[u8], format: FileFormat) -> Option<S
                 }
                 let path = normalize_module_path(node_text(target, source));
                 if !path.is_empty() {
+                    // Python: the `name` field wraps the whole aliased unit
+                    // on `import left as left_api`; the module path is the
+                    // wrapper's inner `name` field. Unaliased imports and
+                    // `from` modules carry no inner `name` and keep the
+                    // outer path.
+                    if format == FileFormat::Python {
+                        if let Some(inner) = target.child_by_field_name("name") {
+                            let inner_path = normalize_module_path(node_text(inner, source));
+                            if !inner_path.is_empty() {
+                                return Some(inner_path);
+                            }
+                        }
+                    }
                     return Some(path);
                 }
             }

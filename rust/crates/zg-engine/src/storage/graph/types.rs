@@ -152,6 +152,17 @@ pub(crate) struct StoredPendingRef {
     pub reference: PendingRef,
 }
 
+/// One import statement of a file as the resolver sees it: the extracted
+/// module specifier plus the statement text, which carries the `as` alias
+/// bindings the specifier alone loses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ImportReference {
+    /// Module specifier from extraction (`./left`, `declare`, `left::work`).
+    pub specifier: String,
+    /// Import statement text as written in the source.
+    pub raw_text: Option<String>,
+}
+
 /// Page over pending references. Restart pagination after file mutations.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PendingRefPage {
