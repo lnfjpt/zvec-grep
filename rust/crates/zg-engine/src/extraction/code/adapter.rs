@@ -87,7 +87,7 @@ const JAVASCRIPT: LanguageAdapter = LanguageAdapter {
         "pair",
         "variable_declarator",
     ],
-    scope_types: &["class_declaration"],
+    scope_types: &["class_declaration", "function_declaration"],
 };
 const PYTHON: LanguageAdapter = LanguageAdapter {
     kind: Language::Python,
@@ -96,7 +96,11 @@ const PYTHON: LanguageAdapter = LanguageAdapter {
         "decorated_definition",
         "function_definition",
     ],
-    scope_types: &["class_definition", "decorated_definition"],
+    scope_types: &[
+        "class_definition",
+        "decorated_definition",
+        "function_definition",
+    ],
 };
 const RUST: LanguageAdapter = LanguageAdapter {
     kind: Language::Rust,
@@ -113,7 +117,9 @@ const RUST: LanguageAdapter = LanguageAdapter {
         "type_item",
         "union_item",
     ],
-    scope_types: &["impl_item", "mod_item", "trait_item"],
+    // Functions scope their bodies too: a nested function spells its own
+    // entity (`outer::work`), shadowing the file-level name inside it.
+    scope_types: &["function_item", "impl_item", "mod_item", "trait_item"],
 };
 const TYPESCRIPT: LanguageAdapter = LanguageAdapter {
     kind: Language::TypeScript,
@@ -652,12 +658,31 @@ fn should_index_javascript_typescript_entity(node: Node<'_>) -> bool {
     if !has_function_value(node) && find_descendant_by_kind(node, "class_body").is_some() {
         return false;
     }
+    if node.kind() == "variable_declarator" && inside_function_declaration(node) {
+        // A declaration inside a function body stays unindexed: the
+        // initializer's call sites belong to the enclosing function's flow,
+        // and the local itself is no workspace-level symbol.
+        return false;
+    }
     if node.kind() == "variable_declarator" {
         return node
             .child_by_field_name("name")
             .is_some_and(|name| name.kind() == "identifier");
     }
     true
+}
+
+/// True when every ancestor run from `node` reaches a function declaration
+/// before the program root — the scope recursion only opens those bodies.
+fn inside_function_declaration(node: Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if current.kind() == "function_declaration" {
+            return true;
+        }
+        parent = current.parent();
+    }
+    false
 }
 
 fn has_function_value(node: Node<'_>) -> bool {

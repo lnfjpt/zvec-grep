@@ -95,7 +95,10 @@ fn split_callee_name(callee_text: &str) -> (String, Option<String>) {
         return (cleaned.to_owned(), None);
     }
     let receiver = cleaned[..separator].trim_end_matches(':');
-    (cleaned[separator + 1..].to_owned(), Some(receiver.to_owned()))
+    (
+        cleaned[separator + 1..].to_owned(),
+        Some(receiver.to_owned()),
+    )
 }
 
 /// Collapses Python's `super().member` call receiver to the bare `super`
@@ -192,6 +195,673 @@ fn visit_for_calls(
             continue;
         }
         visit_for_calls(child, owner_index, source, context, boundary);
+    }
+}
+
+/// Collects variable/parameter type bindings from one entity's subtree:
+/// creation-initialized declarations (`var x = new X()`, `x = X()`,
+/// `let x = X {}`, `x := new(X)`, `auto x = X{}`, `const x = new X()`) and
+/// typed parameters (`caller(Left a, Right b)`). Each binding records the
+/// receiver type the resolver may infer when a call at or after this line
+/// names the variable. `boundary` mirrors [`scan_call_edges`]: subtrees
+/// owned by another entity are skipped — those claim their own bindings.
+pub(crate) fn scan_binding_declarations(
+    entity_node: Node<'_>,
+    owner_index: usize,
+    source: &[u8],
+    format: FileFormat,
+    context: &mut WalkContext,
+    boundary: Option<&dyn Fn(Node<'_>) -> bool>,
+) {
+    visit_for_bindings(entity_node, owner_index, source, format, context, boundary);
+}
+
+fn visit_for_bindings(
+    node: Node<'_>,
+    owner_index: usize,
+    source: &[u8],
+    format: FileFormat,
+    context: &mut WalkContext,
+    boundary: Option<&dyn Fn(Node<'_>) -> bool>,
+) {
+    if let Some((name, bound_type)) = declaration_binding_of(node, source, format, context) {
+        context.add_declare_binding(
+            owner_index,
+            &name,
+            &bound_type,
+            node.start_position().row + 1,
+            node.start_position().column,
+        );
+        return;
+    }
+    for child in named_children(node) {
+        if boundary.is_some_and(|owns| owns(child)) {
+            continue;
+        }
+        visit_for_bindings(child, owner_index, source, format, context, boundary);
+    }
+}
+
+/// Extracts `(bound name, declared type)` from a declaration node whose
+/// shape one of the per-language readers recognizes.
+fn declaration_binding_of(
+    node: Node<'_>,
+    source: &[u8],
+    format: FileFormat,
+    context: &WalkContext,
+) -> Option<(String, String)> {
+    match format {
+        FileFormat::Java => java_binding_of(node, source, context),
+        FileFormat::Python => python_binding_of(node, source, context),
+        FileFormat::Rust => rust_binding_of(node, source, context),
+        FileFormat::Go => go_binding_of(node, source, context),
+        FileFormat::Cpp => cpp_binding_of(node, source, context),
+        FileFormat::C => c_binding_of(node, source),
+        FileFormat::TypeScript => ts_binding_of(node, source, context),
+        FileFormat::JavaScript => js_binding_of(node, source, context),
+        _ => None,
+    }
+}
+
+/// Collects this file's factory return types before the per-entity walk:
+/// functions register their signature's return type, and untyped functions
+/// (JavaScript, Python) register the type their `return` constructions
+/// spell. The creation binding collector then answers a bare-call
+/// initializer (`x = makeX()`) from that table regardless of whether the
+/// factory is spelled before or after the caller.
+pub(crate) fn scan_return_types(
+    root: Node<'_>,
+    source: &[u8],
+    format: FileFormat,
+    context: &mut WalkContext,
+) {
+    visit_for_return_types(root, source, format, context);
+}
+
+fn visit_for_return_types(
+    node: Node<'_>,
+    source: &[u8],
+    format: FileFormat,
+    context: &mut WalkContext,
+) {
+    if let Some((name, return_type)) = function_return_of(node, source, format) {
+        context.register_return_type(&name, &return_type);
+        // The body belongs to this registration; nested functions spell
+        // their own.
+        return;
+    }
+    for child in named_children(node) {
+        visit_for_return_types(child, source, format, context);
+    }
+}
+
+/// `(function name, factory return type)` of a function node whose
+/// signature annotates the type — or, for the untyped languages, whose
+/// `return` statements all construct the same one.
+fn function_return_of(
+    node: Node<'_>,
+    source: &[u8],
+    format: FileFormat,
+) -> Option<(String, String)> {
+    match format {
+        FileFormat::Java => java_return_of(node, source),
+        FileFormat::Python => python_return_of(node, source),
+        FileFormat::Rust => rust_return_of(node, source),
+        FileFormat::Go => go_return_of(node, source),
+        FileFormat::Cpp => cpp_return_of(node, source),
+        FileFormat::TypeScript => ts_return_of(node, source),
+        FileFormat::JavaScript => js_return_of(node, source),
+        _ => None,
+    }
+}
+
+/// The single type this function's `return` statements construct
+/// (`return X()`, `return new X()`); several different types, or a body
+/// with none, keep the factory answer unknown.
+fn body_return_type_of(function: Node<'_>, source: &[u8]) -> Option<String> {
+    let body = function.child_by_field_name("body")?;
+    let mut types = Vec::new();
+    collect_return_constructions(body, source, &mut types);
+    types.sort();
+    types.dedup();
+    if let [only] = types.as_slice() {
+        return Some(only.clone());
+    }
+    None
+}
+
+fn collect_return_constructions(node: Node<'_>, source: &[u8], types: &mut Vec<String>) {
+    match node.kind() {
+        // A nested function's returns spell its own factory, not this one.
+        "function_definition"
+        | "function_declaration"
+        | "function_item"
+        | "method_definition"
+        | "method_declaration" => return,
+        "return_statement" => {
+            if let Some(type_name) = return_construction_of(node, source) {
+                types.push(type_name);
+            }
+            return;
+        }
+        _ => {}
+    }
+    for child in named_children(node) {
+        collect_return_constructions(child, source, types);
+    }
+}
+
+/// The type one `return` statement constructs: a bare-identifier call
+/// (`return X()`) or a `new` expression (`return new X()`). Attribute and
+/// member callees stay untyped.
+fn return_construction_of(stmt: Node<'_>, source: &[u8]) -> Option<String> {
+    let expression = stmt.named_child(0)?;
+    match expression.kind() {
+        "new_expression" => {
+            let constructor = expression.child_by_field_name("constructor")?;
+            (constructor.kind() == "identifier").then(|| node_text(constructor, source).to_owned())
+        }
+        "call_expression" | "call" => {
+            let function = expression.child_by_field_name("function")?;
+            (function.kind() == "identifier").then(|| node_text(function, source).to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn java_return_of(node: Node<'_>, source: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "method_declaration" {
+        return None;
+    }
+    let type_node = node.child_by_field_name("type")?;
+    if type_node.kind() == "void_type" {
+        return None;
+    }
+    let type_name = type_name_of(type_node, source)?;
+    let name = node.child_by_field_name("name")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    Some((node_text(name, source).to_owned(), type_name))
+}
+
+fn python_return_of(node: Node<'_>, source: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let name = node.child_by_field_name("name")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    // An arrow annotation is authoritative; otherwise the `return`
+    // constructions spell the factory type.
+    if let Some(annotation) = node.child_by_field_name("return_type") {
+        if let Some(type_name) = type_name_of(annotation, source) {
+            return Some((node_text(name, source).to_owned(), type_name));
+        }
+    }
+    let type_name = body_return_type_of(node, source)?;
+    Some((node_text(name, source).to_owned(), type_name))
+}
+
+fn rust_return_of(node: Node<'_>, source: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "function_item" {
+        return None;
+    }
+    let name = node.child_by_field_name("name")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    let return_type = node.child_by_field_name("return_type")?;
+    let type_name = type_name_of(return_type, source)?;
+    Some((node_text(name, source).to_owned(), type_name))
+}
+
+fn go_return_of(node: Node<'_>, source: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "function_declaration" {
+        return None;
+    }
+    let name = node.child_by_field_name("name")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    let result = node.child_by_field_name("result")?;
+    let type_name = type_name_of(result, source)?;
+    Some((node_text(name, source).to_owned(), type_name))
+}
+
+fn cpp_return_of(node: Node<'_>, source: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let type_node = node.child_by_field_name("type")?;
+    let type_name = type_name_of(type_node, source)?;
+    if type_name == "void" {
+        return None;
+    }
+    // The function name sits under the declarator chain: the function
+    // declarator itself, optionally wrapped in pointer/reference/array
+    // declarators.
+    let mut declarator = node.child_by_field_name("declarator")?;
+    loop {
+        match declarator.kind() {
+            "function_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "array_declarator" => {
+                declarator = declarator.child_by_field_name("declarator")?;
+            }
+            _ => break,
+        }
+    }
+    if declarator.kind() != "identifier" {
+        return None;
+    }
+    Some((node_text(declarator, source).to_owned(), type_name))
+}
+
+fn ts_return_of(node: Node<'_>, source: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "function_declaration" {
+        return None;
+    }
+    let name = node.child_by_field_name("name")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    let annotation = node.child_by_field_name("return_type")?;
+    if annotation.kind() != "type_annotation" {
+        return None;
+    }
+    let inner = annotation.named_child(0)?;
+    if inner.kind() != "type_identifier" {
+        return None;
+    }
+    Some((
+        node_text(name, source).to_owned(),
+        node_text(inner, source).to_owned(),
+    ))
+}
+
+fn js_return_of(node: Node<'_>, source: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "function_declaration" {
+        return None;
+    }
+    let name = node.child_by_field_name("name")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    let type_name = body_return_type_of(node, source)?;
+    Some((node_text(name, source).to_owned(), type_name))
+}
+
+/// Spelled receiver type of a type node. Pointer/reference/array wrappers
+/// address the same method set as their inner type (`*Right`, `Right[]`).
+fn type_name_of(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let inner = match node.kind() {
+        "pointer_type" | "array_type" | "slice_type" | "reference_type" => node.named_child(0)?,
+        _ => node,
+    };
+    let text = node_text(inner, source);
+    is_identifier_like(text).then(|| text.to_owned())
+}
+
+/// Follows pointer/reference declarator wrappers down to the spelled name.
+fn peel_declarator_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "reference_declarator" | "pointer_declarator" | "array_declarator" => {
+            peel_declarator_name(node.named_child(0)?, source)
+        }
+        "identifier" => Some(node_text(node, source).to_owned()),
+        _ => None,
+    }
+}
+
+fn java_binding_of(
+    node: Node<'_>,
+    source: &[u8],
+    context: &WalkContext,
+) -> Option<(String, String)> {
+    match node.kind() {
+        // `var x = new X()` and `X x = new X()`: the creation expression
+        // spells the type regardless of how the declaration's own type
+        // field spells it (`var` placeholder or the explicit name). A
+        // bare-call initializer (`var x = makeX()`) binds the factory's
+        // registered return type instead; a receiver turns the callee
+        // into a member call no factory table answers.
+        "variable_declarator" => {
+            let value = node.child_by_field_name("value")?;
+            let name = node.child_by_field_name("name")?;
+            if name.kind() != "identifier" {
+                return None;
+            }
+            if value.kind() == "method_invocation" {
+                if value.child_by_field_name("object").is_some() {
+                    return None;
+                }
+                let callee = value.child_by_field_name("name")?;
+                if callee.kind() != "identifier" {
+                    return None;
+                }
+                let type_name = context.factory_return_of(node_text(callee, source))?;
+                return Some((node_text(name, source).to_owned(), type_name.to_owned()));
+            }
+            if value.kind() != "object_creation_expression" {
+                return None;
+            }
+            let type_node = value.child_by_field_name("type")?;
+            Some((
+                node_text(name, source).to_owned(),
+                node_text(type_node, source).to_owned(),
+            ))
+        }
+        // `void m(Left a)`: the parameter binds its declared type.
+        "formal_parameter" => {
+            let name = node.child_by_field_name("name")?;
+            let type_node = node.child_by_field_name("type")?;
+            let type_name = type_name_of(type_node, source)?;
+            Some((node_text(name, source).to_owned(), type_name))
+        }
+        _ => None,
+    }
+}
+
+/// `void (*work)(void) = target;`: a function-pointer initializer aliases
+/// the callee — a call spelled through the pointer's name reaches the
+/// function the initializer names, not a same-named declaration the local
+/// hides. Plain declarations without an initializer bind nothing.
+fn c_binding_of(node: Node<'_>, source: &[u8]) -> Option<(String, String)> {
+    if node.kind() != "declaration" {
+        return None;
+    }
+    let declarator = node.child_by_field_name("declarator")?;
+    if declarator.kind() != "init_declarator" {
+        return None;
+    }
+    let value = declarator.child_by_field_name("value")?;
+    if value.kind() != "identifier" {
+        return None;
+    }
+    let mut name_node = declarator.child_by_field_name("declarator")?;
+    loop {
+        match name_node.kind() {
+            // Parenthesized declarators wrap their inner spelling without a
+            // field name; the pointer/function layers name it `declarator`.
+            "parenthesized_declarator" => name_node = name_node.named_child(0)?,
+            "pointer_declarator" | "function_declarator" | "array_declarator" => {
+                name_node = name_node.child_by_field_name("declarator")?;
+            }
+            _ => break,
+        }
+    }
+    if name_node.kind() != "identifier" {
+        return None;
+    }
+    Some((
+        node_text(name_node, source).to_owned(),
+        node_text(value, source).to_owned(),
+    ))
+}
+
+fn python_binding_of(
+    node: Node<'_>,
+    source: &[u8],
+    context: &WalkContext,
+) -> Option<(String, String)> {
+    if node.kind() != "assignment" {
+        return None;
+    }
+    // `x = X()`: the call's bare function name is the constructed type —
+    // unless that name is a registered factory, whose return type binds
+    // instead (`x = make_x()`). Attribute calls (`x = mod.X()`) and
+    // non-call initializers carry no locally spellable type.
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "identifier" {
+        return None;
+    }
+    let right = node.child_by_field_name("right")?;
+    if right.kind() != "call" {
+        return None;
+    }
+    let function = right.child_by_field_name("function")?;
+    if function.kind() != "identifier" {
+        return None;
+    }
+    let callee = node_text(function, source);
+    let bound_type = context.factory_return_of(callee).unwrap_or(callee);
+    Some((node_text(left, source).to_owned(), bound_type.to_owned()))
+}
+
+fn rust_binding_of(
+    node: Node<'_>,
+    source: &[u8],
+    context: &WalkContext,
+) -> Option<(String, String)> {
+    if node.kind() != "let_declaration" {
+        return None;
+    }
+    let pattern = node.child_by_field_name("pattern")?;
+    if pattern.kind() != "identifier" {
+        return None;
+    }
+    let value = node.child_by_field_name("value")?;
+    // `let x = make_x()`: a bare call binds the callee's registered
+    // factory return type; member calls stay untyped.
+    if value.kind() == "call_expression" {
+        let function = value.child_by_field_name("function")?;
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let type_name = context.factory_return_of(node_text(function, source))?;
+        return Some((node_text(pattern, source).to_owned(), type_name.to_owned()));
+    }
+    // `let x = X {}`: the struct literal spells the type.
+    if value.kind() != "struct_expression" {
+        return None;
+    }
+    let name = value.child_by_field_name("name")?;
+    Some((
+        node_text(pattern, source).to_owned(),
+        node_text(name, source).to_owned(),
+    ))
+}
+
+fn go_binding_of(node: Node<'_>, source: &[u8], context: &WalkContext) -> Option<(String, String)> {
+    match node.kind() {
+        // `x := new(X)`: the new call's type argument is the type.
+        // `x := makeX()`: a bare call binds the registered factory's
+        // return type instead.
+        "short_var_declaration" => {
+            let left = node.child_by_field_name("left")?;
+            let right = node.child_by_field_name("right")?;
+            let call = right.named_child(0)?;
+            if call.kind() != "call_expression" {
+                return None;
+            }
+            let function = call.child_by_field_name("function")?;
+            if function.kind() != "identifier" {
+                return None;
+            }
+            let name = left.named_child(0)?;
+            if name.kind() != "identifier" {
+                return None;
+            }
+            let callee = node_text(function, source);
+            if callee == "new" {
+                let arguments = call.child_by_field_name("arguments")?;
+                let type_node = arguments.named_child(0)?;
+                return Some((
+                    node_text(name, source).to_owned(),
+                    node_text(type_node, source).to_owned(),
+                ));
+            }
+            let type_name = context.factory_return_of(callee)?;
+            Some((node_text(name, source).to_owned(), type_name.to_owned()))
+        }
+        // `func m(a Left, b *Right)`: the parameter binds its type.
+        "parameter_declaration" => {
+            let name = node.child_by_field_name("name")?;
+            let type_node = node.child_by_field_name("type")?;
+            let type_name = type_name_of(type_node, source)?;
+            Some((node_text(name, source).to_owned(), type_name))
+        }
+        _ => None,
+    }
+}
+
+fn cpp_binding_of(
+    node: Node<'_>,
+    source: &[u8],
+    context: &WalkContext,
+) -> Option<(String, String)> {
+    match node.kind() {
+        // `auto x = X{}` / `auto x = new X()`: the placeholder type defers
+        // to the initializer's spelled type. `auto x = makeX()`: a bare
+        // call binds the registered factory's return type.
+        "declaration" => {
+            let declared = node.child_by_field_name("type")?;
+            if declared.kind() != "placeholder_type_specifier" {
+                return None;
+            }
+            let declarator = node.child_by_field_name("declarator")?;
+            if declarator.kind() != "init_declarator" {
+                return None;
+            }
+            let name = declarator.child_by_field_name("declarator")?;
+            let value = declarator.child_by_field_name("value")?;
+            let type_node = match value.kind() {
+                "new_expression" | "compound_literal_expression" => {
+                    value.child_by_field_name("type")?
+                }
+                "call_expression" => {
+                    let function = value.child_by_field_name("function")?;
+                    if function.kind() != "identifier" {
+                        return None;
+                    }
+                    let type_name = context.factory_return_of(node_text(function, source))?;
+                    return Some((node_text(name, source).to_owned(), type_name.to_owned()));
+                }
+                _ => return None,
+            };
+            Some((
+                node_text(name, source).to_owned(),
+                node_text(type_node, source).to_owned(),
+            ))
+        }
+        // `void m(Left &a)`: the parameter name sits under the reference
+        // declarator wrapper.
+        "parameter_declaration" => {
+            let type_node = node.child_by_field_name("type")?;
+            let declarator = node.child_by_field_name("declarator")?;
+            let type_name = type_name_of(type_node, source)?;
+            let name = peel_declarator_name(declarator, source)?;
+            Some((name, type_name))
+        }
+        _ => None,
+    }
+}
+
+fn ts_binding_of(node: Node<'_>, source: &[u8], context: &WalkContext) -> Option<(String, String)> {
+    match node.kind() {
+        // `const x = new X()`: the constructor expression spells the type.
+        // `const x = makeX()`: a bare call binds the registered factory's
+        // return type.
+        "variable_declarator" => {
+            let value = node.child_by_field_name("value")?;
+            let name = node.child_by_field_name("name")?;
+            if name.kind() != "identifier" {
+                return None;
+            }
+            let type_name = creation_or_factory_type(value, source, context)?;
+            Some((node_text(name, source).to_owned(), type_name))
+        }
+        // `x = new X()`: a reassignment rebinds the name; the resolver
+        // orders the bindings by line so calls after it see the new type.
+        "assignment_expression" => {
+            let left = node.child_by_field_name("left")?;
+            if left.kind() != "identifier" {
+                return None;
+            }
+            let value = node.child_by_field_name("right")?;
+            let type_name = creation_or_factory_type(value, source, context)?;
+            Some((node_text(left, source).to_owned(), type_name))
+        }
+        // `function m(a: Left, b: Right)`: the parameter binds its type
+        // annotation's single type; unions stay unbound (either type may
+        // answer the call).
+        "required_parameter" => {
+            let pattern = node.child_by_field_name("pattern")?;
+            if pattern.kind() != "identifier" {
+                return None;
+            }
+            let annotation = node.child_by_field_name("type")?;
+            if annotation.kind() != "type_annotation" {
+                return None;
+            }
+            let inner = annotation.named_child(0)?;
+            if inner.kind() != "type_identifier" {
+                return None;
+            }
+            Some((
+                node_text(pattern, source).to_owned(),
+                node_text(inner, source).to_owned(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The type a creation or bare-call initializer spells: a `new X()`
+/// constructor names `X`, a bare `makeX()` call binds the registered
+/// factory's return type, and anything else carries no locally spellable
+/// type.
+fn creation_or_factory_type(
+    value: Node<'_>,
+    source: &[u8],
+    context: &WalkContext,
+) -> Option<String> {
+    if value.kind() == "call_expression" {
+        let function = value.child_by_field_name("function")?;
+        if function.kind() != "identifier" {
+            return None;
+        }
+        return context
+            .factory_return_of(node_text(function, source))
+            .map(str::to_owned);
+    }
+    if value.kind() != "new_expression" {
+        return None;
+    }
+    let constructor = value.child_by_field_name("constructor")?;
+    (constructor.kind() == "identifier").then(|| node_text(constructor, source).to_owned())
+}
+
+fn js_binding_of(node: Node<'_>, source: &[u8], context: &WalkContext) -> Option<(String, String)> {
+    match node.kind() {
+        // `const x = new X()`: the constructor expression spells the type.
+        // `const x = makeX()`: a bare call binds the factory type the
+        // function's `return` construction spells (JavaScript signs no
+        // return types).
+        "variable_declarator" => {
+            let name = node.child_by_field_name("name")?;
+            if name.kind() != "identifier" {
+                return None;
+            }
+            let value = node.child_by_field_name("value")?;
+            let type_name = creation_or_factory_type(value, source, context)?;
+            Some((node_text(name, source).to_owned(), type_name))
+        }
+        // `x = new X()`: a reassignment rebinds the name; the resolver
+        // orders the bindings by line so calls after it see the new type.
+        "assignment_expression" => {
+            let left = node.child_by_field_name("left")?;
+            if left.kind() != "identifier" {
+                return None;
+            }
+            let value = node.child_by_field_name("right")?;
+            let type_name = creation_or_factory_type(value, source, context)?;
+            Some((node_text(left, source).to_owned(), type_name))
+        }
+        _ => None,
     }
 }
 
@@ -624,7 +1294,8 @@ mod tests {
         parser
             .set_language(&tree_sitter_java::LANGUAGE.into())
             .expect("java grammar loads");
-        let source = "class A { void m() { this.foo(); super.foo(); util.run(); plain(); new A().run(); } }";
+        let source =
+            "class A { void m() { this.foo(); super.foo(); util.run(); plain(); new A().run(); } }";
         let tree = parser.parse(source, None).expect("java source parses");
         fn collect<'t>(node: tree_sitter::Node<'t>, out: &mut Vec<tree_sitter::Node<'t>>) {
             if node.kind() == "method_invocation" {
@@ -651,6 +1322,278 @@ mod tests {
                 "plain".to_owned(),
                 "run".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn collects_creation_and_parameter_bindings() {
+        fn bindings(
+            format: FileFormat,
+            lang: tree_sitter::Language,
+            source: &str,
+        ) -> Vec<(String, String, usize)> {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&lang).expect("grammar loads");
+            let tree = parser.parse(source, None).expect("parses");
+            let mut context = WalkContext::new();
+            let owner = context.next_entity_index();
+            scan_binding_declarations(
+                tree.root_node(),
+                owner,
+                source.as_bytes(),
+                format,
+                &mut context,
+                None,
+            );
+            context
+                .name_edges()
+                .iter()
+                .map(|edge| {
+                    (
+                        edge.ref_name.clone(),
+                        edge.bound_type.clone().expect("bound type"),
+                        edge.line,
+                    )
+                })
+                .collect()
+        }
+
+        // Creation-initialized locals across the grammars.
+        assert_eq!(
+            bindings(
+                FileFormat::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                "class A { void m() { var x = new X(); x.foo(); } }",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 1)]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::Python,
+                tree_sitter_python::LANGUAGE.into(),
+                "def m():\n    x = X()\n    x.foo()\n",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 2)]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                "fn m() { let x = X {}; x.foo(); }",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 1)]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::Go,
+                tree_sitter_go::LANGUAGE.into(),
+                "func m() {\n\tx := new(X)\n\tx.foo()\n}",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 2)]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::Cpp,
+                tree_sitter_cpp::LANGUAGE.into(),
+                "void m() { auto x = X{}; x.foo(); }",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 1)]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::Cpp,
+                tree_sitter_cpp::LANGUAGE.into(),
+                "void m() { auto x = new X(); x->foo(); }",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 1)]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "function m() { const x = new X(); x.foo(); }",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 1)]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::JavaScript,
+                tree_sitter_javascript::LANGUAGE.into(),
+                "function m() { const x = new X(); x.foo(); }",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 1)]
+        );
+
+        // Typed parameters.
+        assert_eq!(
+            bindings(
+                FileFormat::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                "class A { void m(Left a, Right b) { a.run(); } }",
+            ),
+            vec![
+                ("a".to_owned(), "Left".to_owned(), 1),
+                ("b".to_owned(), "Right".to_owned(), 1),
+            ]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::Cpp,
+                tree_sitter_cpp::LANGUAGE.into(),
+                "void m(Left &a, Right &b) { a.run(); }",
+            ),
+            vec![
+                ("a".to_owned(), "Left".to_owned(), 1),
+                ("b".to_owned(), "Right".to_owned(), 1),
+            ]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::Go,
+                tree_sitter_go::LANGUAGE.into(),
+                "func m(a Left, b *Right) { a.run() }",
+            ),
+            vec![
+                ("a".to_owned(), "Left".to_owned(), 1),
+                ("b".to_owned(), "Right".to_owned(), 1),
+            ]
+        );
+        assert_eq!(
+            bindings(
+                FileFormat::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "function m(a: Left, b: Right) { a.run(); }",
+            ),
+            vec![
+                ("a".to_owned(), "Left".to_owned(), 1),
+                ("b".to_owned(), "Right".to_owned(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn collects_factory_return_bindings() {
+        fn factory_bindings(
+            format: FileFormat,
+            lang: tree_sitter::Language,
+            source: &str,
+        ) -> Vec<(String, String, usize)> {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&lang).expect("grammar loads");
+            let tree = parser.parse(source, None).expect("parses");
+            let mut context = WalkContext::new();
+            scan_return_types(tree.root_node(), source.as_bytes(), format, &mut context);
+            let owner = context.next_entity_index();
+            scan_binding_declarations(
+                tree.root_node(),
+                owner,
+                source.as_bytes(),
+                format,
+                &mut context,
+                None,
+            );
+            context
+                .name_edges()
+                .iter()
+                .map(|edge| {
+                    (
+                        edge.ref_name.clone(),
+                        edge.bound_type.clone().expect("bound type"),
+                        edge.line,
+                    )
+                })
+                .collect()
+        }
+
+        // Signature-annotated factories across the grammars.
+        assert_eq!(
+            factory_bindings(
+                FileFormat::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                "fn make_x() -> X {\n    X {}\n}\nfn caller() {\n    let x = make_x();\n}\n",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 5)]
+        );
+        assert_eq!(
+            factory_bindings(
+                FileFormat::Go,
+                tree_sitter_go::LANGUAGE.into(),
+                "func makeX() *X {\n\treturn new(X)\n}\nfunc caller() {\n\tx := makeX()\n}\n",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 5)]
+        );
+        assert_eq!(
+            factory_bindings(
+                FileFormat::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "function makeX(): X {\n    return new X();\n}\nfunction caller() {\n    const x = makeX();\n}\n",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 5)]
+        );
+        assert_eq!(
+            factory_bindings(
+                FileFormat::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                "class Use {\n    static X makeX() {\n        return new X();\n    }\n    static void caller() {\n        var x = makeX();\n    }\n}\n",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 6)]
+        );
+        assert_eq!(
+            factory_bindings(
+                FileFormat::Cpp,
+                tree_sitter_cpp::LANGUAGE.into(),
+                "X makeX() {\n    return X{};\n}\nvoid caller() {\n    auto x = makeX();\n}\n",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 5)]
+        );
+
+        // Untyped languages infer from the body's `return` constructions.
+        assert_eq!(
+            factory_bindings(
+                FileFormat::Python,
+                tree_sitter_python::LANGUAGE.into(),
+                "def make_x():\n    return X()\n\ndef caller():\n    x = make_x()\n",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 5)]
+        );
+        assert_eq!(
+            factory_bindings(
+                FileFormat::JavaScript,
+                tree_sitter_javascript::LANGUAGE.into(),
+                "function makeX() {\n    return new X();\n}\nfunction caller() {\n    const x = makeX();\n}\n",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 5)]
+        );
+
+        // A Python arrow annotation outranks what the body returns.
+        assert_eq!(
+            factory_bindings(
+                FileFormat::Python,
+                tree_sitter_python::LANGUAGE.into(),
+                "def make_x() -> X:\n    return Y()\n\ndef caller():\n    x = make_x()\n",
+            ),
+            vec![("x".to_owned(), "X".to_owned(), 5)]
+        );
+
+        // Same-named factories spelling different types stay ambiguous:
+        // the bare call binds nothing rather than guessing.
+        assert_eq!(
+            factory_bindings(
+                FileFormat::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                "fn make() -> X {\n    todo!()\n}\nfn make() -> Y {\n    todo!()\n}\nfn caller() {\n    let m = make();\n}\n",
+            ),
+            vec![]
+        );
+
+        // A member call never consults the factory table.
+        assert_eq!(
+            factory_bindings(
+                FileFormat::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                "fn make_x() -> X {\n    todo!()\n}\nfn caller(v: V) {\n    let m = v.make_x();\n}\n",
+            ),
+            vec![]
         );
     }
 }

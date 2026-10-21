@@ -103,6 +103,9 @@ pub(super) fn assemble_file_graph(
                 reference.arity,
                 reference.receiver_name.as_deref(),
             );
+            if let Some(bound_type) = &reference.bound_type {
+                metadata.insert("type".to_owned(), serde_json::json!(bound_type));
+            }
             PendingRef {
                 owner_id,
                 ref_name: reference.ref_name.clone(),

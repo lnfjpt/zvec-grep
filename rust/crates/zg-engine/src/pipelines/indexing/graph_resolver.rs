@@ -89,6 +89,13 @@ pub(super) fn resolve_pending(
         let page = graph.list_pending_refs(1000, cursor)?;
         sweep.scanned += page.refs.len();
         for stored in &page.refs {
+            if stored.reference.reference_kind == EdgeKind::Declares {
+                // Binding evidence for `resolve_receiver_typed`, not a call
+                // site: the bound variable name must never reach the
+                // name-index lookup below. Declares edges stay pending in
+                // the table for every later sweep to re-read.
+                continue;
+            }
             if is_unresolvable_import(graph, &stored.reference, &mut module_paths)? {
                 failures.push(stored.id);
                 continue;
@@ -160,6 +167,14 @@ pub(super) fn resolve_pending(
                 // The receiver names the enclosing instance or superclass, so
                 // the member's declaring scope is pinned to the owner's class
                 // hierarchy before workspace-wide ambiguity is considered.
+                resolutions.push(resolution);
+                sweep.file_scoped += 1;
+                continue;
+            }
+            if let Some(resolution) = resolve_receiver_typed(graph, stored, &hits)? {
+                // The receiver names a local whose declared type pins the
+                // member's declaring scope before workspace-wide ambiguity
+                // is considered.
                 resolutions.push(resolution);
                 sweep.file_scoped += 1;
                 continue;
@@ -859,9 +874,88 @@ fn resolve_receiver_class(
     let matched: Vec<&NameIndexEntry> = hits
         .iter()
         .filter(|hit| {
-            hit.qualified_name.rsplit_once("::").is_some_and(|(scope, _)| {
-                scopes.iter().any(|candidate| candidate == scope)
-            })
+            hit.qualified_name
+                .rsplit_once("::")
+                .is_some_and(|(scope, _)| scopes.iter().any(|candidate| candidate == scope))
+        })
+        .collect();
+    if let [hit] = matched.as_slice() {
+        return Ok(Some(Resolution {
+            ref_id: stored.id,
+            target_id: hit.entity_id.clone(),
+            provenance: Provenance::FileScoped,
+        }));
+    }
+    Ok(None)
+}
+
+/// Binds a receiver call through the owner's declared bindings: a local
+/// whose creation or parameter line pins exactly one indexed type answers
+/// the member calls that follow it. Bindings at or after the call line say
+/// nothing about it — rebinding a name orders the evidence, so the latest
+/// earlier binding wins. A type name resolving to zero or several entities
+/// keeps the call for the remaining rules.
+///
+/// # Errors
+/// Propagates graph storage failures.
+fn resolve_receiver_typed(
+    graph: &dyn ResolutionSession,
+    stored: &StoredPendingRef,
+    hits: &[NameIndexEntry],
+) -> crate::EngineResult<Option<Resolution>> {
+    let reference = &stored.reference;
+    if reference.reference_kind != EdgeKind::Calls {
+        return Ok(None);
+    }
+    let Some(receiver) = reference.receiver_name.as_deref() else {
+        return Ok(None);
+    };
+    // The self/this family has its own hierarchy rule; typed bindings only
+    // address named locals and parameters.
+    if matches!(receiver, "self" | "this" | "me" | "super") {
+        return Ok(None);
+    }
+    let bindings = graph.declared_bindings(&reference.from_node_id)?;
+    let bound_type = bindings
+        .into_iter()
+        .filter(|binding| binding.name == receiver && binding.line <= reference.line)
+        .map(|binding| binding.bound_type)
+        .last(); // bindings are line-ordered; the latest earlier one shadows
+    let Some(bound_type) = bound_type else {
+        return Ok(None);
+    };
+    let Some(candidates) = graph.lookup_candidates(&bound_type)? else {
+        // Hidden type candidates keep this rule out of the sweep instead of
+        // matching against an unfinished snapshot.
+        return Ok(None);
+    };
+    // Constructors (`X::X`) and impl blocks index under the type's name
+    // inside the type's declaring scope, so the binding identifies the type
+    // by the one scope its candidates share; candidates spelling several
+    // distinct scopes keep the type ambiguous.
+    let mut shared_scopes = candidates.iter().map(|candidate| {
+        candidate
+            .qualified_name
+            .rsplit_once("::")
+            .map(|(scope, _)| scope.to_owned())
+            .unwrap_or_else(|| candidate.qualified_name.clone())
+    });
+    let Some(type_scope) = shared_scopes.next() else {
+        return Ok(None);
+    };
+    if shared_scopes.any(|scope| scope != type_scope) {
+        return Ok(None);
+    }
+    // The member's declaring scope is the bound type's own or any ancestor
+    // the inheritance chain adds, mirroring the self-receiver hierarchy.
+    let mut scopes = vec![type_scope.clone()];
+    collect_base_scopes(graph, &type_scope, &mut scopes, &mut HashSet::new(), 8)?;
+    let matched: Vec<&NameIndexEntry> = hits
+        .iter()
+        .filter(|hit| {
+            hit.qualified_name
+                .rsplit_once("::")
+                .is_some_and(|(scope, _)| scopes.iter().any(|candidate| candidate == scope))
         })
         .collect();
     if let [hit] = matched.as_slice() {
@@ -1235,6 +1329,13 @@ mod tests {
             }
             Ok(bases)
         }
+        fn declared_bindings(
+            &self,
+            owner_id: &str,
+        ) -> crate::EngineResult<Vec<crate::storage::graph::DeclaredBinding>> {
+            SqliteGraphStorage::declared_bindings(self, owner_id)
+                .map_err(|error| crate::EngineError::storage_failure(error.to_string()))
+        }
     }
 
     fn record(entity_id: &str, name: &str) -> EntityRecord {
@@ -1406,6 +1507,29 @@ mod tests {
             pending_refs: vec![import, call_reference],
             ..empty_graph(Vec::new())
         }
+    }
+
+    /// A `declares` pending reference as the sink writes it: the bound
+    /// variable name, the receiver type in the `type` metadata key, and the
+    /// declaring line the resolver orders rebinding evidence by.
+    fn declared_binding_reference(
+        from_node_id: &str,
+        variable: &str,
+        bound_type: &str,
+        line: u32,
+    ) -> crate::storage::graph::PendingRef {
+        let mut binding = pending_reference(
+            from_node_id,
+            variable,
+            crate::storage::graph::EdgeKind::Declares,
+            "typescript",
+        );
+        binding.line = line;
+        binding.metadata.insert(
+            "type".to_owned(),
+            serde_json::Value::String(bound_type.to_owned()),
+        );
+        binding
     }
 
     fn open_memory() -> SqliteGraphStorage {
@@ -2319,6 +2443,243 @@ mod tests {
             )
             .expect("inbound");
         assert_eq!(inbound.len(), 1);
+    }
+
+    #[test]
+    fn typed_receiver_binds_member_through_declared_type() {
+        let mut graph = open_memory();
+        // A creation binding (`const x = new Left()`) pins `x` to `Left`, so
+        // the later `x.run()` resolves to the one `run` the bound type
+        // declares — the same-file hit that stays pending without the type.
+        let entities = vec![
+            scoped_record("left", "Left"),
+            scoped_record("left-run", "Left::run"),
+            scoped_record("caller", "caller"),
+        ];
+        let mut call = pending_reference(
+            "caller",
+            "run",
+            crate::storage::graph::EdgeKind::Calls,
+            "typescript",
+        );
+        call.receiver_name = Some("x".to_owned());
+        call.line = 3;
+        let binding = declared_binding_reference("caller", "x", "Left", 2);
+        graph
+            .write_file_graph(
+                9,
+                "typed.ts",
+                &graph_with_refs(entities, vec![binding, call]),
+                &[],
+            )
+            .expect("write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        assert_eq!(sweep.resolved, 1);
+        assert_eq!(sweep.file_scoped, 1);
+        let inbound = graph
+            .neighborhood(
+                "left-run",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("inbound");
+        assert_eq!(inbound.len(), 1);
+    }
+
+    #[test]
+    fn typed_receiver_binds_across_files_when_type_is_unique() {
+        let mut graph = open_memory();
+        // The parameter binding names a type defined in another file; a
+        // workspace-unique `Left` still pins the member's declaring scope.
+        let mut graph_left = empty_graph(vec![
+            scoped_record("left", "Left"),
+            scoped_record("left-run", "Left::run"),
+        ]);
+        graph
+            .write_file_graph(1, "left.ts", &graph_left, &[])
+            .expect("left write");
+        let entities = vec![scoped_record("caller", "caller")];
+        let mut call = pending_reference(
+            "caller",
+            "run",
+            crate::storage::graph::EdgeKind::Calls,
+            "typescript",
+        );
+        call.receiver_name = Some("a".to_owned());
+        call.line = 2;
+        let binding = declared_binding_reference("caller", "a", "Left", 1);
+        graph
+            .write_file_graph(
+                9,
+                "caller.ts",
+                &graph_with_refs(entities, vec![binding, call]),
+                &[],
+            )
+            .expect("caller write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        assert_eq!(sweep.resolved, 1);
+        let inbound = graph
+            .neighborhood(
+                "left-run",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("inbound");
+        assert_eq!(inbound.len(), 1);
+    }
+
+    #[test]
+    fn typed_receiver_ignores_bindings_after_the_call() {
+        let mut graph = open_memory();
+        // The only `x` binding follows the call, so it says nothing about
+        // it; the call keeps its pre-inference pending state.
+        let entities = vec![
+            scoped_record("left", "Left"),
+            scoped_record("left-run", "Left::run"),
+            scoped_record("caller", "caller"),
+        ];
+        let mut call = pending_reference(
+            "caller",
+            "run",
+            crate::storage::graph::EdgeKind::Calls,
+            "typescript",
+        );
+        call.receiver_name = Some("x".to_owned());
+        call.line = 3;
+        let binding = declared_binding_reference("caller", "x", "Left", 5);
+        graph
+            .write_file_graph(
+                9,
+                "late.ts",
+                &graph_with_refs(entities, vec![binding, call]),
+                &[],
+            )
+            .expect("write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        assert_eq!(sweep.resolved, 0);
+        assert_eq!(sweep.file_scoped, 0);
+        assert_eq!(
+            graph
+                .list_pending_refs(10, 0)
+                .expect("pending page")
+                .refs
+                .len(),
+            2
+        );
+    }
+
+
+    #[test]
+    fn typed_receiver_rebinding_uses_latest_earlier_binding() {
+        let mut graph = open_memory();
+        // `x` is rebound from `Left` to `Right` before the call; the latest
+        // earlier binding is the type the receiver carries there.
+        let entities = vec![
+            scoped_record("left", "Left"),
+            scoped_record("left-run", "Left::run"),
+            scoped_record("right", "Right"),
+            scoped_record("right-run", "Right::run"),
+            scoped_record("caller", "caller"),
+        ];
+        let mut call = pending_reference(
+            "caller",
+            "run",
+            crate::storage::graph::EdgeKind::Calls,
+            "typescript",
+        );
+        call.receiver_name = Some("x".to_owned());
+        call.line = 4;
+        let first = declared_binding_reference("caller", "x", "Left", 1);
+        let rebind = declared_binding_reference("caller", "x", "Right", 3);
+        graph
+            .write_file_graph(
+                9,
+                "rebind.ts",
+                &graph_with_refs(entities, vec![first, rebind, call]),
+                &[],
+            )
+            .expect("write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        assert_eq!(sweep.resolved, 1);
+        let right_inbound = graph
+            .neighborhood(
+                "right-run",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("right inbound");
+        assert_eq!(right_inbound.len(), 1);
+        let left_inbound = graph
+            .neighborhood(
+                "left-run",
+                crate::storage::graph::Direction::In,
+                Some(&[crate::storage::graph::EdgeKind::Calls]),
+            )
+            .expect("left inbound");
+        assert!(left_inbound.is_empty());
+    }
+
+    #[test]
+    fn typed_receiver_with_ambiguous_type_stays_pending() {
+        let mut graph = open_memory();
+        // Two indexed `Left` classes cannot both own the receiver; the call
+        // waits instead of guessing a file.
+        graph
+            .write_file_graph(
+                1,
+                "first/left.ts",
+                &empty_graph(vec![scoped_record("left-a", "Left")]),
+                &[],
+            )
+            .expect("first write");
+        graph
+            .write_file_graph(
+                2,
+                "second/left.ts",
+                &empty_graph(vec![scoped_record("left-b", "Left")]),
+                &[],
+            )
+            .expect("second write");
+        let entities = vec![scoped_record("caller", "caller")];
+        let mut call = pending_reference(
+            "caller",
+            "run",
+            crate::storage::graph::EdgeKind::Calls,
+            "typescript",
+        );
+        call.receiver_name = Some("x".to_owned());
+        call.line = 2;
+        let binding = declared_binding_reference("caller", "x", "Left", 1);
+        graph
+            .write_file_graph(
+                9,
+                "caller.ts",
+                &graph_with_refs(entities, vec![binding, call]),
+                &[],
+            )
+            .expect("caller write");
+
+        let sweep = resolve_pending(&mut graph).expect("sweep");
+
+        assert_eq!(sweep.resolved, 0);
+        // The call plus its one binding edge stay pending: neither the
+        // ambiguous type nor the call reached a decision.
+        assert_eq!(
+            graph
+                .list_pending_refs(10, 0)
+                .expect("pending page")
+                .refs
+                .len(),
+            2
+        );
     }
 
     #[test]

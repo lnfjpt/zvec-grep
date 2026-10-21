@@ -9,6 +9,10 @@ use crate::{
 };
 
 use self::adapter::{LanguageAdapter, named_children, resolve_adapter};
+use super::graph::{
+    WalkContext, collect_import_edge, collect_inheritance_edges, is_import_node, partition_walk,
+    scan_binding_declarations, scan_call_edges, scan_return_types,
+};
 use super::{
     ChunkOptions, ExtractedEntity, ExtractionOutput, TextRange, TextSource,
     chunk_options_for_metadata, chunking::text_fragments, text::extract_plain_text_entities,
@@ -103,10 +107,29 @@ fn extract_code(
     };
     let bytes = source.text.as_bytes();
     let mut entities = Vec::new();
-    walk_code_node(tree.root_node(), adapter, bytes, &[], &mut entities);
+    // The walk buffers containment edges and name references; the post-walk
+    // partition splits them into in-file resolved edges and pending refs.
+    let mut graph_context = WalkContext::new();
+    // Factory return types register before the entity walk so a bare-call
+    // initializer binds its factory even when the factory is spelled after
+    // the caller in this file.
+    scan_return_types(tree.root_node(), bytes, code_format, &mut graph_context);
+    walk_code_node(
+        tree.root_node(),
+        adapter,
+        bytes,
+        &[],
+        &mut entities,
+        &mut graph_context,
+        code_format,
+    );
 
     let mut output = Vec::new();
+    let mut entity_heads = Vec::with_capacity(entities.len());
     for entity in entities {
+        // Fragments are appended contiguously in walk order, so the output
+        // length before each append is that entity's head fragment index.
+        entity_heads.push(output.len());
         append_entity(source, &entity, max_chars, overlap_chars, &mut output);
     }
     if output.is_empty() {
@@ -115,9 +138,12 @@ fn extract_code(
             graph: None,
         })
     } else {
+        // The symbol table is complete now, so partitioning resolves forward
+        // references as readily as backward ones.
+        let graph = partition_walk(graph_context, entity_heads);
         Ok(ExtractionOutput {
             fragments: output,
-            graph: None,
+            graph: Some(graph),
         })
     }
 }
@@ -206,6 +232,7 @@ fn walk_code_node<'tree>(
                 // resolver's name index applies that preference globally.
                 if !adapter.is_declaration(entity) {
                     graph_context.register_symbol(name.as_deref(), entity_index);
+                    graph_context.register_scoped_symbol(name.as_deref(), entity_index);
                 }
                 graph_context.add_contains_edge(
                     entity_index,
@@ -245,6 +272,14 @@ fn walk_code_node<'tree>(
                     first_entity.node,
                     first_entity_index,
                     source,
+                    graph_context,
+                    boundary,
+                );
+                scan_binding_declarations(
+                    first_entity.node,
+                    first_entity_index,
+                    source,
+                    format,
                     graph_context,
                     boundary,
                 );
@@ -1944,7 +1979,7 @@ public class Service {
         );
 
         let names = graph_context.name_edges();
-        assert_eq!(names.len(), 4);
+        assert_eq!(names.len(), 5);
         // Imports belong to the file scope.
         assert_eq!(names[0].ref_kind, GraphRefKind::Imports);
         assert_eq!(names[0].owner_index, FILE_SCOPE_INDEX);
@@ -1959,10 +1994,10 @@ public class Service {
         );
         assert_eq!(names[1].raw_text.as_deref(), Some("extends Base"));
         assert_eq!((names[1].line, names[1].column), (3, 13));
-        // The constructor's own scan attributes the method-body call to
-        // itself and collapses the duplicate `this.init(3)` site into the
-        // first one. The class-level scan skips member subtrees, so the
-        // class no longer duplicates the same call site.
+        // The constructor's own scan attributes both method-body calls to
+        // itself; the sites differ, so each `this.init` spelling stays.
+        // The class-level scan skips member subtrees, so the class no
+        // longer duplicates the same call sites.
         assert_eq!(names[2].ref_kind, GraphRefKind::Calls);
         assert_eq!(
             (names[2].owner_index, names[2].ref_name.as_str()),
@@ -1970,13 +2005,20 @@ public class Service {
         );
         assert_eq!(names[2].arity, Some(2));
         assert_eq!((names[2].line, names[2].column), (5, 4));
-        // Top-level function scan.
         assert_eq!(names[3].ref_kind, GraphRefKind::Calls);
         assert_eq!(
             (names[3].owner_index, names[3].ref_name.as_str()),
+            (1, "init")
+        );
+        assert_eq!(names[3].arity, Some(1));
+        assert_eq!((names[3].line, names[3].column), (6, 4));
+        // Top-level function scan.
+        assert_eq!(names[4].ref_kind, GraphRefKind::Calls);
+        assert_eq!(
+            (names[4].owner_index, names[4].ref_name.as_str()),
             (2, "helper")
         );
-        assert_eq!(names[3].arity, Some(0));
+        assert_eq!(names[4].arity, Some(0));
     }
 
     #[test]

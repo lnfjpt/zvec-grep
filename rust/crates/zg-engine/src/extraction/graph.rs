@@ -33,7 +33,8 @@ mod partition;
 mod vocabulary;
 
 pub(crate) use collector::{
-    collect_import_edge, collect_inheritance_edges, is_import_node, scan_call_edges,
+    collect_import_edge, collect_inheritance_edges, is_import_node, scan_binding_declarations,
+    scan_call_edges, scan_return_types,
 };
 pub(crate) use partition::{PartitionedGraph, partition_walk};
 
@@ -74,6 +75,9 @@ pub(crate) struct NameEdge {
     pub receiver_name: Option<String>,
     /// Original reference text as written in the source.
     pub raw_text: Option<String>,
+    /// Declared type of the bound name for `Declares` edges
+    /// (`var x = new X()` → `Some("X")`).
+    pub bound_type: Option<String>,
     /// Argument count at the call site, when the reference is a call.
     pub arity: Option<usize>,
     pub line: usize,
@@ -87,7 +91,15 @@ pub(crate) struct WalkContext {
     name_edges: Vec<NameEdge>,
     scope_stack: Vec<usize>,
     symbols: HashMap<String, Vec<usize>>,
-    seen_name_edges: HashSet<(GraphRefKind, usize, Option<String>, String)>,
+    /// Symbols each containing entity declares directly in its body, the
+    /// innermost-scope shadow table: a call inside `outer` that names
+    /// `work` binds the nested `outer::work` before any file-level name.
+    scoped_symbols: HashMap<usize, HashMap<String, usize>>,
+    seen_name_edges: HashSet<(GraphRefKind, usize, Option<String>, String, usize, usize)>,
+    /// Factory return types this file spells: `Some` answers a bare-call
+    /// initializer (`x = makeX()`), `None` marks a name registered with two
+    /// different types whose factory answer is ambiguous.
+    return_types: HashMap<String, Option<String>>,
     entity_counter: usize,
 }
 
@@ -128,6 +140,28 @@ impl WalkContext {
         self.symbols.entry(name.to_owned()).or_default().push(index);
     }
 
+    /// Registers a nested entity under its containing entity's local name
+    /// table: inside that entity's body the nested spelling shadows any
+    /// file-level name. The registration is a no-op at file top level.
+    pub(crate) fn register_scoped_symbol(&mut self, name: Option<&str>, index: usize) {
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return;
+        };
+        let Some(owner) = self.current_scope_index() else {
+            return;
+        };
+        self.scoped_symbols
+            .entry(owner)
+            .or_default()
+            .insert(name.to_owned(), index);
+    }
+
+    /// The per-entity local name tables partition consults before the
+    /// file-level one.
+    pub(crate) fn scoped_symbols(&self) -> &HashMap<usize, HashMap<String, usize>> {
+        &self.scoped_symbols
+    }
+
     /// Entity indices in this file that declare `name`, if any.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn lookup_symbol(&self, name: &str) -> Option<&[usize]> {
@@ -163,11 +197,17 @@ impl WalkContext {
     /// metadata. Distinct receivers stay separate: `left_api.work()` and
     /// `right_api.work()` can bind different declarations.
     pub(crate) fn add_name_edge(&mut self, edge: NameEdge) {
+        // The site coordinates close the key: two calls of one shape at
+        // different sites are distinct evidence (`x.foo()` before and after
+        // `x = new Y()` bind different types), while a twice-collected site
+        // still collapses.
         let key = (
             edge.ref_kind,
             edge.owner_index,
             edge.receiver_name.clone(),
             edge.ref_name.clone(),
+            edge.line,
+            edge.column,
         );
         if !self.seen_name_edges.insert(key) {
             return;
@@ -192,10 +232,60 @@ impl WalkContext {
             ref_name: ref_name.to_owned(),
             receiver_name: receiver_name.map(str::to_owned),
             raw_text: raw_text.map(str::to_owned),
+            bound_type: None,
             arity,
             line,
             column,
         });
+    }
+
+    /// Buffers a variable/parameter type binding (`var x = new X()`,
+    /// `caller(Left a)`): the owner declares that `name`'s receiver type is
+    /// `bound_type`. Always pending — the type entity may live in another
+    /// file — and consumed by the resolver when a call names `name` as its
+    /// receiver at or after this line.
+    pub(crate) fn add_declare_binding(
+        &mut self,
+        owner_index: usize,
+        name: &str,
+        bound_type: &str,
+        line: usize,
+        column: usize,
+    ) {
+        // Bindings bypass the name-edge dedup: rebinding one name to a
+        // different type is exactly the evidence the resolver orders by
+        // line, and identical redeclarations collapse harmlessly at
+        // resolution time.
+        self.name_edges.push(NameEdge {
+            ref_kind: GraphRefKind::Declares,
+            owner_index,
+            ref_name: name.to_owned(),
+            receiver_name: None,
+            raw_text: None,
+            bound_type: Some(bound_type.to_owned()),
+            arity: None,
+            line,
+            column,
+        });
+    }
+
+    /// Registers one function's factory return type: the signature's
+    /// annotation, or the type its `return` construction spells. A name
+    /// registered with two different types (same-named methods, overloads)
+    /// becomes ambiguous and stops answering factory lookups.
+    pub(crate) fn register_return_type(&mut self, name: &str, return_type: &str) {
+        let entry = self.return_types.entry(name.to_owned()).or_insert(None);
+        match entry {
+            None => *entry = Some(return_type.to_owned()),
+            Some(existing) if existing == return_type => {}
+            Some(_) => *entry = None,
+        }
+    }
+
+    /// The factory return type a bare call (`makeX()`) resolves to, as
+    /// registered by this file's function signatures and return bodies.
+    pub(crate) fn factory_return_of(&self, name: &str) -> Option<&str> {
+        self.return_types.get(name)?.as_deref()
     }
 
     /// Convenience wrapper for buffered import references. The owner is the
@@ -213,6 +303,7 @@ impl WalkContext {
             ref_name: module_path.to_owned(),
             receiver_name: None,
             raw_text: raw_text.map(str::to_owned),
+            bound_type: None,
             arity: None,
             line,
             column,
@@ -239,6 +330,7 @@ impl WalkContext {
             ref_name: ref_name.to_owned(),
             receiver_name: None,
             raw_text: raw_text.map(str::to_owned),
+            bound_type: None,
             arity: None,
             line,
             column,
@@ -314,9 +406,12 @@ mod tests {
     fn collapses_duplicate_name_edges() {
         let mut context = WalkContext::new();
         context.add_call_edge(0, "helper", None, None, None, 3, 1);
-        // Same owner, kind, receiver, and name: collapses even when the site
-        // evidence (raw text, arity, position) differs.
-        context.add_call_edge(0, "helper", None, Some("helper()"), Some(0), 9, 8);
+        // Same site: the twice-collected call collapses even when the
+        // decorative evidence (raw text, arity) differs.
+        context.add_call_edge(0, "helper", None, Some("helper()"), Some(0), 3, 1);
+        // The same shape at another site is distinct evidence: `x.foo()`
+        // before and after `x = new Y()` bind different declarations.
+        context.add_call_edge(0, "helper", None, None, None, 9, 8);
         // A distinct receiver binds independently: `this.helper()` can
         // resolve to another declaration than a bare `helper()`.
         context.add_call_edge(
@@ -330,7 +425,7 @@ mod tests {
         );
         context.add_call_edge(1, "helper", None, None, None, 4, 2);
         context.add_call_edge(0, "other", None, None, None, 5, 3);
-        assert_eq!(context.name_edges().len(), 4);
+        assert_eq!(context.name_edges().len(), 5);
     }
 
     #[test]
@@ -359,6 +454,7 @@ mod tests {
                 ref_name: "bark".to_owned(),
                 receiver_name: Some("dog".to_owned()),
                 raw_text: Some("dog.bark()".to_owned()),
+                bound_type: None,
                 arity: Some(2),
                 line: 7,
                 column: 11,

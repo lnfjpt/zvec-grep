@@ -1,6 +1,6 @@
 use super::{
-    Direction, Edge, EdgeKind, EntityRecord, ImportReference, Metadata, NameIndexEntry, Result,
-    SqliteGraphStorage, decode_enum, decode_metadata, nonempty,
+    DeclaredBinding, Direction, Edge, EdgeKind, EntityRecord, ImportReference, Metadata,
+    NameIndexEntry, Result, SqliteGraphStorage, decode_enum, decode_metadata, nonempty,
 };
 use rusqlite::{Row, params_from_iter};
 use serde_json::Value;
@@ -227,6 +227,39 @@ impl SqliteGraphStorage {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The type bindings one entity declares (`var x = new X()` inside its
+    /// body, typed parameters in its signature): each names the receiver
+    /// type the resolver may infer when a call names the bound name.
+    ///
+    /// # Errors
+    /// Propagates SQLite errors.
+    pub(crate) fn declared_bindings(&self, owner_id: &str) -> Result<Vec<DeclaredBinding>> {
+        nonempty(owner_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT reference_name, metadata, line FROM edges
+             WHERE source = ?1 AND kind = 'declares' ORDER BY line, id",
+        )?;
+        let rows = statement.query_map([owner_id], |row| {
+            let name: String = row.get(0)?;
+            let metadata: Metadata = decode_metadata(&row.get::<_, String>(1)?)?;
+            let bound_type = metadata
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let line: i64 = row.get(2)?;
+            Ok(DeclaredBinding {
+                name,
+                bound_type: bound_type.to_owned(),
+                line: u32::try_from(line).unwrap_or_default(),
+            })
+        })?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<DeclaredBinding>>>()?
+            .into_iter()
+            .filter(|binding| !binding.bound_type.is_empty())
+            .collect())
     }
 
     /// The name-index record of one entity by ID, or `None` when the entity
