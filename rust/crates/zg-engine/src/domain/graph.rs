@@ -20,6 +20,7 @@ pub(crate) enum GraphEdgeKind {
     Imports,
     Extends,
     Implements,
+    Declares,
 }
 
 /// Kinds of buffered name references. Each pending ref is resolved into the
@@ -31,6 +32,7 @@ pub(crate) enum GraphRefKind {
     Imports,
     Extends,
     Implements,
+    Declares,
 }
 
 impl From<GraphRefKind> for GraphEdgeKind {
@@ -40,6 +42,7 @@ impl From<GraphRefKind> for GraphEdgeKind {
             GraphRefKind::Imports => Self::Imports,
             GraphRefKind::Extends => Self::Extends,
             GraphRefKind::Implements => Self::Implements,
+            GraphRefKind::Declares => Self::Declares,
         }
     }
 }

@@ -22,6 +22,7 @@ impl From<GraphEdgeKind> for graph::EdgeKind {
             GraphEdgeKind::Imports => Self::Imports,
             GraphEdgeKind::Extends => Self::Extends,
             GraphEdgeKind::Implements => Self::Implements,
+            GraphEdgeKind::Declares => Self::Declares,
         }
     }
 }
@@ -33,6 +34,7 @@ impl From<GraphRefKind> for graph::EdgeKind {
             GraphRefKind::Imports => Self::Imports,
             GraphRefKind::Extends => Self::Extends,
             GraphRefKind::Implements => Self::Implements,
+            GraphRefKind::Declares => Self::Declares,
         }
     }
 }

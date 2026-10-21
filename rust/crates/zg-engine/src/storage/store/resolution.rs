@@ -1,8 +1,8 @@
 //! Restricted resolver access to a coordinated, locked storage snapshot.
 use super::*;
 use crate::storage::graph::{
-    EntityRecord, ImportReference, NameIndexEntry, PendingRefPage, Resolution, ResolutionStats,
-    StoredPendingRef,
+    DeclaredBinding, EntityRecord, ImportReference, NameIndexEntry, PendingRefPage, Resolution,
+    ResolutionStats, StoredPendingRef,
 };
 
 /// The resolver can inspect references/candidates and submit decisions, but
@@ -27,6 +27,9 @@ pub(crate) trait ResolutionSession {
     fn imported_file_ids(&self, file_id: u32) -> EngineResult<Vec<u32>>;
     /// Import statements of one file, for the resolver's alias bindings.
     fn import_references(&self, file_id: u32) -> EngineResult<Vec<ImportReference>>;
+    /// Type bindings one entity declares, ordered by line, for the
+    /// resolver's typed-receiver rule.
+    fn declared_bindings(&self, owner_id: &str) -> EngineResult<Vec<DeclaredBinding>>;
     fn apply_resolutions(&mut self, resolutions: &[Resolution]) -> EngineResult<ResolutionStats>;
     fn apply_failures(&mut self, refs: &[i64]) -> EngineResult<usize>;
     fn record_candidates(&mut self, candidates: &[(i64, Vec<String>)]) -> EngineResult<usize>;
@@ -202,6 +205,12 @@ impl ResolutionSession for StoreResolutionSession<'_> {
             return Ok(Vec::new());
         }
         self.graph().import_references(file_id).map_err(graph_error)
+    }
+
+    fn declared_bindings(&self, owner_id: &str) -> EngineResult<Vec<DeclaredBinding>> {
+        self.graph()
+            .declared_bindings(owner_id)
+            .map_err(graph_error)
     }
 
     fn apply_resolutions(&mut self, resolutions: &[Resolution]) -> EngineResult<ResolutionStats> {

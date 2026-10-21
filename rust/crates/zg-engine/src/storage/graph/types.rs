@@ -25,6 +25,7 @@ pub(crate) enum EdgeKind {
     Imports,
     Extends,
     Implements,
+    Declares,
 }
 
 impl EdgeKind {
@@ -35,6 +36,7 @@ impl EdgeKind {
             Self::Imports => "imports",
             Self::Extends => "extends",
             Self::Implements => "implements",
+            Self::Declares => "declares",
         }
     }
 }
@@ -161,6 +163,19 @@ pub(crate) struct ImportReference {
     pub specifier: String,
     /// Import statement text as written in the source.
     pub raw_text: Option<String>,
+}
+
+/// A variable/parameter type binding declared by one entity
+/// (`var x = new X()` binds `x` to `X` inside its function).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeclaredBinding {
+    /// The bound name as the source spells it (the call's receiver).
+    pub name: String,
+    /// Declared receiver type (`X`).
+    pub bound_type: String,
+    /// One-based line of the declaring site; rebindings of the same name
+    /// shadow earlier ones at later lines.
+    pub line: u32,
 }
 
 /// Page over pending references. Restart pagination after file mutations.

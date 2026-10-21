@@ -13,6 +13,8 @@
 //! ordinal onto its head fragment index and then onto the minted `EntityId`.
 //! Mirrors the TypeScript partition step over the walk context.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::domain::{EdgeProvenance, GraphRefKind};
 
 use super::{WalkContext, WalkEdge};
@@ -42,6 +44,8 @@ pub(crate) struct PendingNameRef {
     pub receiver_name: Option<String>,
     /// Original reference text as written in the source, for ref metadata.
     pub raw_text: Option<String>,
+    /// Declared type of the bound name for `Declares` edges.
+    pub bound_type: Option<String>,
     pub arity: Option<usize>,
     pub line: usize,
     pub column: usize,
@@ -80,6 +84,7 @@ pub(crate) fn partition_walk(
         resolved_edges,
         name_edges,
         symbols,
+        scoped_symbols,
         ..
     } = context;
     let mut partitioned = PartitionedGraph {
@@ -88,11 +93,91 @@ pub(crate) fn partition_walk(
         pending: Vec::new(),
         head_fragment_indices,
     };
+    // Function-pointer initializers (`void (*work)(void) = target;`) alias
+    // one name to a same-file function per owner: a call spelled through the
+    // alias reaches that function rather than a same-named declaration the
+    // local hides.
+    let aliases: HashMap<(usize, String), String> = name_edges
+        .iter()
+        .filter(|edge| edge.ref_kind == GraphRefKind::Declares)
+        .filter_map(|edge| {
+            edge.bound_type
+                .clone()
+                .map(|bound| ((edge.owner_index, edge.ref_name.clone()), bound))
+        })
+        .collect();
+    // Receivers whose owner binds them to more than one type (`x = new X()`
+    // ... later `x = new Y()`) keep their call sites apart: only per-site
+    // evidence lets the resolver pick the binding in force at each call.
+    // Every other receiver resolves identically from any of its sites, so
+    // repeated spellings of one call shape collapse to the first.
+    let mut binding_types: HashMap<(usize, String), HashSet<&str>> = HashMap::new();
+    for edge in name_edges
+        .iter()
+        .filter(|edge| edge.ref_kind == GraphRefKind::Declares)
+    {
+        if let Some(bound) = edge.bound_type.as_deref() {
+            binding_types
+                .entry((edge.owner_index, edge.ref_name.clone()))
+                .or_default()
+                .insert(bound);
+        }
+    }
+    let rebinding_receivers: HashSet<(usize, String)> = binding_types
+        .into_iter()
+        .filter(|(_, types)| types.len() > 1)
+        .map(|(key, _)| key)
+        .collect();
+    let mut collapsed: HashSet<(GraphRefKind, usize, Option<String>, String)> = HashSet::new();
     for edge in name_edges {
+        let rebinding_call = edge.ref_kind == GraphRefKind::Calls
+            && edge.receiver_name.as_deref().is_some_and(|receiver| {
+                rebinding_receivers.contains(&(edge.owner_index, receiver.to_owned()))
+            });
+        if !rebinding_call && edge.ref_kind != GraphRefKind::Declares {
+            // Binding rows never collapse: the resolver's binding table
+            // orders them by line, so a rebinding row is load-bearing even
+            // when an earlier row binds the same name.
+            let site = (
+                edge.ref_kind,
+                edge.owner_index,
+                edge.receiver_name.clone(),
+                edge.ref_name.clone(),
+            );
+            if !collapsed.insert(site) {
+                continue;
+            }
+        }
         let resolved_target = match edge.ref_kind {
             GraphRefKind::Imports => None,
+            // Declares edges bind a variable to its type name; the name is
+            // not an entity in this file's symbol table, and the type entity
+            // may live elsewhere — the cross-file resolver consumes them.
+            GraphRefKind::Declares => None,
             GraphRefKind::Calls if edge.receiver_name.is_some() => None,
-            GraphRefKind::Calls | GraphRefKind::Extends | GraphRefKind::Implements => symbols
+            // A bare call resolves through, in order: its owner's alias
+            // initializers, its owner's local name table (the nested
+            // spelling an entity declares in its body shadows any
+            // file-level name inside it), then the file-level table.
+            GraphRefKind::Calls => aliases
+                .get(&(edge.owner_index, edge.ref_name.clone()))
+                .and_then(|bound| {
+                    symbols
+                        .get(bound)
+                        .and_then(|indices| (indices.len() == 1).then(|| indices[0]))
+                })
+                .or_else(|| {
+                    scoped_symbols
+                        .get(&edge.owner_index)
+                        .and_then(|locals| locals.get(&edge.ref_name))
+                        .copied()
+                })
+                .or_else(|| {
+                    symbols
+                        .get(&edge.ref_name)
+                        .and_then(|indices| (indices.len() == 1).then(|| indices[0]))
+                }),
+            GraphRefKind::Extends | GraphRefKind::Implements => symbols
                 .get(&edge.ref_name)
                 .and_then(|indices| (indices.len() == 1).then(|| indices[0])),
         };
@@ -114,6 +199,7 @@ pub(crate) fn partition_walk(
                 ref_name: edge.ref_name,
                 receiver_name: edge.receiver_name,
                 raw_text: edge.raw_text,
+                bound_type: edge.bound_type,
                 arity: edge.arity,
                 line: edge.line,
                 column: edge.column,
