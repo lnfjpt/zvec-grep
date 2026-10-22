@@ -9,8 +9,6 @@ impl SqliteGraphStorage {
     /// an empty slice for a new file. Entity IDs in the new snapshot are not stored
     /// in a second node table. The implicit file endpoint is `f{file_id}`, matching
     /// the zvec file document key. Cross-file edges must use `apply_resolutions`.
-    /// `relative_path` anchors import resolution: workspace-relative, forward
-    /// slashes; an empty path removes the file's path row (deletion).
     /// Read old IDs before mutating zvec, under the same workspace write lock.
     /// This transaction covers SQLite only; the coordinator owns cross-store recovery.
     ///
@@ -20,7 +18,6 @@ impl SqliteGraphStorage {
     pub(crate) fn write_file_graph(
         &mut self,
         file_id: u32,
-        relative_path: &str,
         graph: &FileGraph,
         old_entity_ids: &[String],
     ) -> Result<()> {
@@ -29,20 +26,6 @@ impl SqliteGraphStorage {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if relative_path.trim().is_empty() {
-            tx.execute("DELETE FROM file_paths WHERE file_id = ?", [file_id])?;
-        } else {
-            // The path is the file's authoritative identity for import
-            // resolution: rows left by a replaced file ID must not shadow it.
-            tx.execute(
-                "DELETE FROM file_paths WHERE relative_path = ? AND file_id <> ?",
-                params![relative_path, file_id],
-            )?;
-            tx.execute(
-                "INSERT OR REPLACE INTO file_paths (file_id, relative_path) VALUES (?, ?)",
-                params![file_id, relative_path],
-            )?;
-        }
         let mut targets: Vec<&str> = old_entity_ids.iter().map(String::as_str).collect();
         targets.push(&file_node_id);
         targets.sort_unstable();
@@ -65,24 +48,6 @@ impl SqliteGraphStorage {
             )?;
         }
         tx.execute("DELETE FROM edges WHERE file_id = ?", [file_id])?;
-        tx.execute("DELETE FROM entities WHERE file_id = ?", [file_id])?;
-        {
-            let mut insert = tx.prepare(
-                "INSERT INTO entities (file_id, entity_id, name, qualified_name, is_exported, arity, is_declaration)
-                VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            for record in &graph.entities {
-                insert.execute(params![
-                    file_id,
-                    record.entity_id,
-                    record.name,
-                    record.qualified_name,
-                    i64::from(record.is_exported),
-                    record.arity.map(i64::from),
-                    i64::from(record.is_declaration)
-                ])?;
-            }
-        }
         {
             let mut insert = tx.prepare(
                 "INSERT INTO edges
@@ -139,7 +104,7 @@ impl SqliteGraphStorage {
         file_id: u32,
         old_entity_ids: &[String],
     ) -> Result<()> {
-        self.write_file_graph(file_id, "", &FileGraph::default(), old_entity_ids)
+        self.write_file_graph(file_id, &FileGraph::default(), old_entity_ids)
     }
 }
 
@@ -173,15 +138,6 @@ pub(super) fn validate(file_id: &str, graph: &FileGraph, old_entity_ids: &[Strin
         if !owns(&reference.from_node_id) || reference.line == 0 {
             return Err(Error::InvalidInput(
                 "pending refs require local ownership and one-based lines",
-            ));
-        }
-    }
-    let mut named = HashSet::new();
-    for record in &graph.entities {
-        nonempty(&record.name)?;
-        if !owns(&record.entity_id) || !named.insert(record.entity_id.as_str()) {
-            return Err(Error::InvalidInput(
-                "entity records must reference unique snapshot entity IDs",
             ));
         }
     }

@@ -106,43 +106,16 @@ pub(crate) struct PendingRef {
     pub name_tail: String,
 }
 
-/// Name-index record for one entity. Entities without a symbol name are
-/// omitted; `name` shares the namespace with the pending-ref `name_tail`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct EntityRecord {
-    pub entity_id: String,
-    pub name: String,
-    pub qualified_name: String,
-    pub is_exported: bool,
-    pub arity: Option<u32>,
-    /// Pure declaration without a body (C/C++ prototypes); definitions
-    /// shadow them in name-based binding.
-    pub is_declaration: bool,
-}
-
-/// A complete per-file snapshot. Node metadata is deliberately not stored here,
-/// except the entity names backing the workspace name index.
+/// A complete per-file snapshot. Node metadata is deliberately not stored here;
+/// entity identity and names live in zvec, and the resolver reads them from
+/// there once cross-store read consistency lands.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct FileGraph {
     /// Complete current entity IDs for ownership validation, not persisted as nodes.
     /// The zvec file key `f{file_id}` is an implicit local endpoint.
     pub entity_ids: Vec<String>,
-    /// Named entities for the resolver's name index; unnamed entities are omitted.
-    pub entities: Vec<EntityRecord>,
     pub edges: Vec<Edge>,
     pub pending_refs: Vec<PendingRef>,
-}
-
-/// One workspace name-index hit for a symbol name.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NameIndexEntry {
-    pub entity_id: String,
-    pub file_id: u32,
-    pub qualified_name: String,
-    pub is_exported: bool,
-    pub arity: Option<u32>,
-    /// Pure declaration without a body (C/C++ prototypes).
-    pub is_declaration: bool,
 }
 
 /// A pending reference with its database identity.

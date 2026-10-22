@@ -482,12 +482,11 @@ fn replace_file(
     // Retry intent must survive before SQLite advances or old IDs disappear.
     state.directories.flush()?;
     state.files.flush()?;
-    let relative_path = file.relative_path().to_string_lossy().replace('\\', "/");
     state
         .graph
         .as_mut()
         .expect("writable graph")
-        .write_file_graph(file.id().get(), &relative_path, graph, &old_ids)
+        .write_file_graph(file.id().get(), graph, &old_ids)
         .map_err(graph_error)?;
     state.fragments.delete_file(file.id())?;
     state.entities.delete_file(file.id())?;
