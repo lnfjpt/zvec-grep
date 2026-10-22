@@ -156,6 +156,7 @@ impl WalkContext {
             .insert(name.to_owned(), index);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     /// The per-entity local name tables partition consults before the
     /// file-level one.
     pub(crate) fn scoped_symbols(&self) -> &HashMap<usize, HashMap<String, usize>> {

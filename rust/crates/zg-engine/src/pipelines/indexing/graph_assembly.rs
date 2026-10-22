@@ -48,7 +48,7 @@ pub(super) fn assemble_file_graph(
     let node_ids = |ordinal: usize| -> Option<String> {
         entities
             .get(ordinal)
-            .map(|entity| entity.id.as_str().to_owned())
+            .map(|entity| entity.id().as_str().to_owned())
     };
     for edge in &graph.contains {
         if let (Some(source), Some(target)) =
@@ -110,7 +110,7 @@ pub(super) fn assemble_file_graph(
                 owner_id,
                 ref_name: reference.ref_name.clone(),
                 receiver_name: reference.receiver_name.clone(),
-                ref_kind: reference.ref_kind,
+                ref_kind: reference.ref_kind.into(),
                 arity: reference.arity,
                 line: reference.line,
                 column: reference.column,
@@ -131,7 +131,7 @@ pub(super) fn assemble_file_graph(
 /// string; qualified names join the breadcrumb with `::`.
 fn entity_node(entity: &Entity, language: FileFormat) -> FileGraphNode {
     let (name, kind, qualified_name, signature, doc, visibility, arity, is_exported, is_declaration) =
-        match entity.metadata.as_ref() {
+        match entity.metadata() {
             Some(EntityMetadata::Code(code)) => {
                 let name = code.symbol_name.clone();
                 let qualified_name = match (&name, &code.scope) {
@@ -163,12 +163,12 @@ fn entity_node(entity: &Entity, language: FileFormat) -> FileGraphNode {
                 false,
             ),
         };
-    let range = match entity.source_range {
+    let range = match entity.source_range() {
         Range::Text(range) => Some(range),
         _ => None,
     };
     FileGraphNode {
-        id: entity.id.as_str().to_owned(),
+        id: entity.id().as_str().to_owned(),
         kind,
         name,
         qualified_name,

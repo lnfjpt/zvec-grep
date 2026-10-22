@@ -312,7 +312,7 @@ impl IndexStore {
                 .filter_map(|id| entities.remove(&id))
                 .filter(|stored| {
                     matches!(
-                        &stored.entity.metadata,
+                        stored.entity.metadata(),
                         Some(EntityMetadata::Code(metadata))
                             if metadata.symbol_name.as_deref() == Some(name)
                                 && scope.is_none_or(|scope| metadata.scope.as_deref() == Some(scope))
@@ -325,14 +325,14 @@ impl IndexStore {
             // location and stays reportable.
             let any_definition = matched.iter().any(|stored| {
                 !matches!(
-                    &stored.entity.metadata,
+                    stored.entity.metadata(),
                     Some(EntityMetadata::Code(metadata)) if metadata.is_declaration
                 )
             });
             if any_definition {
                 matched.retain(|stored| {
                     !matches!(
-                        &stored.entity.metadata,
+                        stored.entity.metadata(),
                         Some(EntityMetadata::Code(metadata)) if metadata.is_declaration
                     )
                 });
@@ -388,8 +388,8 @@ impl IndexStore {
                 })
                 .collect();
             for file in state.files.fetch(&file_ids)?.into_values() {
-                if file.index_status.is_indexed() {
-                    visible.insert(format!("f{}", file.id.get()));
+                if file.index_status().is_indexed() {
+                    visible.insert(format!("f{}", file.id().get()));
                 }
             }
             Ok(edges
@@ -488,8 +488,8 @@ impl IndexStore {
     ) -> EngineResult<()> {
         let shared = self.shared()?;
         validate_batch(file, entities, entries, &shared.schema)?;
-        graph.validate(file.id.get()).map_err(graph_error)?;
-        let ids: HashSet<_> = entities.iter().map(|entity| entity.id.as_str()).collect();
+        graph.validate(file.id().get()).map_err(graph_error)?;
+        let ids: HashSet<_> = entities.iter().map(|entity| entity.id().as_str()).collect();
         if graph.entity_ids.iter().any(|id| !ids.contains(id.as_str())) {
             return Err(EngineError::invalid_argument(
                 "graph entity is absent from canonical file entities",
@@ -500,8 +500,7 @@ impl IndexStore {
             indexed_epoch_ms: now_epoch_ms()?,
             entity_count: u64::try_from(entities.len())
                 .map_err(|_| EngineError::invalid_argument("entity count exceeds u64"))?,
-        };
-        file.validate()?;
+        })?;
         self.write(|state| replace_file(state, &file, entities, entries, graph))
     }
 
@@ -509,8 +508,7 @@ impl IndexStore {
         let mut file = file.clone();
         file.set_index_status(FileIndexStatus::Failed {
             error: error.to_owned(),
-        };
-        file.validate()?;
+        })?;
         self.write(|state| replace_file(state, &file, &[], &[], &FileGraph::default()))
     }
 
@@ -616,7 +614,7 @@ fn get_entities(
     let entities = state.entities.fetch(ids)?;
     let file_ids = entities
         .values()
-        .map(|entity| entity.file_id)
+        .map(|entity| entity.file_id())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -624,8 +622,8 @@ fn get_entities(
     Ok(entities
         .into_iter()
         .filter_map(|(id, entity)| {
-            let file = files.get(&entity.file_id)?;
-            if !matches!(file.index_status, FileIndexStatus::Indexed { .. }) {
+            let file = files.get(&entity.file_id())?;
+            if !matches!(file.index_status(), FileIndexStatus::Indexed { .. }) {
                 return None;
             }
             Some((
@@ -657,7 +655,7 @@ fn replace_file(
     let fragment_docs = Fragments::prepare(file, entities, entries, &directories)?;
     let old_ids = state
         .entities
-        .list_ids(file.id)?
+        .list_ids(file.id())?
         .into_iter()
         .map(|id| id.as_str().to_owned())
         .collect::<Vec<_>>();

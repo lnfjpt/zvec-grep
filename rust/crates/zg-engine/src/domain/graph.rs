@@ -121,6 +121,7 @@ pub(crate) struct FileGraphResult {
 }
 
 impl GraphEdgeKind {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Contains => "contains",
@@ -128,11 +129,13 @@ impl GraphEdgeKind {
             Self::Imports => "imports",
             Self::Extends => "extends",
             Self::Implements => "implements",
+            Self::Declares => "declares",
         }
     }
 }
 
 impl EdgeProvenance {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::FileLocal => "file_local",

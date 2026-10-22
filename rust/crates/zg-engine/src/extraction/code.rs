@@ -83,8 +83,8 @@ fn extract_code(
             .copied()
             .find(|format| resolve_adapter(*format).is_some())
     };
-    let Some((adapter, language)) =
-        format.and_then(|format| Some((resolve_adapter(format)?, grammar(format, jsx)?)))
+    let Some((adapter, language, code_format)) =
+        format.and_then(|format| Some((resolve_adapter(format)?, grammar(format, jsx)?, format)))
     else {
         return Ok(ExtractionOutput {
             fragments: fallback(source, max_chars, overlap_chars),
@@ -214,12 +214,21 @@ fn walk_code_node<'tree>(
     source: &[u8],
     breadcrumb: &[String],
     out: &mut Vec<CodeEntity<'tree>>,
+    graph_context: &mut WalkContext,
+    format: FileFormat,
 ) {
     for child in named_children(node) {
         let is_scope = adapter.is_scope(child);
         let is_entity = adapter.is_entity(child);
+        let mut first_entity_index = None;
+        let mut scope_entity_index = None;
+
         if is_entity {
+            let start_index = out.len();
             for entity in adapter.resolve_entities(child, source) {
+                let entity_index = graph_context.next_entity_index();
+                first_entity_index.get_or_insert(entity_index);
+                scope_entity_index = Some(entity_index);
                 let name = adapter.extract_name(entity, source);
                 let entity_breadcrumb = adapter.scope_breadcrumb(entity, source, breadcrumb);
                 let (span_start_byte, span_start) = entity
@@ -299,15 +308,43 @@ fn walk_code_node<'tree>(
             if let Some(name) = name {
                 child_breadcrumb.push(name);
             }
+            let scope_node = adapter.enter_scope_node(child);
+            if let Some(scope_entity_index) = scope_entity_index {
+                graph_context.push_scope(scope_entity_index);
+                walk_code_node(
+                    scope_node,
+                    adapter,
+                    source,
+                    &child_breadcrumb,
+                    out,
+                    graph_context,
+                    format,
+                );
+                graph_context.pop_scope();
+            } else {
+                walk_code_node(
+                    scope_node,
+                    adapter,
+                    source,
+                    &child_breadcrumb,
+                    out,
+                    graph_context,
+                    format,
+                );
+            }
+        } else if !is_entity {
+            if is_import_node(child, format) {
+                collect_import_edge(child, source, format, graph_context);
+            }
             walk_code_node(
-                adapter.enter_scope_node(child),
+                child,
                 adapter,
                 source,
-                &child_breadcrumb,
+                breadcrumb,
                 out,
+                graph_context,
+                format,
             );
-        } else if !is_entity {
-            walk_code_node(child, adapter, source, breadcrumb, out);
         }
     }
 }
@@ -514,6 +551,7 @@ fn remap_script_block_entities(
         })
         .collect()
 }
+
 
 #[cfg(test)]
 mod tests {

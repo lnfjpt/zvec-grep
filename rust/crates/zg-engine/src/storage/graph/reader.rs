@@ -118,6 +118,7 @@ impl SqliteGraphStorage {
         Ok((hits.len() == 1).then(|| hits.pop().expect("single hit")))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     /// The workspace-relative path of one file, or `None` when it has no
     /// persisted snapshot. Anchors relative import specifiers for the resolver.
     ///

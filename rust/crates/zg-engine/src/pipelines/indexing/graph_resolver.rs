@@ -20,7 +20,7 @@ use std::collections::hash_map::Entry;
 use crate::domain::{FileFormat, formats_for_path, reference_compatible_with};
 use crate::storage::ResolutionSession;
 use crate::storage::graph::{
-    EdgeKind, ImportReference, NameIndexEntry, PendingRef, Provenance, Resolution, StoredPendingRef,
+    EdgeKind, NameIndexEntry, PendingRef, Provenance, Resolution, StoredPendingRef,
 };
 
 /// Outcome of one resolution sweep.

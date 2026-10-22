@@ -74,6 +74,7 @@ impl SqliteGraphStorage {
         Self::configure(Connection::open_with_flags(path, flags)?, mode)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     /// Creates an isolated writable graph, primarily for tests.
     ///
     /// # Errors

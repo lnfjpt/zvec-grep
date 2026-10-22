@@ -48,6 +48,7 @@ pub(crate) use graph::FileEdge;
 pub(crate) use graph::FileGraphNode;
 pub(crate) use graph::FileGraphResult;
 pub(crate) use graph::GraphEdgeKind;
+pub(crate) use graph::GraphRefKind;
 pub(crate) use graph::PendingRef;
 pub(crate) use graph::PendingRefStatus;
 
@@ -59,6 +60,8 @@ pub(crate) use model::EmbeddingModelInfo;
 pub(crate) use source::ByteRange;
 pub(crate) use source::DirectoryId;
 pub(crate) use source::DirectoryRecord;
+pub(crate) use source::formats_for_path;
+pub(crate) use source::reference_compatible_with;
 pub use source::FileCategory;
 pub use source::FileFormat;
 pub(crate) use source::FileId;

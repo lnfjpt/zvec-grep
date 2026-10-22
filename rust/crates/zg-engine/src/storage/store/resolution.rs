@@ -58,7 +58,7 @@ impl<'a> StoreResolutionSession<'a> {
             .files
             .fetch(ids)?
             .into_iter()
-            .filter(|(_, file)| file.index_status.is_indexed())
+            .filter(|(_, file)| file.index_status().is_indexed())
             .collect())
     }
 
@@ -70,14 +70,14 @@ impl<'a> StoreResolutionSession<'a> {
             .collect::<Vec<_>>();
         let mut visible: HashMap<_, _> = get_entities(self.state, &entity_ids)?
             .into_iter()
-            .map(|(id, entity)| (id.as_str().to_owned(), entity.file.id))
+            .map(|(id, entity)| (id.as_str().to_owned(), entity.file.id()))
             .collect();
         let files: Vec<_> = ids
             .iter()
             .filter_map(|id| id.strip_prefix('f')?.parse::<u32>().ok().map(FileId::new))
             .collect();
         for file in self.indexed_files(&files)?.into_values() {
-            visible.insert(format!("f{}", file.id.get()), file.id);
+            visible.insert(format!("f{}", file.id().get()), file.id());
         }
         Ok(visible)
     }
@@ -168,7 +168,7 @@ impl ResolutionSession for StoreResolutionSession<'_> {
         Ok(self
             .indexed_files(&[FileId::new(file_id)])?
             .remove(&FileId::new(file_id))
-            .map(|file| file.relative_path.to_string_lossy().replace('\\', "/")))
+            .map(|file| file.relative_path().to_string_lossy().replace('\\', "/")))
     }
 
     fn file_id_by_path(&self, path: &str) -> EngineResult<Option<u32>> {

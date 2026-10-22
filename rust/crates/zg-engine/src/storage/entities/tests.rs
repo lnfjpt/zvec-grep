@@ -19,6 +19,9 @@ fn entity(file_id: u32, metadata: bool) -> Entity {
                 visibility: None,
                 language: None,
                 documentation: Some("documentation".into()),
+                arity: None,
+                is_exported: false,
+                is_declaration: false,
             })
         }),
         vec![EntityFragment {
@@ -111,10 +114,21 @@ fn canonical_columns_reject_mismatched_identity_and_corrupt_metadata() {
 }
 
 fn indexed_entity(id: &str, file_id: u32) -> Doc {
-    let mut entity = entity(file_id, false);
-    entity.id = EntityId::from_string(id.to_owned());
-    entity.fragments[0].id = FragmentId::new(&entity.id, 0);
-    encode_doc(&entity).expect("canonical entity")
+    let template = entity(file_id, false);
+    let new_id = EntityId::from_string(id.to_owned());
+    let rebuilt = Entity::new(
+        new_id.clone(),
+        template.file_id(),
+        template.source_range(),
+        template.content().clone(),
+        template.metadata().cloned(),
+        vec![EntityFragment {
+            id: FragmentId::new(&new_id, 0),
+            range: Range::Full,
+        }],
+    )
+    .expect("canonical entity");
+    encode_doc(&rebuilt).expect("canonical entity")
 }
 
 #[test]

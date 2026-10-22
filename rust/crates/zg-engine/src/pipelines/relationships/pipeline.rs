@@ -64,12 +64,12 @@ pub(super) fn query_symbols(
     }
     let mut symbols: HashMap<_, _> = definitions
         .iter()
-        .map(|stored| (stored.entity.id.clone(), describe(stored)))
+        .map(|stored| (stored.entity.id().clone(), describe(stored)))
         .collect();
     let mut matches = Vec::new();
     let mut seen = HashSet::new();
     for stored in definitions {
-        let id = &stored.entity.id;
+        let id = stored.entity.id();
         let Some(symbol) = symbols.get(id).cloned().flatten() else {
             continue;
         };
@@ -142,14 +142,14 @@ fn recall_symbols(
         };
         if !stored
             .entity
-            .fragments
+            .fragments()
             .iter()
             .any(|fragment| fragment.id.as_str() == hit.document_id)
         {
             continue;
         }
-        if matches!(stored.file.index_status, FileIndexStatus::Indexed { .. })
-            && let Some(EntityMetadata::Code(metadata)) = &stored.entity.metadata
+        if matches!(stored.file.index_status(), FileIndexStatus::Indexed { .. })
+            && let Some(EntityMetadata::Code(metadata)) = stored.entity.metadata()
             && scope.is_none_or(|scope| metadata.scope.as_deref() == Some(scope))
         {
             // FTS can recall a definition through its body or documentation;
@@ -161,14 +161,14 @@ fn recall_symbols(
 }
 
 fn describe(stored: &StoredEntity) -> Option<RelationshipSymbol> {
-    let Some(EntityMetadata::Code(metadata)) = &stored.entity.metadata else {
+    let Some(EntityMetadata::Code(metadata)) = stored.entity.metadata() else {
         return None;
     };
     let name = metadata
         .symbol_name
         .as_deref()
         .filter(|name| !name.is_empty())?;
-    let Range::Text(range) = stored.entity.source_range else {
+    let Range::Text(range) = stored.entity.source_range() else {
         return None;
     };
     Some(RelationshipSymbol {
@@ -176,7 +176,7 @@ fn describe(stored: &StoredEntity) -> Option<RelationshipSymbol> {
             Some(scope) => format!("{scope}::{name}"),
             None => name.to_owned(),
         },
-        file_path: stored.file.relative_path.to_path_buf(),
+        file_path: stored.file.relative_path().to_path_buf(),
         start_line: range.start_line(),
         end_line: range.end_line(),
     })

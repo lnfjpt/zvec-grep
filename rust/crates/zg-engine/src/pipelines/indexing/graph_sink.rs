@@ -206,7 +206,7 @@ mod tests {
             owner_id: owner_id.to_owned(),
             ref_name: "alpha::beta".to_owned(),
             receiver_name: Some("alpha".to_owned()),
-            ref_kind: GraphRefKind::Imports,
+            ref_kind: GraphEdgeKind::Imports,
             arity: Some(2),
             line: 10,
             column: 4,

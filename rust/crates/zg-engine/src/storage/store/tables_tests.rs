@@ -98,6 +98,19 @@ fn file(id: u32, path: impl Into<PathBuf>) -> FileRecord {
     .expect("file record")
 }
 
+/// Metadata is immutable on `Entity`; rebuild with the new metadata.
+fn with_metadata(entity: &Entity, metadata: Option<EntityMetadata>) -> Entity {
+    Entity::new(
+        entity.id().clone(),
+        entity.file_id(),
+        entity.source_range(),
+        entity.content().clone(),
+        metadata,
+        entity.fragments().to_vec(),
+    )
+    .expect("rebuilt entity")
+}
+
 fn metadata_fragments(
     file_id: u32,
     label: &str,
@@ -126,6 +139,9 @@ fn metadata_fragments(
             visibility: None,
             language: None,
             documentation: Some("Produces the seasonal crop.".into()),
+            arity: None,
+            is_exported: false,
+            is_declaration: false,
         })),
         vec![
             EntityFragment {
@@ -195,23 +211,29 @@ fn symbol_lookup_returns_canonical_definitions_with_exact_names_and_scopes() {
     let store = metadata_store(temporary.path());
     let (mut source, mut entities, mut entries) = metadata_fragments(0, "first owner");
     let (_, mut other_entities, other_entries) = metadata_fragments(0, "second owner");
-    if let Some(EntityMetadata::Code(metadata)) = &mut other_entities[0].metadata {
-        metadata.scope = Some("Meadow".into());
-    }
+    other_entities[0] = match other_entities[0].metadata().cloned() {
+        Some(EntityMetadata::Code(mut code)) => {
+            code.scope = Some("Meadow".into());
+            with_metadata(&other_entities[0], Some(EntityMetadata::Code(code)))
+        }
+        other => with_metadata(&other_entities[0], other),
+    };
     entities.extend(other_entities);
     entries.extend(other_entries);
-    source.index_status = FileIndexStatus::Indexed {
-        indexed_epoch_ms: 1,
-        entity_count: 2,
-    };
+    source
+        .set_index_status(FileIndexStatus::Indexed {
+            indexed_epoch_ms: 1,
+            entity_count: 2,
+        })
+        .expect("mark indexed");
     store
         .apply_fixture_records(&source, &entities, &entries)
         .expect("write definitions");
     let name = "harvest 春'\\crop";
     let mut matches = store.find_symbols(name, None).expect("exact symbols");
-    matches.sort_by(|a, b| a.entity.id.cmp(&b.entity.id));
+    matches.sort_by(|a, b| a.entity.id().cmp(b.entity.id()));
     let mut expected = entities.clone();
-    expected.sort_by(|a, b| a.id.cmp(&b.id));
+    expected.sort_by(|a, b| a.id().cmp(b.id()));
     assert_eq!(
         matches
             .iter()
@@ -239,7 +261,7 @@ fn symbol_lookup_returns_canonical_definitions_with_exact_names_and_scopes() {
     }
     let ids = entities
         .iter()
-        .map(|entity| entity.id.clone())
+        .map(|entity| entity.id().clone())
         .collect::<Vec<_>>();
     let requested = [
         ids[0].clone(),
@@ -252,10 +274,14 @@ fn symbol_lookup_returns_canonical_definitions_with_exact_names_and_scopes() {
 
     // Projection fields are only candidate hints; canonical metadata decides membership.
     let mut changed = entities.clone();
-    if let Some(EntityMetadata::Code(metadata)) = &mut changed[0].metadata {
-        metadata.symbol_name = Some("renamed".into());
-    }
-    changed[1].metadata = None;
+    changed[0] = match changed[0].metadata().cloned() {
+        Some(EntityMetadata::Code(mut code)) => {
+            code.symbol_name = Some("renamed".into());
+            with_metadata(&changed[0], Some(EntityMetadata::Code(code)))
+        }
+        other => with_metadata(&changed[0], other),
+    };
+    changed[1] = with_metadata(&changed[1], None);
     store
         .write(|state| state.entities.write(&Entities::prepare(&changed)?))
         .expect("change canonical metadata only");
@@ -276,10 +302,10 @@ fn symbol_lookup_returns_canonical_definitions_with_exact_names_and_scopes() {
             error: "interrupted".into(),
         },
     ] {
-        source.index_status = status;
+        source.set_index_status(status).expect("set status");
         store
             .write(|state| {
-                let directories = state.directories.ensure(&source.relative_path)?;
+                let directories = state.directories.ensure(source.relative_path())?;
                 state.files.put(&source, &directories)
             })
             .expect("mark source unavailable");
@@ -297,7 +323,7 @@ fn symbol_lookup_returns_canonical_definitions_with_exact_names_and_scopes() {
         );
     }
     store
-        .write(|state| state.files.delete(source.id))
+        .write(|state| state.files.delete(source.id()))
         .expect("remove source record");
     assert!(
         store
@@ -326,27 +352,48 @@ fn symbol_lookup_returns_canonical_definitions_with_exact_names_and_scopes() {
 fn symbol_candidates_are_bounded_before_deduplication_across_model_tables() {
     let temporary = tempfile::tempdir().expect("temporary storage");
     let first = model();
-    let mut second = model();
-    second.model.name = "later".into();
+    let second = EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
+            "fixture",
+            "later",
+            [
+                crate::domain::ContentKind::Text,
+                crate::domain::ContentKind::Code,
+                crate::domain::ContentKind::Image,
+            ],
+            32,
+        )
+        .expect("valid model metadata"),
+        3,
+        EmbeddingMetric::Cosine,
+        None,
+        None,
+    )
+    .expect("valid embedding metadata");
     let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
         storage_path: temporary.path().to_owned(),
         embeddings: vec![first.clone(), second.clone()],
     })
     .expect("multiple model tables");
     for (file_id, model, count) in [(0, first, 2), (1, second, 60)] {
-        let (mut source, _, _) = metadata_fragments(file_id, "unused");
-        source.relative_path = SourcePath::new(format!("source-{file_id}.rs")).expect("path");
-        source.index_status = FileIndexStatus::Indexed {
-            indexed_epoch_ms: 1,
-            entity_count: count,
-        };
+        let (source, _, _) = metadata_fragments(file_id, "unused");
+        let source = FileRecord::new(
+            source.id(),
+            SourcePath::new(format!("source-{file_id}.rs")).expect("path"),
+            source.snapshot().clone(),
+            FileIndexStatus::Indexed {
+                indexed_epoch_ms: 1,
+                entity_count: count,
+            },
+        )
+        .expect("source record");
         let mut entities = Vec::new();
         let mut entries = Vec::new();
         for index in 0..count {
             let (_, owners, mut projections) =
                 metadata_fragments(file_id, &format!("owner {index}"));
             for entry in &mut projections {
-                entry.model = model.model.reference();
+                entry.model = model.model().reference();
             }
             entities.extend(owners);
             entries.extend(projections);
@@ -367,7 +414,7 @@ fn symbol_candidates_are_bounded_before_deduplication_across_model_tables() {
     assert_eq!(
         matches
             .into_iter()
-            .map(|stored| stored.entity.id)
+            .map(|stored| stored.entity.id().clone())
             .collect::<HashSet<_>>(),
         expected
     );
@@ -448,8 +495,8 @@ fn store_graph_reads_preserve_call_sites_and_share_the_storage_lifetime() {
     store
         .apply_fixture_records(&file, &entities, &entries)
         .expect("canonical endpoints");
-    let caller = format!("f{}", file.id.get());
-    let callee = entities[0].id.as_str().to_owned();
+    let caller = format!("f{}", file.id().get());
+    let callee = entities[0].id().as_str().to_owned();
     store.close().expect("initialize index");
     let graph_path = temporary.path().join("graph/graph.sqlite");
     let mut graph =

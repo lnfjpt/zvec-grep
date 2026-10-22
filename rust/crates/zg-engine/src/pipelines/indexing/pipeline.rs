@@ -51,7 +51,10 @@ use crate::{
     utils::{collapse_whitespace, decode_index_text, sha256_hex},
 };
 
-use super::{input_budget::index_chunk_options, model_progress, storage::IndexStorage};
+use super::{
+    graph_assembly, graph_sink, input_budget::index_chunk_options, model_progress,
+    storage::IndexStorage,
+};
 
 const MAX_SKIPPED_FILE_SAMPLES: usize = 20;
 // All default file-size limits are at least this large.
@@ -1005,6 +1008,7 @@ async fn prepare_candidate(
         text: source_text.into_owned(),
     };
     let extracted = extract_for_indexing(&text, chunk_options)?;
+    let graph_source = extracted.graph;
     let entities = bind_entities(file.id(), extracted.fragments)?;
     let owners = entities
         .iter()
@@ -1022,10 +1026,29 @@ async fn prepare_candidate(
     for fragment in &mut fragments {
         fragment.model = owners[&fragment.entity_id].clone();
     }
+    let graph = graph_source
+        .map(|graph| {
+            let language = graph_language(formats);
+            let assembled = graph_assembly::assemble_file_graph(
+                &file.id().get().to_string(),
+                language,
+                &graph,
+                &entities,
+            );
+            graph_sink::file_graph(file.id(), language, &assembled)
+        })
+        .transpose()
+        .map_err(|error| {
+            EngineError::storage_failure(format!(
+                "prepare graph snapshot for {}: {error}",
+                file.relative_path().display()
+            ))
+        })?;
     Ok(PreparedCandidate::File(Box::new(PreparedFile {
         file,
         entities,
         fragments,
+        graph,
     })))
 }
 
@@ -2521,16 +2544,17 @@ mod tests {
         let storage = MemoryStorage::default();
         let prepared = PreparedFile {
             graph: None,
-            file: FileRecord {
-                id: file_id,
-                relative_path: SourcePath::new("file.md").expect("path"),
-                snapshot: FileSnapshot {
+            file: FileRecord::new(
+                file_id,
+                SourcePath::new("file.md").expect("path"),
+                FileSnapshot {
                     size_bytes: 18,
                     modified_epoch_ms: None,
                     content_hash: Some(sha256_hex(bodies.concat().as_bytes())),
                 },
-                index_status: FileIndexStatus::NotIndexed,
-            },
+                FileIndexStatus::NotIndexed,
+            )
+            .expect("file record"),
             entities,
             fragments,
         };

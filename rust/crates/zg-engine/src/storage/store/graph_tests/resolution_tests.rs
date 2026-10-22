@@ -3,10 +3,11 @@ use crate::storage::graph::EntityRecord;
 
 fn status(store: &IndexStore, file: &FileRecord, status: FileIndexStatus) {
     let mut file = file.clone();
-    file.index_status = status;
+    file.set_index_status(status)
+        .expect("set interrupted file state");
     store
         .write(|state| {
-            let directories = state.directories.ensure(&file.relative_path)?;
+            let directories = state.directories.ensure(file.relative_path())?;
             state.files.put(&file, &directories)?;
             state.files.flush()
         })
@@ -16,7 +17,7 @@ fn status(store: &IndexStore, file: &FileRecord, status: FileIndexStatus) {
 fn named(store: &IndexStore, path: &str) -> Snapshot {
     let mut target = snapshot(store, path, &["target"]);
     target.graph.entities.push(EntityRecord {
-        entity_id: target.entities[0].id.as_str().into(),
+        entity_id: target.entities[0].id().as_str().into(),
         name: "target".into(),
         qualified_name: "target".into(),
         is_exported: true,
@@ -43,7 +44,7 @@ fn hidden_reference_pages_preserve_cursor_and_do_not_block_ready_files() {
     write(&store, &ready);
     let hidden_ids: Vec<_> = pending(&store)
         .into_iter()
-        .filter(|r| r.file_id == hidden.file.id.get())
+        .filter(|r| r.file_id == hidden.file.id().get())
         .map(|r| r.id)
         .collect();
     status(&store, &hidden.file, FileIndexStatus::NotIndexed);
@@ -55,7 +56,7 @@ fn hidden_reference_pages_preserve_cursor_and_do_not_block_ready_files() {
             assert!(second.refs.is_empty());
             let third = session.list_pending_refs(1, second.next_cursor.unwrap())?;
             assert_eq!(third.refs.len(), 1);
-            assert_eq!(third.refs[0].file_id, ready.file.id.get());
+            assert_eq!(third.refs[0].file_id, ready.file.id().get());
             assert!(third.next_cursor.is_none());
             assert_eq!(session.apply_failures(&hidden_ids)?, 0);
             assert_eq!(session.apply_failures(&[third.refs[0].id])?, 1);
@@ -79,24 +80,24 @@ fn incomplete_candidates_defer_uniqueness_and_ready_names_still_resolve() {
                 "one hidden candidate must not imply a unique ready target"
             );
             assert_eq!(session.file_id_by_path("hidden.rs")?, None);
-            assert_eq!(session.file_path(hidden.file.id.get())?, None);
+            assert_eq!(session.file_path(hidden.file.id().get())?, None);
             assert!(
                 session.path_has_module("hidden", &[".rs"])?,
                 "unfinished is not external"
             );
             assert_eq!(
                 session.file_id_by_path("ready.rs")?,
-                Some(ready.file.id.get())
+                Some(ready.file.id().get())
             );
             Ok(())
         })
         .unwrap();
-    store.delete_file(hidden.file.id).unwrap();
+    store.delete_file(hidden.file.id()).unwrap();
     store
         .with_resolution_session(|session| {
             let candidates = session.lookup_candidates("target")?.unwrap();
             assert_eq!(candidates.len(), 1);
-            assert_eq!(candidates[0].entity_id, ready.entities[0].id.as_str());
+            assert_eq!(candidates[0].entity_id, ready.entities[0].id().as_str());
             Ok(())
         })
         .unwrap();
@@ -123,7 +124,7 @@ fn writeback_requires_issued_references_and_visible_canonical_targets() {
     };
     store
         .with_resolution_session(|session| {
-            let valid = proposal(target.entities[0].id.as_str());
+            let valid = proposal(target.entities[0].id().as_str());
             assert_eq!(
                 session.apply_resolutions(&[valid.clone()])?.resolved,
                 0,
@@ -132,18 +133,18 @@ fn writeback_requires_issued_references_and_visible_canonical_targets() {
             session.list_pending_refs(100, 0)?;
             for endpoint in [
                 "absent".to_owned(),
-                hidden.entities[0].id.as_str().to_owned(),
-                format!("f{}", hidden.file.id.get()),
+                hidden.entities[0].id().as_str().to_owned(),
+                format!("f{}", hidden.file.id().get()),
             ] {
                 let stats = session.apply_resolutions(&[proposal(&endpoint)])?;
                 assert_eq!((stats.resolved, stats.stale), (0, 1));
             }
             assert_eq!(
-                session.record_candidates(&[(id, vec![hidden.entities[0].id.as_str().into()])])?,
+                session.record_candidates(&[(id, vec![hidden.entities[0].id().as_str().into()])])?,
                 0
             );
             assert_eq!(
-                session.record_candidates(&[(id, vec![target.entities[0].id.as_str().into()])])?,
+                session.record_candidates(&[(id, vec![target.entities[0].id().as_str().into()])])?,
                 1
             );
             assert_eq!(session.apply_resolutions(&[valid])?.resolved, 1);
@@ -193,7 +194,7 @@ fn file_endpoint_writeback_and_import_scope_obey_file_visibility() {
             }])?;
             assert_eq!(stats.resolved, 1);
             assert_eq!(
-                session.imported_file_ids(source.file.id.get())?,
+                session.imported_file_ids(source.file.id().get())?,
                 vec![file_id]
             );
             Ok(())
@@ -202,7 +203,7 @@ fn file_endpoint_writeback_and_import_scope_obey_file_visibility() {
     status(&store, &target.file, FileIndexStatus::Deleting);
     store
         .with_resolution_session(|session| {
-            assert!(session.imported_file_ids(source.file.id.get())?.is_empty());
+            assert!(session.imported_file_ids(source.file.id().get())?.is_empty());
             Ok(())
         })
         .unwrap();

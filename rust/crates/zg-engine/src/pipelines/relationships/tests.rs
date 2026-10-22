@@ -6,10 +6,10 @@ use crate::{
     EngineError, EngineRuntimeSnapshot, ZvecGrep,
     api::relationships::RelationshipOptions,
     domain::{
-        CodeMetadata, Content, Entity, EntityFragment, EntityId, EntityMetadata, FileIndexStatus,
-        FileRecord, FileSnapshot, FragmentId, IndexDescriptor, IndexState, Range, ScanRules,
-        SourcePath, SymbolType, TextRange, Workspace,
-        model::{EmbeddingModelInfo, Metric, ModelInfo},
+        CodeMetadata, Content, ContentKind, Entity, EntityFragment, EntityId, EntityMetadata,
+        FileIndexStatus, FileRecord, FileSnapshot, FragmentId, FTS_CONFIG, IndexDescriptor,
+        IndexState, Range, ScanRules, SourcePath, SymbolType, TextRange, Workspace,
+        model::{EmbeddingModelInfo, EmbeddingMetric as Metric, ModelInfo},
     },
     storage::{
         IndexStore,
@@ -43,7 +43,7 @@ impl Fixture {
                 name: "relationship-fixture".into(),
                 root: root.clone(),
                 scan: ScanRules::default(),
-                index: IndexState::Enabled(IndexDescriptor::single(schema())),
+                index: IndexState::Enabled(Box::new(single_descriptor(schema()))),
                 created_epoch_ms: 1,
                 updated_epoch_ms: 1,
             },
@@ -106,18 +106,31 @@ impl Fixture {
 }
 
 fn schema() -> EmbeddingModelInfo {
-    EmbeddingModelInfo {
-        model: ModelInfo {
-            provider: "fixture".into(),
-            name: "relationships-without-model-runtime".into(),
-            endpoint: None,
-        },
-        dimension: 3,
-        metric: Metric::Cosine,
-        max_batch_size: 32,
-        max_input_tokens: None,
-        max_image_bytes: None,
-    }
+    EmbeddingModelInfo::new(
+        ModelInfo::new(
+            "fixture",
+            "relationships-without-model-runtime",
+            [ContentKind::Text],
+            32,
+        )
+        .expect("model info"),
+        3,
+        Metric::Cosine,
+        None,
+        None,
+    )
+    .expect("embedding info")
+}
+
+/// The base `IndexDescriptor` has no `single` constructor; assemble the
+/// one-text-route shape this version mandates.
+fn single_descriptor(embedding: EmbeddingModelInfo) -> IndexDescriptor {
+    IndexDescriptor::new(
+        embedding.clone(),
+        BTreeMap::from([(ContentKind::Text, embedding)]),
+        FTS_CONFIG,
+    )
+    .expect("single index descriptor")
 }
 
 fn write_symbols(
@@ -139,49 +152,46 @@ fn write_symbols(
                     .expect("source coordinates"),
             );
             let id = EntityId::new(file_id, &content, source_range).expect("entity identity");
-            Entity {
-                fragments: (0..2)
-                    .map(|ordinal| EntityFragment {
-                        id: FragmentId::new(&id, ordinal),
-                        range: Range::Full,
-                    })
-                    .collect(),
-                id,
-                file_id,
-                source_range,
-                content,
-                metadata: (!name.is_empty()).then(|| {
-                    EntityMetadata::Code(CodeMetadata {
-                        symbol_name: Some(name.into()),
-                        symbol_type: Some(SymbolType::Function),
-                        scope: scope.map(str::to_owned),
-                        signature: None,
-                        documentation: None,
-                        ..Default::default()
-                    })
-                }),
-            }
+            let metadata = (!name.is_empty()).then(|| {
+                EntityMetadata::Code(CodeMetadata {
+                    symbol_name: Some(name.into()),
+                    symbol_type: Some(SymbolType::Function),
+                    scope: scope.map(str::to_owned),
+                    signature: None,
+                    documentation: None,
+                    ..Default::default()
+                })
+            });
+            let fragments: Vec<_> = (0..2)
+                .map(|ordinal| EntityFragment {
+                    id: FragmentId::new(&id, ordinal),
+                    range: Range::Full,
+                })
+                .collect();
+            Entity::new(id, file_id, source_range, content, metadata, fragments)
+                .expect("valid entity")
         })
         .collect();
-    let file = FileRecord {
-        id: file_id,
+    let file = FileRecord::new(
+        file_id,
         relative_path,
-        snapshot: FileSnapshot {
+        FileSnapshot {
             size_bytes: 4096,
             modified_epoch_ms: None,
             content_hash: Some(crate::utils::sha256_hex(path.as_bytes())),
         },
-        index_status: FileIndexStatus::NotIndexed,
-    };
+        FileIndexStatus::NotIndexed,
+    )
+    .expect("valid file record");
     let entries: Vec<_> = entities
         .iter()
         .flat_map(|entity| {
-            entity.fragments.iter().map(|fragment| IndexedFragment {
-                entity_id: entity.id.clone(),
+            entity.fragments().iter().map(|fragment| IndexedFragment {
+                entity_id: entity.id().clone(),
                 fragment_id: fragment.id.clone(),
-                model: schema().model.reference(),
+                model: schema().model().reference(),
                 vector: vec![1.0, 0.0, 0.0],
-                fts_text: match &entity.content {
+                fts_text: match &entity.content() {
                     Content::Text(text) => text.clone(),
                     _ => unreachable!("text fixture"),
                 },
@@ -197,7 +207,7 @@ fn write_symbols(
 fn edge(source: &Entity, target: &str, line: u32) -> Edge {
     Edge {
         kind: EdgeKind::Calls,
-        source: source.id.as_str().into(),
+        source: source.id().as_str().into(),
         target: target.into(),
         line: Some(line),
         column: Some(4),
@@ -208,7 +218,7 @@ fn edge(source: &Entity, target: &str, line: u32) -> Edge {
 
 fn pending(source: &Entity, name: &str, line: u32) -> PendingRef {
     PendingRef {
-        from_node_id: source.id.as_str().into(),
+        from_node_id: source.id().as_str().into(),
         reference_name: name.into(),
         receiver_name: None,
         reference_kind: EdgeKind::Calls,
@@ -226,28 +236,28 @@ fn write_graph(path: &std::path::Path, local: &[Entity], remote: &Entity) {
     let mut graph = SqliteGraphStorage::open(path, OpenMode::ReadWrite).expect("graph writer");
     let source = &local[2];
     let missing_id = EntityId::new(
-        source.file_id,
+        source.file_id(),
         &Content::Text("missing".into()),
         Range::Full,
     )
     .expect("missing target identity");
     let mut edges: Vec<_> = (1..=25)
-        .map(|line| edge(source, local[0].id.as_str(), line))
-        .chain((30..=52).map(|line| edge(source, local[1].id.as_str(), line)))
+        .map(|line| edge(source, local[0].id().as_str(), line))
+        .chain((30..=52).map(|line| edge(source, local[1].id().as_str(), line)))
         .collect();
     edges.push(edge(source, missing_id.as_str(), 99));
-    let mut contains = edge(source, local[0].id.as_str(), 100);
+    let mut contains = edge(source, local[0].id().as_str(), 100);
     contains.kind = EdgeKind::Contains;
     edges.push(contains);
     graph
         .write_file_graph(
-            source.file_id.get(),
+            source.file_id().get(),
             "local.rs",
             &FileGraph {
                 entities: Vec::new(),
                 entity_ids: local
                     .iter()
-                    .map(|entity| entity.id.as_str().to_owned())
+                    .map(|entity| entity.id().as_str().to_owned())
                     .chain(std::iter::once(missing_id.as_str().into()))
                     .collect(),
                 edges,
@@ -261,11 +271,11 @@ fn write_graph(path: &std::path::Path, local: &[Entity], remote: &Entity) {
         .expect("local callsites and pending refs");
     graph
         .write_file_graph(
-            remote.file_id.get(),
+            remote.file_id().get(),
             "remote.rs",
             &FileGraph {
                 entities: Vec::new(),
-                entity_ids: vec![remote.id.as_str().into()],
+                entity_ids: vec![remote.id().as_str().into()],
                 ..FileGraph::default()
             },
             &[],
@@ -281,7 +291,7 @@ fn write_graph(path: &std::path::Path, local: &[Entity], remote: &Entity) {
     graph
         .apply_resolutions(&[Resolution {
             ref_id: reference.id,
-            target_id: remote.id.as_str().into(),
+            target_id: remote.id().as_str().into(),
             provenance: Provenance::ImportScoped,
         }])
         .expect("resolve cross-file call");
@@ -612,12 +622,12 @@ async fn unfinished_cross_file_endpoints_are_filtered_before_count_and_limit() {
             .list_files()
             .expect("files")
             .into_iter()
-            .find(|file| file.relative_path.to_path_buf() == PathBuf::from("z.rs"))
+            .find(|file| file.relative_path().to_path_buf() == PathBuf::from("z.rs"))
             .unwrap();
         let database = rusqlite::Connection::open(&fixture.graph_path).expect("fault connection");
         database.execute_batch("CREATE TRIGGER reject_graph_update BEFORE UPDATE ON edges BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").expect("inject failure");
         let result = if deleting {
-            store.delete_file(remote.id)
+            store.delete_file(remote.id())
         } else {
             store.replace_file(&remote, &[], &[])
         };
