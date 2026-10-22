@@ -2493,7 +2493,7 @@ mod tests {
         let mut graph = open_memory();
         // The parameter binding names a type defined in another file; a
         // workspace-unique `Left` still pins the member's declaring scope.
-        let mut graph_left = empty_graph(vec![
+        let graph_left = empty_graph(vec![
             scoped_record("left", "Left"),
             scoped_record("left-run", "Left::run"),
         ]);

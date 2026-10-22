@@ -58,6 +58,7 @@ impl SqliteGraphStorage {
     /// # Errors
     /// Propagates SQLite errors.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn file_entity_ids(&self, file_id: u32) -> Result<Vec<String>> {
         let mut statement = self.connection.prepare(
             "SELECT DISTINCT target FROM edges
