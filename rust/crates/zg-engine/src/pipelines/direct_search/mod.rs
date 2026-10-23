@@ -327,7 +327,8 @@ mod tests {
             Some(EntityMetadata::Code(metadata))
                 if metadata.symbol_name.as_deref() == Some("orchard")
         ));
-        // The definition range starts at the name token, not the `pub` modifier.
+        // The reported range covers the full declaration, `pub` modifier
+        // included, so slices of it stay valid source text.
         assert!(matches!(
             container.range,
             ContentRange::Text {
@@ -336,7 +337,7 @@ mod tests {
                 start_byte_offset,
                 end_byte_offset,
                 ..
-            } if start_byte_offset == "pub fn ".len()
+            } if start_byte_offset == 0
                 && end_byte_offset == source.trim_end().len()
         ));
         let serialized = serde_json::to_value(container).expect("serialize container");
