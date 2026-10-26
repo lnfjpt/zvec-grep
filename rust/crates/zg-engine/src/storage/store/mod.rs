@@ -476,7 +476,13 @@ impl IndexStore {
         entities: &[Entity],
         entries: &[IndexedFragment],
     ) -> EngineResult<()> {
-        self.replace_file_with_graph(file, entities, entries, &FileGraph::default())
+        self.replace_file_with_graph(
+            file,
+            entities,
+            entries,
+            &FileGraph::default(),
+            FlushPolicy::Immediate,
+        )
     }
 
     pub(crate) fn replace_file_with_graph(
@@ -485,6 +491,7 @@ impl IndexStore {
         entities: &[Entity],
         entries: &[IndexedFragment],
         graph: &FileGraph,
+        policy: FlushPolicy,
     ) -> EngineResult<()> {
         let shared = self.shared()?;
         validate_batch(file, entities, entries, &shared.schema)?;
@@ -501,7 +508,7 @@ impl IndexStore {
             entity_count: u64::try_from(entities.len())
                 .map_err(|_| EngineError::invalid_argument("entity count exceeds u64"))?,
         })?;
-        self.write(|state| replace_file(state, &file, entities, entries, graph))
+        self.write(|state| replace_file(state, &file, entities, entries, graph, policy))
     }
 
     pub(crate) fn mark_file_failed(&self, file: &FileRecord, error: &str) -> EngineResult<()> {
@@ -509,7 +516,16 @@ impl IndexStore {
         file.set_index_status(FileIndexStatus::Failed {
             error: error.to_owned(),
         })?;
-        self.write(|state| replace_file(state, &file, &[], &[], &FileGraph::default()))
+        self.write(|state| {
+            replace_file(
+                state,
+                &file,
+                &[],
+                &[],
+                &FileGraph::default(),
+                FlushPolicy::Immediate,
+            )
+        })
     }
 
     pub(crate) fn delete_file(&self, file_id: FileId) -> EngineResult<()> {
@@ -545,6 +561,15 @@ impl IndexStore {
             return Ok(());
         }
         self.write(|state| flush(state))
+    }
+
+    /// Persist a deferred replacement batch at its indexing boundary. This
+    /// is the batch-boundary counterpart of the per-file flush sequence:
+    /// same flushes, run once per batch instead of once per file, so bulk
+    /// indexing stops inflating `RocksDB` SST production and its open-file
+    /// count.
+    pub(crate) fn flush_batch(&self) -> EngineResult<()> {
+        self.checkpoint()
     }
 
     /// Persist retry state before building indexes and compacting accepted writes.
@@ -607,6 +632,25 @@ fn graph_error(error: graph::Error) -> EngineError {
     }
 }
 
+/// Durability policy for one file replacement inside the single-writer lock.
+///
+/// `Immediate` flushes at the two sequence points that keep the retry intent
+/// ahead of SQLite and the stored content ahead of the Indexed status.
+/// `Deferred` keeps the same ordering in the write-ahead logs and leaves
+/// flushing to the caller's batch boundary, which bounds `RocksDB` SST
+/// production while bulk indexing thousands of files.
+#[derive(Clone, Copy)]
+pub(crate) enum FlushPolicy {
+    Immediate,
+    Deferred,
+}
+
+impl FlushPolicy {
+    fn is_immediate(self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+}
+
 fn get_entities(
     state: &StoreState,
     ids: &[EntityId],
@@ -644,6 +688,7 @@ fn replace_file(
     entities: &[Entity],
     entries: &[IndexedFragment],
     graph: &FileGraph,
+    policy: FlushPolicy,
 ) -> EngineResult<()> {
     state.files.validate(file)?;
     state.entities.validate_ownership(entities, file.id())?;
@@ -663,8 +708,12 @@ fn replace_file(
     unfinished.set_index_status(FileIndexStatus::NotIndexed)?;
     state.files.put(&unfinished, &directories)?;
     // Retry intent must survive before SQLite advances or old IDs disappear.
-    state.directories.flush()?;
-    state.files.flush()?;
+    // A deferred batch keeps this ordering in the write-ahead logs and
+    // persists it once per batch through `flush_batch` instead.
+    if policy.is_immediate() {
+        state.directories.flush()?;
+        state.files.flush()?;
+    }
     let relative_path = file.relative_path().to_string_lossy().replace('\\', "/");
     state
         .graph
@@ -676,10 +725,18 @@ fn replace_file(
     state.entities.delete_file(file.id())?;
     state.entities.write(&entity_docs)?;
     state.fragments.write(&fragment_docs)?;
-    // Only durable content may be exposed through the final file status.
-    flush_content(state)?;
+    // The Indexed status is written after the stored content under both
+    // policies, so neither a memtable read nor a replayed log exposes a
+    // file whose content is less durable than its status.
+    if policy.is_immediate() {
+        flush_content(state)?;
+    }
     state.files.put(file, &directories)?;
-    state.files.flush()
+    if policy.is_immediate() {
+        state.files.flush()
+    } else {
+        Ok(())
+    }
 }
 
 fn load_search_hits(

@@ -50,6 +50,19 @@ impl IndexStore {
         let (entities, entries) = fixture_records(fixtures);
         self.replace_file(file, &entities, &entries)
     }
+
+    /// The pipeline's bulk path: flushes wait for the batch boundary.
+    fn replace_deferred(&self, file: &FileRecord, fixtures: &[FixtureEntity]) {
+        let (entities, entries) = fixture_records(fixtures);
+        self.replace_file_with_graph(
+            file,
+            &entities,
+            &entries,
+            &FileGraph::default(),
+            FlushPolicy::Deferred,
+        )
+        .expect("deferred replacement");
+    }
 }
 
 fn file_at(storage: &IndexStore, path: &str) -> (FileRecord, FixtureEntity) {
@@ -214,6 +227,44 @@ fn directory_and_filename_filters_match_both_retrieval_collections() {
             .is_empty()
     );
     assert!(reader.resolve_file_ids(&[PathBuf::from("new.rs")]).is_err());
+    reader.close().expect("close reader");
+}
+
+#[test]
+fn deferred_replacements_converge_at_the_batch_boundary() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let storage = open(directory.path(), false);
+    let (first_file, first_entry) = file_at(&storage, "batch/first.rs");
+    let (second_file, second_entry) = file_at(&storage, "batch/second.rs");
+
+    // Bulk indexing commits through the deferred policy: the write-ahead-log
+    // ordering survives while the flushes wait for the batch boundary.
+    storage.replace_deferred(&first_file, &[first_entry]);
+    storage.replace_deferred(&second_file, &[second_entry]);
+    storage.flush_batch().expect("batch boundary");
+    storage.close().expect("checkpoint");
+
+    let reader = open(directory.path(), false);
+    assert_eq!(
+        reader
+            .resolve_file_ids(&[
+                PathBuf::from("batch/first.rs"),
+                PathBuf::from("batch/second.rs")
+            ])
+            .expect("stored batch"),
+        [first_file.id(), second_file.id()]
+    );
+    let stored = reader.list_files().expect("stored files");
+    for file in [&first_file, &second_file] {
+        let record = stored
+            .iter()
+            .find(|stored| stored.id() == file.id())
+            .expect("stored file");
+        assert!(matches!(
+            record.index_status(),
+            FileIndexStatus::Indexed { .. }
+        ));
+    }
     reader.close().expect("close reader");
 }
 

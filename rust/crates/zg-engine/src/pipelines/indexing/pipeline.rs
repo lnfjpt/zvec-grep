@@ -846,14 +846,34 @@ fn apply_embedding_outcome(
 ) -> Result<(), EngineError> {
     let outcome = outcome.map_err(ModelError::into_engine_error)?;
     timings.record("index_embedding", outcome.duration, outcome.outcomes.len());
-    apply_embedding_files(
+    let applied = apply_embedding_files(
         context,
         diff,
         progress_base,
         timings,
         stats,
         outcome.outcomes,
-    )
+    );
+    // Batch boundary: deferred replacements flush once per embedding batch
+    // instead of once per file. A failing batch flushes before the error
+    // propagates so retry intent and accepted content survive.
+    flush_embedding_batch(context.storage, applied)
+}
+
+/// Persist one deferred replacement batch, including a batch that failed
+/// partway: the flush error wins over an aborted write, because without it
+/// the stored state behind the reported failure stays invisible on disk.
+fn flush_embedding_batch(
+    storage: &dyn IndexStorage,
+    applied: Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    match applied {
+        Ok(()) => storage.flush_batch(),
+        Err(error) => {
+            storage.flush_batch()?;
+            Err(error)
+        }
+    }
 }
 
 fn apply_embedding_files(
@@ -2497,7 +2517,23 @@ mod tests {
         resolved_paths: Mutex<Vec<Vec<PathBuf>>>,
         finalized: AtomicUsize,
         failed_markers: AtomicUsize,
+        flushed_batches: AtomicUsize,
         fail_replacements_once: Mutex<HashSet<FileId>>,
+    }
+
+    #[test]
+    fn batch_flush_runs_once_for_success_and_once_for_aborted_batch() {
+        let storage = MemoryStorage::default();
+        flush_embedding_batch(&storage, Ok(())).expect("successful batch");
+        assert_eq!(storage.flushed_batches.load(Ordering::Acquire), 1);
+        let aborted = flush_embedding_batch(
+            &storage,
+            Err(EngineError::storage_failure("injected replacement failure")),
+        )
+        .expect_err("aborted batch");
+        assert!(aborted.to_string().contains("injected replacement failure"));
+        // The aborted batch still flushed before the error propagated.
+        assert_eq!(storage.flushed_batches.load(Ordering::Acquire), 2);
     }
 
     #[test]
@@ -2649,6 +2685,11 @@ mod tests {
             } else {
                 files.push(stored);
             }
+            Ok(())
+        }
+
+        fn flush_batch(&self) -> EngineResult<()> {
+            self.flushed_batches.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 

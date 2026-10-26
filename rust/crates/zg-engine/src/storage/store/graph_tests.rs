@@ -107,6 +107,7 @@ fn write(store: &IndexStore, snapshot: &Snapshot) {
             &snapshot.entities,
             &snapshot.fragments,
             &snapshot.graph,
+            FlushPolicy::Immediate,
         )
         .expect("replace canonical and graph records");
 }
@@ -279,6 +280,7 @@ fn empty_relationships_clear_previous_local_edges_and_pending_refs() {
             &source.entities,
             &source.fragments,
             &FileGraph::default(),
+            FlushPolicy::Immediate,
         )
         .expect("replace with empty relationships");
     assert!(callers(&store, &source.entities[1]).is_empty());
@@ -338,7 +340,8 @@ fn graph_and_entities_reopen_together_and_read_only_handles_reject_writes() {
                 &source.file,
                 &source.entities,
                 &source.fragments,
-                &source.graph
+                &source.graph,
+                FlushPolicy::Immediate
             )
             .is_err()
     );
@@ -386,14 +389,14 @@ fn graph_ownership_is_validated_against_entities_before_either_store_changes() {
     invalid.edges[0].target = "not a canonical entity".into();
     assert!(
         store
-            .replace_file_with_graph(&source.file, &source.entities, &source.fragments, &invalid)
+            .replace_file_with_graph(&source.file, &source.entities, &source.fragments, &invalid, FlushPolicy::Immediate)
             .is_err()
     );
     invalid = source.graph.clone();
     invalid.edges[0].source = "foreign source".into();
     assert!(
         store
-            .replace_file_with_graph(&source.file, &source.entities, &source.fragments, &invalid)
+            .replace_file_with_graph(&source.file, &source.entities, &source.fragments, &invalid, FlushPolicy::Immediate)
             .is_err()
     );
     invalid = source.graph.clone();
@@ -402,7 +405,7 @@ fn graph_ownership_is_validated_against_entities_before_either_store_changes() {
     invalid.pending_refs.push(foreign_ref);
     assert!(
         store
-            .replace_file_with_graph(&source.file, &source.entities, &source.fragments, &invalid)
+            .replace_file_with_graph(&source.file, &source.entities, &source.fragments, &invalid, FlushPolicy::Immediate)
             .is_err()
     );
 
@@ -438,7 +441,8 @@ fn sqlite_insert_failure_preserves_entities_and_retries_after_reopen() {
                 &replacement.file,
                 &replacement.entities,
                 &replacement.fragments,
-                &replacement.graph
+                &replacement.graph,
+                FlushPolicy::Immediate
             )
             .is_err()
     );

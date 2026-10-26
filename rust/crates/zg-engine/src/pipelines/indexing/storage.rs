@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::{
     EngineResult,
     domain::{Entity, FileId, FileRecord},
-    storage::{IndexStore, graph::FileGraph, types::IndexedFragment},
+    storage::{FlushPolicy, IndexStore, graph::FileGraph, types::IndexedFragment},
 };
 
 pub(crate) trait IndexStorage: Send + Sync {
@@ -19,6 +19,8 @@ pub(crate) trait IndexStorage: Send + Sync {
         entries: &[IndexedFragment],
         graph: &FileGraph,
     ) -> EngineResult<()>;
+    /// Persists one deferred replacement batch at its indexing boundary.
+    fn flush_batch(&self) -> EngineResult<()>;
     fn mark_file_failed(&self, file: &FileRecord, error: &str) -> EngineResult<()>;
     fn delete_file(&self, file_id: FileId) -> EngineResult<()>;
     fn finalize_writes(&self) -> EngineResult<()>;
@@ -44,7 +46,13 @@ impl IndexStorage for IndexStore {
         entries: &[IndexedFragment],
         graph: &FileGraph,
     ) -> EngineResult<()> {
-        self.replace_file_with_graph(file, entities, entries, graph)
+        // Bulk indexing defers its flushes to the pipeline's batch boundary;
+        // the store's failure and test paths stay immediate.
+        self.replace_file_with_graph(file, entities, entries, graph, FlushPolicy::Deferred)
+    }
+
+    fn flush_batch(&self) -> EngineResult<()> {
+        self.flush_batch()
     }
 
     fn mark_file_failed(&self, file: &FileRecord, error: &str) -> EngineResult<()> {
