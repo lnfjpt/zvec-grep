@@ -11,4 +11,4 @@ mod store;
 pub(crate) mod types;
 mod zvec;
 
-pub(crate) use store::{IndexStore, ResolutionSnapshot};
+pub(crate) use store::{IndexStore, RelationshipReadSession, ResolutionSnapshot};

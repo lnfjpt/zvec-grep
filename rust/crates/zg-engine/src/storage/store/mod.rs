@@ -31,7 +31,9 @@ use super::{
 use crate::domain::FileGraphResult;
 use crate::domain::model::EmbeddingModelInfo;
 
+mod relationships;
 mod resolution;
+pub(crate) use relationships::RelationshipReadSession;
 pub(crate) use resolution::ResolutionSnapshot;
 
 type StoreRegistry = Mutex<HashMap<PathBuf, Weak<SharedStore>>>;
@@ -156,11 +158,18 @@ impl IndexStore {
         let directories = Directories::open(&path, read_only)?;
         let entities = Entities::open(&path, read_only)?;
         let fragments = Fragments::open(&path, &schema, read_only)?;
-        // Ordinary readers do not depend on the graph's availability.
+        let graph_path = home.join("graph").join("graph.sqlite");
         let graph = if read_only {
-            None
+            match fs::metadata(&graph_path) {
+                Ok(_) => Some(
+                    SqliteGraphStorage::open(&graph_path, OpenMode::ReadOnly)
+                        .map_err(graph_error)?,
+                ),
+                // Pre-graph indexes remain readable without creating SQLite in a reader.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(io_error("inspect workspace graph", &graph_path, &error)),
+            }
         } else {
-            let graph_path = home.join("graph").join("graph.sqlite");
             // Current extractors produce no graph, so pre-graph indexes can
             // initialize an empty database without rebuilding canonical data.
             let graph =
@@ -791,3 +800,19 @@ mod tables_tests;
 
 #[cfg(test)]
 mod graph_tests;
+
+#[cfg(test)]
+impl IndexStore {
+    pub(crate) fn set_test_file_status(
+        &self,
+        id: FileId,
+        status: FileIndexStatus,
+    ) -> EngineResult<()> {
+        self.write(|state| {
+            let mut file = state.files.fetch(&[id])?.remove(&id).expect("fixture file");
+            file.set_index_status(status)?;
+            let directories = state.directories.ensure(file.relative_path())?;
+            state.files.put(&file, &directories)
+        })
+    }
+}
