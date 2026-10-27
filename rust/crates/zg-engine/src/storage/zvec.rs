@@ -55,7 +55,7 @@ pub(super) fn open_collection(
     }
 }
 
-fn native_path(path: &Path) -> EngineResult<&str> {
+pub(super) fn native_path(path: &Path) -> EngineResult<&str> {
     // zvec rejects the `?` in Windows verbatim prefixes. Simplify only when
     // the regular path identifies the same location; retain internal paths.
     #[cfg(windows)]
