@@ -111,7 +111,23 @@ impl RelationshipReadSession<'_> {
         scope: Option<&str>,
         path: Option<&Path>,
     ) -> EngineResult<Vec<StoredEntity>> {
-        let selected = self.select_symbols(name, scope, path, MAX_SYMBOL_MATCHES + 1)?;
+        let mut selected =
+            self.select_symbols(name, ScopeMatch::Exact(scope), path, MAX_SYMBOL_MATCHES + 1)?;
+        if let Some(scope) = scope.filter(|_| selected.is_empty()) {
+            // Rust's module layout (`mod foo;` beside foo/mod.rs) lives in file
+            // paths, so those top-level entities record no scope and a
+            // scope-restricted lookup can never see them. Retry inside that
+            // module's files only, so a wrong scope still finds nothing.
+            let in_module = self.select_symbols(
+                name,
+                ScopeMatch::ModulePath(scope),
+                path,
+                MAX_SYMBOL_MATCHES + 1,
+            )?;
+            if in_module.len() <= MAX_SYMBOL_MATCHES {
+                selected = in_module;
+            }
+        }
         if selected.len() > MAX_SYMBOL_MATCHES {
             return Err(EngineError::invalid_argument(format!(
                 "symbol query matches more than {MAX_SYMBOL_MATCHES} indexed definitions; use a narrower scope::name or path filter",
@@ -126,7 +142,8 @@ impl RelationshipReadSession<'_> {
         name: &str,
         path: Option<&Path>,
     ) -> EngineResult<Vec<StoredEntity>> {
-        let selected = self.select_symbols(name, None, path, MAX_SYMBOL_SUGGESTIONS)?;
+        let selected =
+            self.select_symbols(name, ScopeMatch::Exact(None), path, MAX_SYMBOL_SUGGESTIONS)?;
         self.load_symbols(selected)
     }
 
@@ -152,7 +169,7 @@ impl RelationshipReadSession<'_> {
     fn select_symbols(
         &self,
         name: &str,
-        scope: Option<&str>,
+        scope: ScopeMatch<'_>,
         path: Option<&Path>,
         limit: usize,
     ) -> EngineResult<Vec<(EntityId, FileRecord)>> {
@@ -166,7 +183,8 @@ impl RelationshipReadSession<'_> {
         let ids = state
             .fragments
             .find_symbol_entity_ids(name, path_filter.as_deref())?;
-        let mut selected = Vec::new();
+        let mut defined = Vec::new();
+        let mut declarations = Vec::new();
         'batches: for batch in ids.chunks(128) {
             let mut owners: HashMap<_, _> = state
                 .entities
@@ -174,31 +192,42 @@ impl RelationshipReadSession<'_> {
                 .into_iter()
                 .filter_map(|(id, (file_id, metadata))| {
                     (metadata.symbol_name.as_deref() == Some(name)
-                        && scope.is_none_or(|scope| {
-                            metadata.scope.as_deref().unwrap_or("").replace('.', "::") == scope
-                        }))
-                    .then_some((id, file_id))
+                        && scope.accepts(metadata.scope.as_deref()))
+                    .then_some((id, (file_id, metadata.is_declaration)))
                 })
                 .collect();
             let file_ids: Vec<_> = owners
                 .values()
-                .copied()
+                .map(|(file_id, _)| *file_id)
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
             let files = state.files.fetch(&file_ids)?;
             for id in batch {
-                if let Some(file) = owners.remove(id).and_then(|file_id| files.get(&file_id))
+                if let Some((file_id, is_declaration)) = owners.remove(id)
+                    && let Some(file) = files.get(&file_id)
                     && visible_in_path(file, path)
+                    && scope.accepts_file(file)
                 {
-                    selected.push((id.clone(), file.clone()));
-                    if selected.len() == limit {
+                    let entry = (id.clone(), file.clone());
+                    if is_declaration {
+                        declarations.push(entry);
+                    } else {
+                        defined.push(entry);
+                    }
+                    if defined.len() + declarations.len() == limit {
                         break 'batches;
                     }
                 }
             }
         }
-        Ok(selected)
+        // A pure declaration (C/C++ prototype, in-class member declaration) only
+        // names the same entity; prefer the definition whenever one exists.
+        Ok(if defined.is_empty() {
+            declarations
+        } else {
+            defined
+        })
     }
 
     fn load_symbols(
@@ -282,6 +311,59 @@ impl RelationshipReadSession<'_> {
 fn visible_in_path(file: &FileRecord, path: Option<&Path>) -> bool {
     file.index_status().is_indexed()
         && path.is_none_or(|path| file.relative_path().as_path().starts_with(path))
+}
+
+/// How a name query constrains the scopes recorded on candidate entities.
+#[derive(Clone, Copy)]
+enum ScopeMatch<'a> {
+    /// Compare recorded scopes; `None` accepts any scope.
+    Exact(Option<&'a str>),
+    /// The qualified module recorded no scope: Rust keeps module identity in
+    /// file paths (`foo/mod.rs`, `foo.rs`), so only that module's files may
+    /// satisfy the query.
+    ModulePath(&'a str),
+}
+
+impl ScopeMatch<'_> {
+    fn accepts(self, recorded: Option<&str>) -> bool {
+        match self {
+            Self::Exact(scope) => {
+                scope.is_none_or(|scope| recorded.unwrap_or("").replace('.', "::") == scope)
+            }
+            Self::ModulePath(_) => recorded.is_none_or(str::is_empty),
+        }
+    }
+
+    fn accepts_file(self, file: &FileRecord) -> bool {
+        match self {
+            Self::Exact(_) => true,
+            Self::ModulePath(scope) => module_path_matches(file, scope),
+        }
+    }
+}
+
+/// Rust maps module `foo` to `foo.rs` or `foo/mod.rs` and nested modules to
+/// stacked directories; accept a file whose trailing layout spells the module.
+fn module_path_matches(file: &FileRecord, scope: &str) -> bool {
+    let modules: Vec<&str> = scope.split("::").filter(|part| !part.is_empty()).collect();
+    if modules.is_empty() {
+        return false;
+    }
+    let path = file.relative_path().as_path();
+    let mut layout: Vec<&str> = Vec::new();
+    if let Some(parent) = path.parent() {
+        layout.extend(
+            parent
+                .components()
+                .filter_map(|component| component.as_os_str().to_str()),
+        );
+    }
+    if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+        && !matches!(stem, "mod" | "lib" | "main")
+    {
+        layout.push(stem);
+    }
+    layout.ends_with(&modules)
 }
 
 /// Smaller ranks are better; reverse containment needs a meaningful name length.
