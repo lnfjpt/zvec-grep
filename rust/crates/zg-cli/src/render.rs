@@ -1042,6 +1042,9 @@ mod output_tests {
             visibility: None,
             language: None,
             documentation: None,
+            arity: None,
+            is_exported: false,
+            is_declaration: false,
         }));
         for source in [ContextSource::Index, ContextSource::Rg] {
             result.source = source;
