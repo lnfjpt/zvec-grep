@@ -35,6 +35,7 @@ use crate::domain::FileGraphResult;
 use crate::domain::model::EmbeddingModelInfo;
 
 mod resolution;
+pub(crate) use resolution::ResolutionSnapshot;
 
 type StoreRegistry = Mutex<HashMap<PathBuf, Weak<SharedStore>>>;
 static STORES: OnceLock<StoreRegistry> = OnceLock::new();
@@ -540,10 +541,20 @@ fn replace_file(
     let mut unfinished = file.clone();
     unfinished.set_index_status(FileIndexStatus::NotIndexed)?;
     state.files.put(&unfinished, &directories)?;
+    // The language labels this file's pending references for the resolver's
+    // language gate; the path itself stays canonical in zvec.
+    let relative_path = file
+        .relative_path()
+        .as_path()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let language = crate::domain::formats_for_path(std::path::Path::new(&relative_path))
+        .first()
+        .map_or("unknown", |format| format.as_str());
     // zvec writes are durable on success: record retry intent before advancing SQLite.
     if let Some(storage) = state.graph.as_mut() {
         storage
-            .write_file_graph(file.id().get(), graph, &old_ids)
+            .write_file_graph_with_language(file.id().get(), language, graph, &old_ids)
             .map_err(graph_error)?;
     }
     state.fragments.delete_file(file.id())?;
