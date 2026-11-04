@@ -162,6 +162,9 @@ async fn check_case(case: Case) {
     configure_remote_model(&root, server.address).expect("embedding configuration");
     let engine = ZvecGrep::new();
     let mut options = index_options(&root);
+    // The suite asserts on persisted call edges, so this workspace must opt in
+    // to graph indexing; the default build carries no relationship data.
+    options.graph_indexing = Some(true);
     options.scan.globs = Some(case.files.iter().map(|file| file.path.into()).collect());
     let indexed = engine.index(options).await.expect("index source files");
     assert_eq!(indexed.files_failed, 0, "{}: {indexed:?}", case.name);
@@ -1267,6 +1270,9 @@ impl IncrementalWorkspace {
 
     async fn index(&self, changes: Vec<WorkspaceChange>) -> IndexResult {
         let mut options = index_options(self.directory.path());
+        // Incremental passes must keep the graph on, otherwise the workspace
+        // rebuilds without relationship data on the first update.
+        options.graph_indexing = Some(true);
         options.scan.globs = Some(vec![self.glob.into()]);
         options.changes = changes;
         let result = self
